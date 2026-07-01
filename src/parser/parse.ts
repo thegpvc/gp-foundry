@@ -42,6 +42,7 @@ const VALID_TYPES: ReadonlySet<string> = new Set<NodeType>([
   "pr-fix",
   "merge-gate",
   "human-gate",
+  "scheduled-agent",
   "parallel",
   "fan_in",
 ]);

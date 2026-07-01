@@ -11,7 +11,7 @@
 import type { Diagnostic, Harness, HarnessNode } from "../ir/types.js";
 
 /** Types that are legitimate terminals (no outgoing edge required). */
-const SINK_TYPES = new Set(["exit", "merge-gate", "human-gate"]);
+const SINK_TYPES = new Set(["exit", "merge-gate", "human-gate", "scheduled-agent"]);
 const ENTRY_TYPES = new Set(["start"]);
 
 export function modelCheck(ir: Harness): Diagnostic[] {

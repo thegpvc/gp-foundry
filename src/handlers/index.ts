@@ -208,6 +208,42 @@ function emitHumanGate(ctx: EmitContext): WorkflowJobFragment {
   };
 }
 
+// ── scheduled-agent: a maintenance agent on schedule/dispatch (Scribe, Gardener, …) ──
+function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
+  const node = ctx.node;
+  const cfg = ctx.config;
+  const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 }); // app-token, checkout, git identity
+  steps.push(setupStep());
+  // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
+  steps.push(runAgentStep(ctx, { withContext: false }));
+  steps.push(
+    runStep({
+      name: "Commit changes",
+      env: { BRANCH: cfg.repo.base_branch },
+      run: [
+        `if [ -n "$(git status --porcelain)" ]; then`,
+        `  git add -A`,
+        `  git commit -m "chore(${node.id}): scheduled update"`,
+        `fi`,
+        `git fetch origin "$BRANCH" --quiet 2>/dev/null || true`,
+        `if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)" ]; then`,
+        `  git push origin "HEAD:$BRANCH"`,
+        `  echo "pushed changes to $BRANCH"`,
+        `else`,
+        `  echo "no changes to commit"`,
+        `fi`,
+      ].join("\n"),
+    }),
+  );
+  return {
+    jobId: node.id,
+    name: node.id,
+    permissions: { contents: "write", issues: "write", "pull-requests": "write" },
+    timeoutMinutes: timeoutOf(node, 15),
+    steps,
+  };
+}
+
 export type EmitFn = (ctx: EmitContext) => WorkflowJobFragment | null;
 
 export const HANDLERS: Partial<Record<NodeType, EmitFn>> = {
@@ -218,6 +254,7 @@ export const HANDLERS: Partial<Record<NodeType, EmitFn>> = {
   "pr-fix": emitPrFix,
   "merge-gate": emitMergeGate,
   "human-gate": emitHumanGate,
+  "scheduled-agent": emitScheduledAgent,
   // start / exit / parallel / fan_in are virtual (no generated job) for v1
   start: () => null,
   exit: () => null,

@@ -29,6 +29,7 @@ export type NodeType =
   | "pr-fix"
   | "merge-gate"
   | "human-gate"
+  | "scheduled-agent"
   | "parallel"
   | "fan_in";
 
@@ -38,6 +39,7 @@ export const AGENT_TYPES: readonly NodeType[] = [
   "producer",
   "pr-review",
   "pr-fix",
+  "scheduled-agent",
 ];
 
 /** What context an agent node is fed before it runs. */
