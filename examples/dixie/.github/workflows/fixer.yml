@@ -13,7 +13,7 @@ permissions:
 jobs:
   fixer:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'changes_requested'
+    if: contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES')
     permissions:
       contents: write
       pull-requests: write
@@ -41,6 +41,13 @@ jobs:
           git config user.email "$GIT_EMAIL"
       - name: Setup agent toolchain
         uses: ./.github/agent-setup
+      - name: Fetch context
+        id: ctx
+        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        with:
+          type: pr-review
+          number: ${{ github.event.pull_request.number }}
+          token: ${{ steps.app-token.outputs.token }}
       - name: Run agent
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
@@ -49,13 +56,22 @@ jobs:
           scope-path: agents/scope.yaml
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github-token: ${{ steps.app-token.outputs.token }}
+          context-file: ${{ steps.ctx.outputs.context-file }}
       - name: Commit and push fixes
         shell: bash
         env:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |-
+          # Commit anything the agent left uncommitted...
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
             git commit -m "agent fix: fixer"
+          fi
+          # ...then push if HEAD is ahead of the remote (the agent may have committed itself).
+          git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)" ]; then
             git push origin "HEAD:$BRANCH"
+            echo "pushed fix to $BRANCH"
+          else
+            echo "no changes to push"
           fi
