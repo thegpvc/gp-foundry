@@ -122,7 +122,15 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
     return false;
   }
   if (decision.action === "merge") {
-    await octokit.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: policy.mergeMethod ?? "rebase" });
+    try {
+      await octokit.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: policy.mergeMethod ?? "rebase" });
+    } catch (e) {
+      // A merge can still fail at merge time (e.g. a conflict that appeared after
+      // another PR landed). Don't crash the whole poller — explain and move on.
+      core.warning(`Merge of #${prNumber} rejected: ${(e as Error).message}`);
+      await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge (usually a conflict that appeared after another PR landed). This branch needs a rebase onto \`${policy.branchPrefix ? "the base branch" : "main"}\` before it can merge.`);
+      return false;
+    }
     if (policy.deleteBranchOnMerge ?? true) {
       try {
         await octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${facts.headRefName}` });
