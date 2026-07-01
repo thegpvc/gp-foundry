@@ -44,6 +44,20 @@ describe("parseDot", () => {
     expect(g.errors.some((e) => /unknown node type 'bogus'/.test(e.message))).toBe(true);
   });
 
+  it("does not treat /* in a // line-comment or a string as a block comment", () => {
+    const g = parseDot(`
+      // NEVER hand-edit .github/workflows/*.yml — edit this graph
+      digraph t {
+        a [type=start]
+        s [type=merge-gate, schedule="*/30 * * * *"]
+        a -> s [on="issues.opened"]
+      }
+    `);
+    expect(g.errors).toEqual([]);
+    expect(g.nodes.map((n) => n.id).sort()).toEqual(["a", "s"]);
+    expect(g.nodes.find((n) => n.id === "s")?.attrs.schedule).toBe("*/30 * * * *");
+  });
+
   it("handles comments and quoted strings", () => {
     const g = parseDot(`
       // a line comment

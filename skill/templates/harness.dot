@@ -12,22 +12,22 @@ digraph harness {
   start       [type=start]
 
   // intake: shape/triage an incoming unit of work
-  triager     [type=issue-agent, role="roles/triager.md",   context=issue]
+  triager     [type=issue-agent, role="agents/roles/triager.md",   context=issue]
 
   // optional advisory lane for big/ambiguous units (read-only, posts a plan)
-  planner     [type=analyst,     role="roles/planner.md",    context=issue, output=comment]
+  planner     [type=analyst,     role="agents/roles/planner.md",    context=issue, output=comment]
 
   // the producer: turns a labeled unit into a tested PR (the only code-writer here)
-  maker       [type=producer,    role="roles/maker.md",      context=issue]
+  maker       [type=producer,    role="agents/roles/maker.md",      context=issue]
 
   // review: reads the diff, runs gates, posts an approve / request-changes verdict
-  reviewer    [type=pr-review,   role="roles/reviewer.md",   context="pr-diff", gates="ci.yml"]
+  reviewer    [type=pr-review,   role="agents/roles/reviewer.md",   context="pr-diff", gates="ci.yml"]
 
   // bounded fix loop with the reviewer
-  fixer       [type=pr-fix,      role="roles/fixer.md",      max_attempts=3]
+  fixer       [type=pr-fix,      role="agents/roles/fixer.md",      max_attempts=3]
 
   // approval: automated merge policy (swap for a human-gate if approval must be human)
-  shipper     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
+  shipper     [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
 
   // bounded escape hatch — the terminal a stuck unit lands in
   needs_human [type=exit]

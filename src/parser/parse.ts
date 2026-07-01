@@ -57,13 +57,6 @@ interface Tok {
   line: number;
 }
 
-function stripComments(src: string): string {
-  // Block comments (non-greedy), then line comments. Preserve newlines for line counts.
-  let out = src.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
-  out = out.replace(/\/\/[^\n]*/g, "");
-  return out;
-}
-
 function tokenize(src: string): { toks: Tok[]; errors: Diagnosticish[] } {
   const toks: Tok[] = [];
   const errors: Diagnosticish[] = [];
@@ -79,6 +72,21 @@ function tokenize(src: string): { toks: Tok[]; errors: Diagnosticish[] } {
     }
     if (c === " " || c === "\t" || c === "\r") {
       i++;
+      continue;
+    }
+    // Comments — handled here (not via pre-strip) so `/*`/`*/` inside strings
+    // (e.g. cron "*/30 * * * *") or `//` line-comments are never misread.
+    if (c === "/" && s[i + 1] === "/") {
+      while (i < s.length && s[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && s[i + 1] === "*") {
+      i += 2;
+      while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) {
+        if (s[i] === "\n") line++;
+        i++;
+      }
+      i += 2;
       continue;
     }
     if (c === "-" && s[i + 1] === ">") {
@@ -142,7 +150,7 @@ function coerce(v: string): AttrValue {
 }
 
 export function parseDot(text: string): ParsedGraph {
-  const { toks, errors } = tokenize(stripComments(text));
+  const { toks, errors } = tokenize(text);
   const nodes: HarnessNode[] = [];
   const edges: HarnessEdge[] = [];
   const nodeIndex = new Map<string, HarnessNode>();
