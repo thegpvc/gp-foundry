@@ -30,9 +30,18 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
+      - name: Configure git identity
+        shell: bash
+        env:
+          GIT_NAME: dixie-agent[bot]
+          GIT_EMAIL: dixie-agent@users.noreply.github.com
+        run: |-
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
       - name: Evaluate merge gate
         uses: thegpvc/gp-foundry/actions/merge-gate@v1
         with:
           token: ${{ steps.app-token.outputs.token }}
           policy-path: policy/merge.yaml
           base-branch: main
+          branch-prefix: agent/

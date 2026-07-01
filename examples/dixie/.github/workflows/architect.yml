@@ -45,4 +45,5 @@ jobs:
           model: claude-opus-4-8
           scope-path: agents/scope.yaml
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           context-file: ${{ steps.ctx.outputs.context-file }}

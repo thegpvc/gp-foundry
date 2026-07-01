@@ -31,6 +31,14 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
+      - name: Configure git identity
+        shell: bash
+        env:
+          GIT_NAME: dixie-agent[bot]
+          GIT_EMAIL: dixie-agent@users.noreply.github.com
+        run: |-
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
       - name: Setup agent toolchain
         uses: ./.github/agent-setup
       - name: Run agent
@@ -40,6 +48,7 @@ jobs:
           model: claude-opus-4-8
           scope-path: agents/scope.yaml
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
       - name: Commit and push fixes
         shell: bash
         env:
