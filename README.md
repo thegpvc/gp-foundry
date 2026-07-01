@@ -23,9 +23,9 @@ harness.dot ──▶ parse ──▶ validate ──▶ model-check ──▶ a
                                         + cycle bounds   + wiring        drift-checked)
 ```
 
-- **Nodes are roles.** Each node has a `type` (mechanical: `issue-agent`,
+- **Nodes are roles.** Each node has a `type` (mechanical: `analyst`, `issue-agent`,
   `producer`, `pr-review`, `pr-fix`, `merge-gate`, `human-gate`, plus `start`/`exit`)
-  and a `role="roles/<name>.md"` that carries the domain-specific job description.
+  and a `role="agents/roles/<name>.md"` that carries the domain-specific job description.
 - **Edges are transitions.** Expressed only in GitHub-observable primitives
   (`on="issues.opened"`, `when="label=agent"`, `when="verdict=approve"`), so the
   platform — not a bespoke engine — drives the loop.
@@ -40,10 +40,10 @@ A minimal spec:
 ```dot
 digraph harness {
   start     [type=start]
-  scout     [type=issue-agent, role="roles/scout.md"]
-  builder   [type=producer,    role="roles/builder.md"]
-  reviewer  [type=pr-review,   role="roles/reviewer.md"]
-  fixer     [type=pr-fix,      role="roles/fixer.md", max_attempts=2]
+  scout     [type=issue-agent, role="agents/roles/scout.md"]
+  builder   [type=producer,    role="agents/roles/builder.md"]
+  reviewer  [type=pr-review,   role="agents/roles/reviewer.md"]
+  fixer     [type=pr-fix,      role="agents/roles/fixer.md", max_attempts=2]
   gate      [type=merge-gate]
 
   start    -> scout    [on="issues.opened"]
@@ -71,7 +71,7 @@ build — and it can reconcile against local edits when you regenerate.
 ### Via the CLI
 
 ```bash
-gp-foundry init                # scaffold harness.dot + foundry.config.yaml + roles/
+gp-foundry init                # scaffold harness.dot + config + roles + scope + policy
 gp-foundry validate            # schema + reachability + bounded-cycle checks
 gp-foundry build               # compile harness.dot → .github/workflows/*.yml
 gp-foundry build --check       # drift gate: fail if generated YAML is out of date
@@ -80,19 +80,20 @@ gp-foundry graph               # render / inspect the topology
 gp-foundry explain <node>      # show what a node compiles to
 ```
 
-Add `--json` to any command for machine/agent-consumable output. Diagnostics report
-`file:line` with fix hints.
+Add `--json` to any command for machine/agent-consumable output. Diagnostics carry a
+stable `code`, the offending node, and a fix hint.
 
-**Consumer repo layout after `gp-foundry build`:**
+**Consumer repo layout after `gp-foundry init` + `build`:**
 
 ```
 .github/
-  workflows/*.yml         # GENERATED — drift-checked, do not edit
-  harness.dot             # source of truth (topology)
-  roles/*.md              # job descriptions (content; runtime-loaded)
-  prompts/*.md            # optional extra prompt bodies (content)
-  policy/*.yaml           # merge policy, size gates, protected paths
-  foundry.config.yaml     # identity, model, labels, branch prefix, build profile
+  harness.dot                 # source of truth (topology)
+  workflows/*.yml             # GENERATED — drift-checked, do not edit
+  agents/
+    foundry.config.yaml       # identity, auth, model, labels, branch prefix
+    scope.yaml                # immutable / forbidden paths (CI-enforced)
+    roles/*.md                # job descriptions (content; runtime-loaded)
+    policy/*.yaml             # merge policy: size gates, protected paths
 ```
 
 ## Repository layout
