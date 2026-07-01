@@ -13,3 +13,6 @@ tsconfig.src.json
 
 # local harness smoke test (not part of gp-foundry)
 .sandbox/
+
+# locally-downloaded actionlint binary (installed on demand / in CI)
+/actionlint

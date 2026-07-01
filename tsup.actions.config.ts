@@ -19,6 +19,7 @@ export default defineConfig(
     target: "node20",
     platform: "node" as const,
     bundle: true,
+    minify: true,
     noExternal: [/.*/],
     dts: false,
     clean: true,
