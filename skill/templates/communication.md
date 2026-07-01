@@ -13,28 +13,36 @@ header — your emoji + name, e.g. `## 👷 Builder`. It's how people scan who s
 Concise, specific, warm-but-professional. State decisions plainly. No hedging, no filler,
 no restating the task back to yourself.
 
-## Structure — a clean top, rich detail tucked away
+## Structure — a useful visible summary, agent context tucked below
 
-Keep the **visible** message short and scannable, and put the depth in a collapsed block so
-humans see a summary while agents (which read the raw markdown) get the full brief:
+Lead with a summary a human can **act on at a glance**. For a PR description or a review,
+"useful" means the actual substance: **what changed, why, and how you verified it** — visible,
+not hidden. Then use a collapsed `<details>` block for *supplementary* material aimed mainly at
+the next agent (deep reasoning, the file-by-file walk, structured hand-off notes). `<details>`
+is collapsed for humans but **fully visible to every agent** that reads the raw markdown — so
+it's for depth the human usually won't need, never for the main message.
 
 ```markdown
 ## 👷 Builder
 
-<one-line summary of what you did / decided>
-- <a couple of key points, if useful>
+<one line: what this change is / does>
 
-<details><summary>Details</summary>
+**What changed** — <the key edits, as a couple of bullets>
+**Why** — <the reasoning / approach, when not obvious>
+**Verified** — <how you tested it; e.g. `make test` green>
 
-<your full reasoning, observations, and the handoff brief for the next agent — everything a
-successor needs to act without re-deriving your context>
+Closes #<n>
+
+<details><summary>Notes for reviewers & agents</summary>
+
+<supplementary depth: trade-offs, alternatives considered, follow-ups, file-by-file — the
+context a successor may want but a human scanning does not need up front>
 
 </details>
 ```
 
-The content inside `<details>` is collapsed for humans but **fully visible to every agent**
-that reads the comment — so put the meat there, not in a wall of text up top. Reserve HTML
-comments `<!-- like this -->` for machine-only state markers (invisible even when expanded).
+Reserve HTML comments `<!-- like this -->` for machine-only state markers (invisible even when
+expanded).
 
 ## Handoffs — write for the next agent, not just for humans
 

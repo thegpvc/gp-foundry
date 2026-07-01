@@ -103,12 +103,22 @@ async function listCandidates(octokit: Octokit, owner: string, repo: string, pol
   return filterCandidateNumbers(prs.map((p) => ({ number: p.number, headRefName: p.head.ref })), policy.branchPrefix);
 }
 
+async function comment(octokit: Octokit, owner: string, repo: string, prNumber: number, body: string): Promise<void> {
+  try {
+    await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+  } catch (e) {
+    core.warning(`Could not comment on PR #${prNumber}: ${(e as Error).message}`);
+  }
+}
+
 async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNumber: number, facts: PullRequestFacts, decision: MergeDecision, policy: PolicyFile, dryRun: boolean): Promise<boolean> {
   core.info(`PR #${prNumber}: ${decision.action} (${decision.code}) — ${decision.reason}`);
   if (dryRun) return false;
   if (decision.action === "label" && decision.label) {
     await octokit.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [decision.label] });
     core.info(`Labeled PR #${prNumber} \`${decision.label}\``);
+    // Explain why it was held back (skipped plain-skips stay quiet; a label is a real block).
+    await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nHeld this PR back and labeled \`${decision.label}\` — ${decision.reason}. A human should take a look.`);
     return false;
   }
   if (decision.action === "merge") {
@@ -121,6 +131,8 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
       }
     }
     core.info(`Merged PR #${prNumber}`);
+    // Explain the decision on the PR (an audit trail humans can scan).
+    await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nMerged (\`${policy.mergeMethod ?? "rebase"}\`) — ${decision.reason}.`);
     return true;
   }
   return false;
