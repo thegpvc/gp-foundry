@@ -172,6 +172,7 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
       token: tokenExpr(ctx),
       "policy-path": resolveFile(ctx, node.files.policy),
       "base-branch": ctx.config.repo.base_branch,
+      "branch-prefix": ctx.config.repo.branch_prefix,
     },
   });
   return {

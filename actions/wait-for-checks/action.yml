@@ -47,5 +47,5 @@ outputs:
       neutral | timeout | not_found | …
 
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.cjs"

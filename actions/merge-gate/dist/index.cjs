@@ -27151,136 +27151,117 @@ function evaluateMergeGate(pr, policy = {}, nowMs = Date.now()) {
 
 // actions/merge-gate/src/index.ts
 function loadPolicy(path) {
-  const raw = (0, import_node_fs.readFileSync)(path, "utf8");
-  const parsed = yaml.load(raw) ?? {};
+  const parsed = yaml.load((0, import_node_fs.readFileSync)(path, "utf8")) ?? {};
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`policy file ${path} did not parse to an object`);
   }
   return parsed;
 }
-function isApproval(review, bodyRe) {
+function isApprovalReview(review, bodyRe) {
   if (review.state === "APPROVED") return true;
-  if (review.state === "COMMENTED" && bodyRe && review.body) {
-    return bodyRe.test(review.body);
-  }
+  if (review.state === "COMMENTED" && bodyRe && review.body) return bodyRe.test(review.body);
   return false;
 }
 function rollupCi(checkRuns, ignoreNames) {
   const relevant = checkRuns.filter((c) => !ignoreNames.has(c.name ?? ""));
   if (relevant.length === 0) return "unknown";
-  if (relevant.some((c) => c.conclusion === "failure" || c.conclusion === "timed_out" || c.conclusion === "cancelled")) {
-    return "failing";
-  }
-  if (relevant.every((c) => c.status === "completed" && (c.conclusion === "success" || c.conclusion === "skipped" || c.conclusion === "neutral"))) {
-    return "passing";
-  }
-  if (relevant.some((c) => c.status === "in_progress" || c.status === "queued" || c.status === "pending")) {
-    return "pending";
-  }
+  if (relevant.some((c) => c.conclusion === "failure" || c.conclusion === "timed_out" || c.conclusion === "cancelled")) return "failing";
+  if (relevant.every((c) => c.status === "completed" && (c.conclusion === "success" || c.conclusion === "skipped" || c.conclusion === "neutral"))) return "passing";
+  if (relevant.some((c) => c.status === "in_progress" || c.status === "queued" || c.status === "pending")) return "pending";
   return "unknown";
 }
 async function gatherFacts(octokit, owner, repo, prNumber, policy) {
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => typeof l === "string" ? l : l.name ?? "").filter(Boolean);
   const bodyRe = policy.approvalBodyRegex ? new RegExp(policy.approvalBodyRegex) : void 0;
-  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
-    owner,
-    repo,
-    pull_number: prNumber,
-    per_page: 100
-  });
-  const approvalTimes = reviews.filter((r) => isApproval(r, bodyRe)).map((r) => r.submitted_at).filter((t) => !!t).sort();
+  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
+  const reviewApprovals = reviews.filter((r) => isApprovalReview(r, bodyRe)).map((r) => r.submitted_at).filter((t) => !!t);
+  const commentApprovals = [];
+  if (bodyRe) {
+    const comments = await octokit.paginate(octokit.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+    for (const c of comments) if (c.body && bodyRe.test(c.body) && c.created_at) commentApprovals.push(c.created_at);
+  }
+  const approvalTimes = [...reviewApprovals, ...commentApprovals].sort();
   const approvedAt = approvalTimes.length ? approvalTimes[approvalTimes.length - 1] : null;
-  const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, {
-    owner,
-    repo,
-    pull_number: prNumber,
-    per_page: 100
-  });
-  const files = filesRaw.map((f) => ({
-    path: f.filename,
-    additions: f.additions,
-    deletions: f.deletions
-  }));
+  const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
+  const files = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
-  const checkRuns = await octokit.paginate(octokit.rest.checks.listForRef, {
-    owner,
-    repo,
-    ref: pr.head.sha,
-    per_page: 100
-  });
+  const checkRuns = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
   const ciStatus = rollupCi(checkRuns, ignore);
   let cleanRebase;
-  if (pr.mergeable === true && pr.mergeable_state && pr.mergeable_state !== "dirty") {
-    cleanRebase = true;
-  } else if (pr.mergeable === false || pr.mergeable_state === "dirty") {
-    cleanRebase = false;
-  } else {
-    cleanRebase = void 0;
-  }
+  if (pr.mergeable === true && pr.mergeable_state && pr.mergeable_state !== "dirty") cleanRebase = true;
+  else if (pr.mergeable === false || pr.mergeable_state === "dirty") cleanRebase = false;
   const overrideRebase = core2.getInput("clean-rebase");
   if (overrideRebase === "true") cleanRebase = true;
   else if (overrideRebase === "false") cleanRebase = false;
-  return {
-    number: prNumber,
-    title: pr.title,
-    headRefName: pr.head.ref,
-    labels,
-    ciStatus,
-    approvedAt,
-    files,
-    cleanRebase
-  };
+  return { number: prNumber, title: pr.title, headRefName: pr.head.ref, labels, ciStatus, approvedAt, files, cleanRebase };
+}
+async function listCandidates(octokit, owner, repo, policy, base) {
+  const prs = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base, sort: "created", direction: "asc", per_page: 100 });
+  return prs.filter((p) => !policy.branchPrefix || p.head.ref.startsWith(policy.branchPrefix)).map((p) => p.number);
+}
+async function actOnDecision(octokit, owner, repo, prNumber, facts, decision, policy, dryRun) {
+  core2.info(`PR #${prNumber}: ${decision.action} (${decision.code}) \u2014 ${decision.reason}`);
+  if (dryRun) return false;
+  if (decision.action === "label" && decision.label) {
+    await octokit.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [decision.label] });
+    core2.info(`Labeled PR #${prNumber} \`${decision.label}\``);
+    return false;
+  }
+  if (decision.action === "merge") {
+    await octokit.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: policy.mergeMethod ?? "rebase" });
+    if (policy.deleteBranchOnMerge ?? true) {
+      try {
+        await octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${facts.headRefName}` });
+      } catch (e) {
+        core2.warning(`Could not delete branch ${facts.headRefName}: ${e.message}`);
+      }
+    }
+    core2.info(`Merged PR #${prNumber}`);
+    return true;
+  }
+  return false;
 }
 async function run() {
   try {
-    const prNumber = parseInt(core2.getInput("pr-number", { required: true }), 10);
     const token = core2.getInput("token", { required: true });
     const policyPath = core2.getInput("policy-path", { required: true });
+    const prNumberInput = core2.getInput("pr-number");
+    const baseBranch = core2.getInput("base-branch") || "main";
+    const branchPrefixInput = core2.getInput("branch-prefix");
     const dryRun = core2.getInput("dry-run") === "true";
-    if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
     const policy = loadPolicy(policyPath);
+    if (branchPrefixInput) policy.branchPrefix = branchPrefixInput;
     const octokit = github.getOctokit(token);
     const { owner, repo } = github.context.repo;
-    const facts = await gatherFacts(octokit, owner, repo, prNumber, policy);
-    const decision = evaluateMergeGate(facts, policy);
-    core2.info(`Decision for PR #${prNumber}: ${decision.action} (${decision.code}) \u2014 ${decision.reason}`);
-    core2.setOutput("action", decision.action);
-    core2.setOutput("code", decision.code);
-    core2.setOutput("reason", decision.reason);
-    if (decision.label) core2.setOutput("label", decision.label);
-    core2.setOutput("merged", "false");
-    if (dryRun) {
-      core2.info("dry-run: not performing any mutation");
+    if (prNumberInput) {
+      const prNumber = parseInt(prNumberInput, 10);
+      if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
+      const facts = await gatherFacts(octokit, owner, repo, prNumber, policy);
+      const decision = evaluateMergeGate(facts, policy);
+      const merged = await actOnDecision(octokit, owner, repo, prNumber, facts, decision, policy, dryRun);
+      core2.setOutput("action", decision.action);
+      core2.setOutput("code", decision.code);
+      core2.setOutput("reason", decision.reason);
+      core2.setOutput("merged", String(merged));
+      core2.setOutput("merged-pr", merged ? String(prNumber) : "");
       return;
     }
-    if (decision.action === "label" && decision.label) {
-      await octokit.rest.issues.addLabels({
-        owner,
-        repo,
-        issue_number: prNumber,
-        labels: [decision.label]
-      });
-      core2.info(`Labeled PR #${prNumber} with \`${decision.label}\``);
-      return;
-    }
-    if (decision.action === "merge") {
-      await octokit.rest.pulls.merge({
-        owner,
-        repo,
-        pull_number: prNumber,
-        merge_method: policy.mergeMethod ?? "rebase"
-      });
-      if (policy.deleteBranchOnMerge ?? true) {
-        try {
-          await octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${facts.headRefName}` });
-        } catch (e) {
-          core2.warning(`Could not delete branch ${facts.headRefName}: ${e.message}`);
-        }
+    const candidates = await listCandidates(octokit, owner, repo, policy, baseBranch);
+    core2.info(`${candidates.length} candidate PR(s): ${candidates.join(", ") || "(none)"}`);
+    let mergedPr = "";
+    for (const n of candidates) {
+      const facts = await gatherFacts(octokit, owner, repo, n, policy);
+      const decision = evaluateMergeGate(facts, policy);
+      const merged = await actOnDecision(octokit, owner, repo, n, facts, decision, policy, dryRun);
+      if (merged) {
+        mergedPr = String(n);
+        break;
       }
-      core2.setOutput("merged", "true");
-      core2.info(`Merged PR #${prNumber}`);
     }
+    core2.setOutput("merged", String(mergedPr !== ""));
+    core2.setOutput("merged-pr", mergedPr);
+    if (!mergedPr) core2.info("No PR qualified for merge this run.");
   } catch (err) {
     core2.setFailed(err.message);
   }

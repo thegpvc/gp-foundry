@@ -29,5 +29,5 @@ outputs:
     description: Path to the formatted context file
 
 runs:
-  using: node20
+  using: node24
   main: dist/index.cjs

@@ -7,16 +7,29 @@ author: "gp-foundry"
 
 inputs:
   pr-number:
-    description: "PR number to evaluate."
-    required: true
+    description: >
+      PR number to evaluate. When omitted, the action runs in POLLER mode:
+      it discovers open candidate PRs and merges the first that qualifies.
+    required: false
+    default: ""
   token:
     description: >
-      GitHub token with contents:write and pull-requests:write (typically a
-      GitHub App installation token so merges are attributed to the bot).
+      GitHub token with contents:write and pull-requests:write (a GitHub App
+      installation token or a PAT so merges are attributed and events cascade).
     required: true
   policy-path:
     description: "Path to the merge policy file (YAML or JSON)."
     required: true
+  base-branch:
+    description: "Base branch to filter candidate PRs by (poller mode)."
+    required: false
+    default: "main"
+  branch-prefix:
+    description: >
+      Only consider PRs whose head branch starts with this prefix (poller mode).
+      Overrides the policy file's branchPrefix when set.
+    required: false
+    default: ""
   clean-rebase:
     description: >
       Optional override for the clean-rebase check: "true" or "false". When
@@ -38,8 +51,10 @@ outputs:
   label:
     description: "Label to apply, when action is 'label'."
   merged:
-    description: "'true' if the PR was merged by this run, else 'false'."
+    description: "'true' if a PR was merged by this run, else 'false'."
+  merged-pr:
+    description: "The PR number that was merged, if any."
 
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.cjs"
