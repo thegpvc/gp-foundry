@@ -32,6 +32,12 @@ inputs:
       conventions are stated once, centrally.
     required: false
     default: ""
+  comms-file:
+    description: >-
+      Optional path to the team communication guide (tone, identity, handoff
+      protocol). Included verbatim if the file exists, before the scope.
+    required: false
+    default: ".github/agents/communication.md"
   scope-path:
     description: >-
       Path to the scope config file (e.g. allowed paths / boundaries). Included
@@ -79,6 +85,7 @@ runs:
         PROMPT_OVERRIDE_FILE: ${{ inputs.prompt-override-file }}
         CONTEXT_FILE: ${{ inputs.context-file }}
         CONVENTIONS: ${{ inputs.conventions }}
+        COMMS_FILE: ${{ inputs.comms-file }}
         SCOPE_PATH: ${{ inputs.scope-path }}
       run: |
         set -euo pipefail
@@ -117,6 +124,12 @@ runs:
         if [ -n "$CONVENTIONS" ]; then
           printf '## Conventions\n\n' >> "$PROMPT_FILE"
           printf '%s\n\n' "$CONVENTIONS" >> "$PROMPT_FILE"
+        fi
+
+        # 3b. communication guide (tone / identity / handoff protocol)
+        if [ -n "$COMMS_FILE" ] && [ -f "$COMMS_FILE" ]; then
+          cat "$COMMS_FILE" >> "$PROMPT_FILE"
+          printf '\n\n' >> "$PROMPT_FILE"
         fi
 
         # 4. scope

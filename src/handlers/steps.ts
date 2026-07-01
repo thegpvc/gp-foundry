@@ -82,6 +82,7 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
   const withBlock: Record<string, string> = {
     "role-file": resolveFile(ctx, node.files.role),
     model: cfg.agent.model,
+    "comms-file": resolveFile(ctx, "agents/communication.md"),
     "scope-path": resolveFile(ctx, "agents/scope.yaml"),
     "claude-code-oauth-token": secretRef(cfg.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN"),
     "github-token": tokenExpr(ctx),

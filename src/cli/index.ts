@@ -68,6 +68,7 @@ const INIT_FILES: [tpl: string, dest: string][] = [
   ["skill/templates/foundry.config.yaml", ".github/agents/foundry.config.yaml"],
   ["skill/templates/scope.yaml", ".github/agents/scope.yaml"],
   ["skill/templates/policy-merge.yaml", ".github/agents/policy/merge.yaml"],
+  ["skill/templates/communication.md", ".github/agents/communication.md"],
 ];
 
 program

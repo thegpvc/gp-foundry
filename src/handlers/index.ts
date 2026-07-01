@@ -119,8 +119,10 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
       "agent-name": node.id,
       "base-branch": cfg.repo.base_branch,
       "issue-number": ISSUE_NUMBER,
-      "pr-title": `[agent] ${node.id} #${ISSUE_NUMBER}`,
-      "pr-body": `Automated change for #${ISSUE_NUMBER}.\n\nCloses #${ISSUE_NUMBER}`,
+      // Meaningful title from the issue; the agent normally opens its own PR with a
+      // fuller body — this fires only as a safety net if it didn't.
+      "pr-title": "${{ github.event.issue.title }}",
+      "pr-body": `### 🛠️ Auto-created (fallback)\n\nThe agent finished but didn't open a PR itself, so one was created automatically. See the commits and the linked issue for context.\n\nCloses #${ISSUE_NUMBER}`,
     },
   });
 
