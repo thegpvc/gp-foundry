@@ -93,9 +93,13 @@ program
     // relative to the harness.dot dir, i.e. .github/).
     const dotPath = join(root, ".github/harness.dot");
     if (existsSync(dotPath)) {
-      const roleTpl = readFileSync(pkgFile("skill/templates/role.md"), "utf8");
       for (const n of parseDot(readFileSync(dotPath, "utf8")).nodes) {
-        if (n.files.role) write(join(".github", n.files.role), roleTpl);
+        if (!n.files.role) continue;
+        // Prefer a ready-made software-pack role of the same name; else the generic template.
+        const roleName = n.files.role.replace(/^.*\//, "").replace(/\.md$/, "");
+        const packPath = pkgFile(`roles/software/${roleName}.md`);
+        const src = existsSync(packPath) ? packPath : pkgFile("skill/templates/role.md");
+        write(join(".github", n.files.role), readFileSync(src, "utf8"));
       }
     }
     if (opts.json) return emitJson({ written, skipped });
