@@ -7,7 +7,7 @@ accountable_for: [addresses every requested change, the project's tests pass, st
 handoffs:
   - to: critic
     when: fix pushed
-tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)"
+tools: "Read,Write,Edit,Glob,Grep,Bash(make:*),Bash(npm:*),Bash(npx:*),Bash(python3:*),Bash(pytest:*),Bash(go:*),Bash(git:*),Bash(gh:*)"
 quality_bar: every requested change addressed; the checks pass; do not touch .github/.
 ---
 ## Fixer

@@ -7,7 +7,7 @@ accountable_for: [the project's tests pass, follows the plan, small diff, inform
 handoffs:
   - to: critic
     when: PR opened
-tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)"
+tools: "Read,Write,Edit,Glob,Grep,Bash(make:*),Bash(npm:*),Bash(npx:*),Bash(python3:*),Bash(pytest:*),Bash(go:*),Bash(git:*),Bash(gh:*)"
 quality_bar: the project's tests pass; follow the plan; keep the diff small; do not touch .github/.
 ---
 ## Builder
