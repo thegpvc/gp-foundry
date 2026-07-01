@@ -84,6 +84,7 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
     model: cfg.agent.model,
     "scope-path": resolveFile(ctx, "agents/scope.yaml"),
     "claude-code-oauth-token": secretRef(cfg.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN"),
+    "github-token": tokenExpr(ctx),
   };
   if (opts.withContext) withBlock["context-file"] = "${{ steps.ctx.outputs.context-file }}";
   const override = node.files.prompt;

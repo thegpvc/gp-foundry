@@ -54,6 +54,13 @@ inputs:
       Claude Code OAuth token. Composites have no secrets context, so this must
       be passed in explicitly by the caller.
     required: true
+  github-token:
+    description: >-
+      Token for the agent's own `gh`/git operations (labels, comments, PRs).
+      Exposed to the agent as GH_TOKEN/GITHUB_TOKEN. Without it, the agent's
+      `gh` calls are unauthenticated.
+    required: false
+    default: ""
   extra-args:
     description: >-
       Optional extra arguments appended verbatim to the `claude` invocation
@@ -132,6 +139,8 @@ runs:
       shell: bash
       env:
         CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
         PROMPT_FILE: ${{ steps.assemble.outputs.prompt-file }}
         ROLE_FILE: ${{ inputs.role-file }}
         MODEL: ${{ inputs.model }}
