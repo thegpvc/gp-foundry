@@ -27059,6 +27059,20 @@ function firstProtectedPath(files, protectedPaths) {
   }
   return void 0;
 }
+function normalizePolicyKeys(v) {
+  if (Array.isArray(v)) return v.map(normalizePolicyKeys);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) {
+      out[k.replace(/_([a-z0-9])/g, (_m, c) => c.toUpperCase())] = normalizePolicyKeys(val);
+    }
+    return out;
+  }
+  return v;
+}
+function filterCandidateNumbers(prs, branchPrefix) {
+  return prs.filter((p) => !branchPrefix || p.headRefName.startsWith(branchPrefix)).map((p) => p.number);
+}
 function evaluateMergeGate(pr, policy = {}, nowMs = Date.now()) {
   const blockingLabels = policy.blockingLabels ?? [];
   const requireCi = policy.requireCi ?? true;
@@ -27155,7 +27169,7 @@ function loadPolicy(path) {
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`policy file ${path} did not parse to an object`);
   }
-  return parsed;
+  return normalizePolicyKeys(parsed);
 }
 function isApprovalReview(review, bodyRe) {
   if (review.state === "APPROVED") return true;
@@ -27198,7 +27212,7 @@ async function gatherFacts(octokit, owner, repo, prNumber, policy) {
 }
 async function listCandidates(octokit, owner, repo, policy, base) {
   const prs = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base, sort: "created", direction: "asc", per_page: 100 });
-  return prs.filter((p) => !policy.branchPrefix || p.head.ref.startsWith(policy.branchPrefix)).map((p) => p.number);
+  return filterCandidateNumbers(prs.map((p) => ({ number: p.number, headRefName: p.head.ref })), policy.branchPrefix);
 }
 async function actOnDecision(octokit, owner, repo, prNumber, facts, decision, policy, dryRun) {
   core2.info(`PR #${prNumber}: ${decision.action} (${decision.code}) \u2014 ${decision.reason}`);

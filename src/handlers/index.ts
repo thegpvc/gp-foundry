@@ -138,7 +138,8 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const steps: StepSpec[] = preamble(ctx, { ref: PR_HEAD_REF, fetchDepth: 0 });
   steps.push(setupStep());
-  steps.push(runAgentStep(ctx, { withContext: false }));
+  steps.push(contextStep(ctx, "pr-review", PR_NUMBER)); // the Fixer needs the review feedback
+  steps.push(runAgentStep(ctx, { withContext: true }));
   steps.push(
     runStep({
       name: "Commit and push fixes",

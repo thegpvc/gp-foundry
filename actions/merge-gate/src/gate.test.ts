@@ -5,9 +5,57 @@ import {
   handWrittenAdditions,
   firstProtectedPath,
   parseTimestamp,
+  normalizePolicyKeys,
+  filterCandidateNumbers,
+  isApprovalBody,
   type PullRequestFacts,
   type MergePolicy,
 } from "./gate.js";
+
+describe("normalizePolicyKeys (snake_case policy support)", () => {
+  it("converts snake_case keys to camelCase recursively", () => {
+    const out = normalizePolicyKeys({
+      branch_prefix: "agent/",
+      approval_delay_minutes: 30,
+      exclude_globs: ["**/dist/**"],
+      max_additions: 600,
+    }) as Record<string, unknown>;
+    expect(out.branchPrefix).toBe("agent/");
+    expect(out.approvalDelayMinutes).toBe(30);
+    expect(out.maxAdditions).toBe(600);
+    expect(out.excludeGlobs).toEqual(["**/dist/**"]); // values (globs) untouched
+  });
+  it("leaves already-camelCase keys unchanged", () => {
+    const out = normalizePolicyKeys({ branchPrefix: "x", approvalBodyRegex: "Verdict.*APPROVE" }) as Record<string, unknown>;
+    expect(out.branchPrefix).toBe("x");
+    expect(out.approvalBodyRegex).toBe("Verdict.*APPROVE");
+  });
+});
+
+describe("filterCandidateNumbers", () => {
+  const prs = [
+    { number: 1, headRefName: "agent/1-a" },
+    { number: 2, headRefName: "feature/x" },
+    { number: 3, headRefName: "agent/3-c" },
+  ];
+  it("filters by branch prefix, preserving order", () => {
+    expect(filterCandidateNumbers(prs, "agent/")).toEqual([1, 3]);
+  });
+  it("returns all when no prefix", () => {
+    expect(filterCandidateNumbers(prs)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("isApprovalBody", () => {
+  it("matches a comment/review verdict body", () => {
+    expect(isApprovalBody("## Critic\n\n**Verdict:** APPROVE", "Verdict.*APPROVE")).toBe(true);
+    expect(isApprovalBody("**Verdict:** REQUEST_CHANGES", "Verdict.*APPROVE")).toBe(false);
+  });
+  it("is false for empty body or no regex", () => {
+    expect(isApprovalBody("", "Verdict.*APPROVE")).toBe(false);
+    expect(isApprovalBody("**Verdict:** APPROVE", undefined)).toBe(false);
+  });
+});
 
 // A fixed "now" for deterministic delay math.
 const NOW = Date.parse("2026-07-01T12:00:00Z");

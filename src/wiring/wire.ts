@@ -48,26 +48,23 @@ function mergeEvent(triggers: Record<string, any>, event: string, target: Harnes
 }
 
 interface EdgeWire {
-  event?: string;
+  events: string[];
   guard?: string;
 }
 
 function wireEdge(edge: HarnessEdge, target: HarnessNode): EdgeWire | undefined {
   if (edge.on) {
-    const w: EdgeWire = { event: edge.on };
-    if (edge.when) w.guard = guardFor(edge.when, target);
-    return w;
+    // `on` may list several events, e.g. "pull_request.opened, pull_request.synchronize".
+    const events = edge.on.split(",").map((s) => s.trim()).filter(Boolean);
+    return { events, guard: edge.when ? guardFor(edge.when, target) : undefined };
   }
   if (!edge.when) return undefined;
   const w = edge.when;
   if (w.startsWith("label=")) {
-    return {
-      event: targetIsPr(target) ? "pull_request.labeled" : "issues.labeled",
-      guard: guardFor(w, target),
-    };
+    return { events: [targetIsPr(target) ? "pull_request.labeled" : "issues.labeled"], guard: guardFor(w, target) };
   }
   if (w.startsWith("verdict=")) {
-    return { event: "pull_request_review.submitted", guard: guardFor(w, target) };
+    return { events: ["pull_request_review.submitted"], guard: guardFor(w, target) };
   }
   // internal-only transitions (attempts>=N, ci=...) are not triggers for this node
   return undefined;
@@ -77,8 +74,10 @@ function guardFor(when: string, _target: HarnessNode): string | undefined {
   if (when.startsWith("label=")) {
     return `github.event.label.name == '${when.slice("label=".length)}'`;
   }
-  if (when === "verdict=approve") return "github.event.review.state == 'approved'";
-  if (when === "verdict=request_changes") return "github.event.review.state == 'changes_requested'";
+  // A bot cannot APPROVE/REQUEST_CHANGES its own PR, so the Critic submits a
+  // COMMENTED review with the verdict in the body; guard on the body marker.
+  if (when === "verdict=approve") return "contains(github.event.review.body, '**Verdict:** APPROVE')";
+  if (when === "verdict=request_changes") return "contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES')";
   return undefined;
 }
 
@@ -113,8 +112,8 @@ export function wire(ir: Harness): WiringPlan {
     } else {
       for (const e of incoming.get(node.id) ?? []) {
         const w = wireEdge(e, node);
-        if (!w?.event) continue;
-        mergeEvent(triggers, w.event, node);
+        if (!w) continue;
+        for (const ev of w.events) mergeEvent(triggers, ev, node);
         if (w.guard) guards.add(w.guard);
       }
     }

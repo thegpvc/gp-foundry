@@ -223,6 +223,41 @@ export function firstProtectedPath(files: PrFile[], protectedPaths?: string[]): 
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Poller helpers (pure, testable)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Recursively convert snake_case object keys to camelCase, so policy files can
+ * use the same snake_case convention as foundry.config.yaml while the TS stays
+ * idiomatic. Already-camelCase keys pass through unchanged.
+ */
+export function normalizePolicyKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(normalizePolicyKeys);
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      out[k.replace(/_([a-z0-9])/g, (_m, c: string) => c.toUpperCase())] = normalizePolicyKeys(val);
+    }
+    return out;
+  }
+  return v;
+}
+
+/** Filter open PRs to candidate numbers by head-branch prefix (oldest-first order preserved). */
+export function filterCandidateNumbers(
+  prs: { number: number; headRefName: string }[],
+  branchPrefix?: string,
+): number[] {
+  return prs.filter((p) => !branchPrefix || p.headRefName.startsWith(branchPrefix)).map((p) => p.number);
+}
+
+/** Does a review/comment body match the approval regex (e.g. "Verdict.*APPROVE")? */
+export function isApprovalBody(body: string | null | undefined, regexSource?: string): boolean {
+  if (!regexSource || !body) return false;
+  return new RegExp(regexSource).test(body);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // The gate
 // ────────────────────────────────────────────────────────────────────────────
 

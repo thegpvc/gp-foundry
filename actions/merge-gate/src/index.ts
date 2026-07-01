@@ -18,6 +18,8 @@ import * as github from "@actions/github";
 import yaml from "js-yaml";
 import {
   evaluateMergeGate,
+  filterCandidateNumbers,
+  normalizePolicyKeys,
   type MergePolicy,
   type PullRequestFacts,
   type PrFile,
@@ -39,7 +41,8 @@ function loadPolicy(path: string): PolicyFile {
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`policy file ${path} did not parse to an object`);
   }
-  return parsed as PolicyFile;
+  // Accept snake_case policy files (same convention as foundry.config.yaml).
+  return normalizePolicyKeys(parsed) as PolicyFile;
 }
 
 function isApprovalReview(review: { state?: string | null; body?: string | null }, bodyRe?: RegExp): boolean {
@@ -97,7 +100,7 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
 /** Open PRs on branch-prefix branches targeting base, oldest first. */
 async function listCandidates(octokit: Octokit, owner: string, repo: string, policy: PolicyFile, base: string): Promise<number[]> {
   const prs = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base, sort: "created", direction: "asc", per_page: 100 });
-  return prs.filter((p) => !policy.branchPrefix || p.head.ref.startsWith(policy.branchPrefix)).map((p) => p.number);
+  return filterCandidateNumbers(prs.map((p) => ({ number: p.number, headRefName: p.head.ref })), policy.branchPrefix);
 }
 
 async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNumber: number, facts: PullRequestFacts, decision: MergeDecision, policy: PolicyFile, dryRun: boolean): Promise<boolean> {
