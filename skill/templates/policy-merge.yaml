@@ -1,0 +1,31 @@
+# policy/merge.yaml — the merge-gate's policy (interview Q2 approvals). Evaluated by the
+# runtime-core merge-gate action into a {merge | skip | label} decision + audit trail.
+# Everything here is config; no hardcoded label names or paths (those come from
+# foundry.config.yaml / scope.yaml).
+
+approval:
+  required_reviews: 1            # human/agent approvals required before merge
+  approval_delay_minutes: 0     # cool-off after approval before auto-merge (0 = none)
+
+ci:
+  require_pass: true            # all required checks must conclude success
+  required_checks:
+    - ci.yml                     # named check workflows that must be green
+
+size:
+  # additions cap for auto-merge (over this -> label for a human instead of merging).
+  # Uses foundry.config.yaml `size.exclude_globs` to discount generated files.
+  hard_additions: 800
+
+protected_paths:
+  # If a PR touches any of these, do NOT auto-merge — label for human review.
+  # (immutable_paths in scope.yaml are a harder boundary enforced separately.)
+  from_scope: true             # inherit scope.yaml forbidden/immutable paths as protected
+  extra: []
+
+rebase:
+  require_clean: true          # refuse to merge a PR that needs a non-trivial rebase
+
+on_block:
+  action: label                # what to do when a gate fails: `label` (for a human) or `skip`
+  label: needs-human           # semantic key resolved via foundry.config.yaml labels

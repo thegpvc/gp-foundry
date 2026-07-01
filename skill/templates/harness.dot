@@ -1,0 +1,45 @@
+// harness.dot — the single source of truth for this repo's agent harness topology.
+// `type` = mechanical GitHub interaction (chosen at build time); `role` = job description
+// (a roles/*.md file, loaded at runtime). Edges are transitions: `on=` GitHub event,
+// `when=` GitHub-observable guard. Compile with `gp-foundry build`. NEVER hand-edit the
+// generated .github/workflows/*.yml — edit this graph and rebuild.
+//
+// Replace the placeholders below with what the interview produced. Every cycle MUST have a
+// bounded escape edge to an `exit` node. See skill reference/node-types.md for the vocabulary.
+
+digraph harness {
+  // ── nodes ─────────────────────────────────────────────────────────────────
+  start       [type=start]
+
+  // intake: shape/triage an incoming unit of work
+  triager     [type=issue-agent, role="roles/triager.md",   context=issue]
+
+  // optional advisory lane for big/ambiguous units (read-only, posts a plan)
+  planner     [type=analyst,     role="roles/planner.md",    context=issue, output=comment]
+
+  // the producer: turns a labeled unit into a tested PR (the only code-writer here)
+  maker       [type=producer,    role="roles/maker.md",      context=issue]
+
+  // review: reads the diff, runs gates, posts an approve / request-changes verdict
+  reviewer    [type=pr-review,   role="roles/reviewer.md",   context="pr-diff", gates="ci.yml"]
+
+  // bounded fix loop with the reviewer
+  fixer       [type=pr-fix,      role="roles/fixer.md",      max_attempts=3]
+
+  // approval: automated merge policy (swap for a human-gate if approval must be human)
+  shipper     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
+
+  // bounded escape hatch — the terminal a stuck unit lands in
+  needs_human [type=exit]
+
+  // ── edges ─────────────────────────────────────────────────────────────────
+  start    -> triager     [on="issues.opened"]
+  triager  -> planner     [when="label=plan"]      // label names resolve via foundry.config.yaml
+  triager  -> maker       [when="label=build"]
+  planner  -> maker       [when="label=build"]
+  maker    -> reviewer    [on="pull_request.opened"]
+  reviewer -> shipper     [when="verdict=approve"]
+  reviewer -> fixer       [when="verdict=request_changes"]
+  fixer    -> reviewer    [on="push"]              // retry loop…
+  fixer    -> needs_human [when="attempts>=3"]     // …with a bounded escape (required)
+}

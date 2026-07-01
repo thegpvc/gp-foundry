@@ -1,0 +1,47 @@
+name: Sanitize Untrusted Input
+description: >-
+  Neutralize prompt-injection in attacker-controlled issue/PR/comment text
+  before it is placed in an LLM prompt. Strips control/bidi sequences, caps
+  length, neutralizes role-play override markers, masks secret-looking strings,
+  and backtick-fences the content inside an UNTRUSTED banner.
+
+inputs:
+  raw:
+    description: Raw, attacker-controlled text to sanitize (issue/PR/comment body).
+    required: true
+  config:
+    description: >-
+      Optional JSON object overriding sanitizer defaults. Recognized keys:
+      maxLength (number), redactionMarker (string), secretMask (string),
+      bannerLabel (string), extraInjectionPhrases (string[]),
+      annotateTruncation (boolean). Malformed JSON is ignored with a warning.
+    required: false
+    default: ""
+  max-length:
+    description: >-
+      Convenience override for config.maxLength (hard character cap on the raw
+      input). Takes precedence over the `config` blob when set.
+    required: false
+    default: ""
+  banner-label:
+    description: >-
+      Convenience override for config.bannerLabel (the label wrapping the fenced
+      content). Takes precedence over the `config` blob when set.
+    required: false
+    default: ""
+
+outputs:
+  safe:
+    description: Sanitized, fenced, banner-wrapped text safe to embed in a prompt.
+  truncated:
+    description: '"true" if the input exceeded the length cap and was truncated.'
+  injection-hits:
+    description: Number of suspected prompt-injection markers that were neutralized.
+  secret-hits:
+    description: Number of secret-looking strings that were masked.
+  original-length:
+    description: Character length of the raw input as received (pre-sanitization).
+
+runs:
+  using: node20
+  main: dist/index.cjs

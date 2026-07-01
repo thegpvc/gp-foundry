@@ -1,0 +1,100 @@
+name: Setup Agent Environment
+description: One-step, generalized environment setup for agent workflows. Always installs Node.js and Claude Code; Go, protoc, and make targets are opt-in.
+
+inputs:
+  node-version:
+    description: Node.js version to install (always installed). Defaults to 20 if empty.
+    required: false
+    default: "20"
+  install-go:
+    description: Set to "true" to install Go and run Go tooling. Empty or any other value skips Go.
+    required: false
+    default: ""
+  go-version:
+    description: Go version to install when install-go is "true".
+    required: false
+    default: "1.24"
+  install-protoc:
+    description: Set to "true" to install protoc. Empty or any other value skips protoc.
+    required: false
+    default: ""
+  protoc-version:
+    description: protoc version to install when install-protoc is "true".
+    required: false
+    default: "25.1"
+  setup-commands:
+    description: Arbitrary shell to run after toolchain setup (e.g. "make tools" or dependency install). Skipped when empty.
+    required: false
+    default: ""
+  git-name:
+    description: git user.name to configure. Skipped when empty.
+    required: false
+    default: ""
+  git-email:
+    description: git user.email to configure. Skipped when empty.
+    required: false
+    default: ""
+  claude-code-oauth-token:
+    description: Claude Code OAuth token. Validated (must be non-empty) when provided.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Go
+      if: inputs.install-go == 'true'
+      uses: actions/setup-go@v6
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: ${{ inputs.node-version == '' && '20' || inputs.node-version }}
+
+    - name: Install Claude Code
+      shell: bash
+      run: npm install -g @anthropic-ai/claude-code
+
+    - name: Install protoc
+      if: inputs.install-protoc == 'true'
+      shell: bash
+      env:
+        PROTOC_VERSION: ${{ inputs.protoc-version }}
+      run: |
+        set -euo pipefail
+        curl -sLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        sudo unzip -o "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local bin/protoc 'include/*'
+        rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+
+    - name: Run setup commands
+      if: inputs.setup-commands != ''
+      shell: bash
+      run: ${{ inputs.setup-commands }}
+
+    - name: Configure git identity
+      if: inputs.git-name != '' || inputs.git-email != ''
+      shell: bash
+      env:
+        GIT_NAME: ${{ inputs.git-name }}
+        GIT_EMAIL: ${{ inputs.git-email }}
+      run: |
+        set -euo pipefail
+        if [ -n "$GIT_NAME" ]; then
+          git config user.name "$GIT_NAME"
+        fi
+        if [ -n "$GIT_EMAIL" ]; then
+          git config user.email "$GIT_EMAIL"
+        fi
+
+    - name: Validate Claude Code token
+      if: inputs.claude-code-oauth-token != ''
+      shell: bash
+      env:
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+      run: |
+        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+          echo "::error::claude-code-oauth-token was provided but resolved to an empty value"
+          exit 1
+        fi

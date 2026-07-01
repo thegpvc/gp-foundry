@@ -1,0 +1,14 @@
+# Paths the agent must never modify. The 'immutable' list is enforced
+# by CI and cannot be changed by agents. The 'forbidden' list is
+# prompt-enforced and can be adjusted by the improve workflow.
+immutable_paths:  # enforced by CI check, never modifiable by agents
+  - .github/workflows/
+forbidden_paths:  # prompt-enforced, adjustable by improve workflow
+  - terraform/
+forbidden_operations:
+  - infrastructure changes
+guidance:
+  - prefer small, focused changes
+  - if proto or sqlc files change, run 'make generate' before testing
+  - when in doubt, open a draft PR and explain what's left
+  - never use gRPC path parameters for fields that may contain slashes or other special characters (e.g., project names, file paths, user-supplied text). Use query parameters instead. grpc-gateway does not correctly route URL-encoded slashes (%2F) in path segments.

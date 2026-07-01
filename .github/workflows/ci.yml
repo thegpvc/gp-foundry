@@ -1,0 +1,115 @@
+# gp-foundry's own CI. Builds/tests the compiler and runtime-core actions, and
+# lints both this repo's workflows and any GENERATED example harness workflows.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default; individual jobs are read-only here.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build & test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # actions/setup-node@v4.1.0
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      # Rebuilds every action bundle and fails if actions/*/dist/ drifts from
+      # what is committed (the pinned runtime core must ship in sync with src).
+      - name: Check bundled dist is up to date
+        run: npm run check:dist
+
+  lint-workflows:
+    name: lint workflows (actionlint + zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # actionlint: rhysd publishes no root action.yml, so we run it via his
+      # official installer fetched at a pinned commit (rhysd/actionlint@v1.7.12,
+      # 914e7df21a07ef503a81201c76d2b11c789d3fca) — this IS the SHA pin.
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL \
+            https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash)
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      # Lints this repo's workflows AND any generated example harness workflows.
+      # -shellcheck= disables shellcheck (not installed here); config-loader-like
+      # generated files are covered by the same pass.
+      - name: Run actionlint
+        run: |
+          shopt -s nullglob globstar
+          files=( .github/workflows/*.yml .github/workflows/*.yaml )
+          gen=( examples/**/.github/workflows/*.yml examples/**/.github/workflows/*.yaml )
+          if [ ${#gen[@]} -gt 0 ]; then
+            files+=( "${gen[@]}" )
+          fi
+          echo "Linting: ${files[*]}"
+          actionlint -shellcheck= "${files[@]}"
+
+      # astral-sh/setup-uv@v5 (d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86) — used
+      # only to fetch a pinned zizmor via uvx; no network audits are performed.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+
+      - name: Run zizmor
+        run: |
+          shopt -s nullglob globstar
+          targets=( .github/workflows )
+          for d in examples/**/.github/workflows; do
+            targets+=( "$d" )
+          done
+          echo "Auditing: ${targets[*]}"
+          # --no-online-audits keeps the run hermetic (no token required,
+          # deterministic in CI). Default persona: fails on real findings without
+          # the noise of low-confidence pedantic ones.
+          uvx --from zizmor==1.26.1 zizmor --no-online-audits "${targets[@]}"
+
+  guard:
+    name: generated-workflow guards
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Invariants for GENERATED harness workflows (system-design §7):
+      #   1. never `uses: ./` — generated workflows must reference the pinned
+      #      runtime core by version, not consumer-local relative paths that
+      #      would break when copied into a target repo.
+      #   2. never interpolate `${{ github.event.* }}` inside a run: block —
+      #      untrusted event data must flow through env + sanitize-untrusted-input,
+      #      never be spliced straight into a shell (script-injection class).
+      - name: Guard generated workflows
+        run: bash scripts/guard-generated-workflows.sh

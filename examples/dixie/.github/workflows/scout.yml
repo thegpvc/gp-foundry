@@ -1,0 +1,47 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: scout
+"on":
+  issues:
+    types:
+      - opened
+concurrency:
+  group: scout-${{ github.event.issue.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 15
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DIXIE_AGENT_APP_ID }}
+          private-key: ${{ secrets.DIXIE_AGENT_APP_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Setup agent toolchain
+        uses: ./.github/agent-setup
+      - name: Fetch context
+        id: ctx
+        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        with:
+          type: issue
+          number: ${{ github.event.issue.number }}
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Run agent
+        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        with:
+          role-file: roles/scout.md
+          model: claude-opus-4-8
+          scope-path: agents/scope.yaml
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          context-file: ${{ steps.ctx.outputs.context-file }}

@@ -1,0 +1,50 @@
+name: "Foundry config-loader"
+description: >-
+  Parse a consumer foundry.config.yaml, validate it against the FoundryConfig
+  JSON Schema, resolve a given node/persona's effective settings, and emit them
+  as outputs (model, allowed-tools, labels, identity fields, and a full JSON
+  blob). Fully domain-neutral — no hardcoded bot login, model, secret names or
+  labels.
+author: gp-foundry
+
+inputs:
+  config-path:
+    description: "Path to the consumer's foundry.config.yaml."
+    required: true
+  node:
+    description: >-
+      Optional persona/role key. When set, that persona's overrides (from the
+      config's `personas` map) shadow the top-level defaults. When omitted, the
+      top-level defaults are used verbatim.
+    required: false
+    default: ""
+
+outputs:
+  name:
+    description: "The harness/fleet name."
+  model:
+    description: "Effective model id for the resolved persona."
+  cli:
+    description: "Effective agent CLI binary for the resolved persona."
+  allowed-tools:
+    description: "Effective allowed-tools as a comma-joined string."
+  labels-json:
+    description: "Effective semantic-role -> label map as a JSON object."
+  bot-login:
+    description: "Effective bot login (empty if unset)."
+  git-name:
+    description: "Effective git commit author name (empty if unset)."
+  git-email:
+    description: "Effective git commit author email (empty if unset)."
+  app-id-secret:
+    description: "Name of the Actions secret holding the GitHub App id (empty if unset)."
+  app-key-secret:
+    description: "Name of the Actions secret holding the GitHub App private key (empty if unset)."
+  oauth-token-secret:
+    description: "Name of the Actions secret holding the agent OAuth token (empty if unset)."
+  json:
+    description: "The full resolved config view (persona-flattened) as a JSON blob."
+
+runs:
+  using: "node20"
+  main: "dist/index.cjs"

@@ -1,0 +1,56 @@
+name: Example Agent Fleet
+
+identity:
+  app_id_secret: EXAMPLE_APP_ID
+  app_key_secret: EXAMPLE_APP_PRIVATE_KEY
+  bot_login: example-agent[bot]
+  git_name: Example Agent
+  git_email: agent@example.com
+
+agent:
+  cli: claude
+  model: claude-opus-4-8
+  oauth_token_secret: CLAUDE_CODE_OAUTH_TOKEN
+  allowed_tools:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Bash(git:*)
+
+repo:
+  base_branch: main
+  branch_prefix: agent/
+
+labels:
+  triage: needs-triage
+  ready: agent-ready
+  blocked: agent-blocked
+
+markers:
+  done: "<!-- agent:done -->"
+
+size:
+  warn_additions: 300
+  hard_additions: 1000
+  exclude_globs:
+    - "**/*.snap"
+
+runtime:
+  mode: pinned
+  ref: v1.2.3
+  owner_repo: example/gp-runtime
+
+personas:
+  reviewer:
+    model: claude-sonnet-4-6
+    allowed_tools: "Read,Grep,Glob"
+    labels:
+      ready: review-ready
+    identity:
+      bot_login: example-reviewer[bot]
+      git_name: Example Reviewer
+  implementer:
+    labels:
+      ready: build-ready

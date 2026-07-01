@@ -1,0 +1,33 @@
+name: Agent Context
+description: Fetch and format GitHub issue/PR context for agent prompts
+
+inputs:
+  type:
+    description: "Context type: issue, pr-diff, pr-review, pr-full"
+    required: true
+  number:
+    description: Issue or PR number
+    required: true
+  token:
+    description: GitHub token for API calls
+    required: true
+  include-diff:
+    description: Whether to include the full diff (for PR types)
+    default: "true"
+  triggering-comment:
+    description: Body of the comment that triggered the workflow
+    default: ""
+  base-branch:
+    description: >-
+      Optional base branch to note as the comparison base. The PR diff is always
+      taken relative to the PR's own base ref; this input is surfaced for logging
+      and downstream steps.
+    default: ""
+
+outputs:
+  context-file:
+    description: Path to the formatted context file
+
+runs:
+  using: node20
+  main: dist/index.cjs

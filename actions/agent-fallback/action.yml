@@ -1,0 +1,204 @@
+name: Agent Fallback
+description: Safety net — strip protected paths, commit, push, and create a PR if the agent didn't.
+
+inputs:
+  branch:
+    description: Branch name to push.
+    required: true
+  token:
+    description: GitHub token used for push, PR creation, and comments.
+    required: true
+  agent-name:
+    description: Agent name for fallback commit messages (e.g., implement, improve, fix).
+    required: true
+  base-branch:
+    description: Base branch to diff against and target for the fallback PR.
+    default: main
+  scope-path:
+    description: >-
+      Path to the scope YAML file whose `immutable_paths:` list names paths the agent
+      must never modify. These are stripped before pushing (a restricted token cannot
+      push workflow changes). If the file or the key is absent, defaults to
+      `.github/workflows/`.
+    default: .github/agents/scope.yaml
+  commit-message:
+    description: Fallback commit message (if the agent left uncommitted changes).
+    default: ""
+  pr-title:
+    description: Fallback PR title (empty = never create a fallback PR).
+    default: ""
+  pr-body:
+    description: Fallback PR body.
+    default: ""
+  pr-label:
+    description: Label for the fallback PR.
+    default: ""
+  issue-number:
+    description: Issue to comment on with the PR link (and optional no-changes comment).
+    default: ""
+  no-changes-comment:
+    description: Comment to post on PR/issue if no changes were made (empty = skip).
+    default: ""
+  comment-target:
+    description: "Where to post no-changes-comment: 'pr' or 'issue'."
+    default: "pr"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve immutable paths
+      id: immutable
+      shell: bash
+      env:
+        SCOPE_PATH: ${{ inputs.scope-path }}
+      run: |
+        # Extract the `immutable_paths:` list from the scope YAML without a YAML
+        # parser. We read simple `- <path>` list items that follow the
+        # `immutable_paths:` key, stopping at the next top-level key.
+        PATHS=""
+        if [ -f "$SCOPE_PATH" ]; then
+          PATHS=$(awk '
+            /^immutable_paths[[:space:]]*:/ { grab=1; next }
+            grab {
+              # A new top-level key (no leading whitespace, ends with ":") ends the list.
+              if ($0 ~ /^[^[:space:]#][^:]*:/) { grab=0; next }
+              # List item: "  - some/path"
+              if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+                line=$0
+                sub(/^[[:space:]]*-[[:space:]]*/, "", line)   # drop the "- " marker
+                sub(/[[:space:]]*#.*$/, "", line)             # drop trailing comment
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)  # trim
+                gsub(/^["'\'']|["'\'']$/, "", line)            # drop surrounding quotes
+                if (line != "") print line
+              }
+            }
+          ' "$SCOPE_PATH")
+        fi
+        if [ -z "$PATHS" ]; then
+          PATHS=".github/workflows/"
+          echo "::notice::No immutable_paths found in '$SCOPE_PATH'; defaulting to .github/workflows/"
+        fi
+        # Serialize the (possibly multi-line) list into GITHUB_OUTPUT.
+        {
+          echo "paths<<__IMMUTABLE_EOF__"
+          echo "$PATHS"
+          echo "__IMMUTABLE_EOF__"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Strip protected path changes
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        IMMUTABLE_PATHS: ${{ steps.immutable.outputs.paths }}
+      run: |
+        # Revert any changes to immutable paths — the restricted App token
+        # typically lacks permission to push them (e.g. `workflows`), so the
+        # push would be rejected. Strip from committed and uncommitted changes.
+        BASE_REF="origin/${BASE_BRANCH}"
+
+        while IFS= read -r P; do
+          [ -z "$P" ] && continue
+
+          # 1. Committed changes (agent may have committed via git).
+          CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" -- "$P" 2>/dev/null || true)
+          if [ -n "$CHANGED" ]; then
+            echo "::warning::Agent committed changes to protected path '$P' — stripping"
+            echo "$CHANGED"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              git checkout "$BASE_REF" -- "$f" 2>/dev/null || git rm -f "$f" 2>/dev/null || true
+            done <<< "$CHANGED"
+          fi
+
+          # 2. Uncommitted changes (working tree / staged).
+          git checkout -- "$P" 2>/dev/null || true
+          git reset -- "$P" 2>/dev/null || true
+        done <<< "$IMMUTABLE_PATHS"
+
+        # Fold any restorations staged above into the tip commit.
+        git diff --staged --quiet || git commit --amend --no-edit
+
+    - name: Commit uncommitted changes
+      shell: bash
+      env:
+        COMMIT_MSG: ${{ inputs.commit-message }}
+        AGENT_NAME: ${{ inputs.agent-name }}
+      run: |
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::notice::Agent left uncommitted changes, committing..."
+          git add -A
+          if [ -z "$COMMIT_MSG" ]; then
+            COMMIT_MSG="Agent ${AGENT_NAME}: automated changes"
+          fi
+          git commit -m "$COMMIT_MSG"
+        fi
+
+    - name: Check for changes
+      id: check
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base-branch }}
+      run: |
+        if [ "$(git rev-list "origin/${BASE_BRANCH}..HEAD" --count)" -eq 0 ]; then
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Post no-changes comment
+      if: steps.check.outputs.has_changes == 'false' && inputs.no-changes-comment != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        COMMENT_BODY: ${{ inputs.no-changes-comment }}
+        COMMENT_TARGET: ${{ inputs.comment-target }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        if [ "$COMMENT_TARGET" = "issue" ] && [ -n "$ISSUE_NUMBER" ]; then
+          gh issue comment "$ISSUE_NUMBER" --body "$COMMENT_BODY"
+        elif [ "$COMMENT_TARGET" = "pr" ]; then
+          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+          fi
+        fi
+
+    - name: Push branch
+      if: steps.check.outputs.has_changes == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        git push origin "$BRANCH"
+
+    - name: Create PR if needed
+      if: steps.check.outputs.has_changes == 'true' && inputs.pr-title != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        PR_LABEL: ${{ inputs.pr-label }}
+        BRANCH: ${{ inputs.branch }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        AGENT_NAME: ${{ inputs.agent-name }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+      run: |
+        EXISTING_PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')
+        if [ -z "$EXISTING_PR" ]; then
+          echo "::notice::Agent didn't create a PR, creating fallback..."
+          PR_ARGS=(--title "$PR_TITLE" --base "$BASE_BRANCH" --head "$BRANCH")
+          if [ -n "$PR_BODY" ]; then
+            PR_ARGS+=(--body "$PR_BODY")
+          fi
+          if [ -n "$PR_LABEL" ]; then
+            PR_ARGS+=(--label "$PR_LABEL")
+          fi
+          PR_URL=$(gh pr create "${PR_ARGS[@]}")
+
+          if [ -n "$ISSUE_NUMBER" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "Agent ${AGENT_NAME}: PR created: ${PR_URL}"
+          fi
+        fi

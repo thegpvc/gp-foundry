@@ -1,0 +1,22 @@
+# Merge-gate policy for the dixie shipper (merge-gate node).
+# Consumed by the merge-gate handler / enforcer.
+
+# Minimum age of an approval before the PR may be auto-merged.
+approval_delay_minutes: 30
+
+# Hard cap on additions for an auto-mergeable PR (excludes exclude_globs).
+max_additions: 1200
+
+# Globs excluded from the size accounting.
+exclude_globs:
+  - "gen/**"
+
+# Paths that block auto-merge and require human review if touched.
+protected_paths:
+  - "db/migrations/"
+  - "terraform/"
+  - ".github/"
+  - "CLAUDE.md"
+
+# Merge strategy used when the gate opens.
+strategy: rebase

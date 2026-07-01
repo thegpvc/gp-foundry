@@ -1,0 +1,43 @@
+# gp-foundry consumer config for the dixie agent fleet.
+# Mirrors src/ir/types.ts FoundryConfig and schema/config.schema.json.
+name: dixie
+
+identity:
+  app_id_secret: DIXIE_AGENT_APP_ID
+  app_key_secret: DIXIE_AGENT_APP_PRIVATE_KEY
+  bot_login: dixie-agent
+  git_name: dixie-agent[bot]
+
+agent:
+  cli: claude
+  model: claude-opus-4-8
+  oauth_token_secret: CLAUDE_CODE_OAUTH_TOKEN
+
+repo:
+  base_branch: main
+  branch_prefix: agent/
+
+# semantic role -> repo label (the drift-killer).
+labels:
+  ready: agent
+  needs_design: agent-brainstorm
+  in_progress: agent-in-progress
+  needs_human: needs-human
+  blocked: agent-blocked
+
+# parseable markers shared by prompts + guards + enforcers.
+markers:
+  approve_regex: '^\s*(?:lgtm|approved?|ship\s*it)\s*$'
+  open_questions: "## Open Questions"
+  follow_ups: "## Follow-ups"
+  depends_on: "Depends-On:"
+
+size:
+  warn_additions: 900
+  hard_additions: 1200
+  exclude_globs:
+    - "gen/**"
+
+runtime:
+  mode: pinned
+  owner_repo: thegpvc/gp-foundry

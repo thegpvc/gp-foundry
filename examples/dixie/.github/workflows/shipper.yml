@@ -1,0 +1,38 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: shipper
+"on":
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: shipper
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  shipper:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    timeout-minutes: 10
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DIXIE_AGENT_APP_ID }}
+          private-key: ${{ secrets.DIXIE_AGENT_APP_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+      - name: Evaluate merge gate
+        uses: thegpvc/gp-foundry/actions/merge-gate@v1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          policy-path: policy/merge.yaml
+          base-branch: main

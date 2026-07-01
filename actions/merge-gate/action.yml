@@ -1,0 +1,45 @@
+name: "merge-gate"
+description: >
+  Evaluate a PR against a merge policy (bot-approval, CI, approval delay,
+  hand-written diff size, protected paths, clean rebase) and either merge it,
+  apply a routing label, or skip. Generalized port of the gp-dixie "Shipper".
+author: "gp-foundry"
+
+inputs:
+  pr-number:
+    description: "PR number to evaluate."
+    required: true
+  token:
+    description: >
+      GitHub token with contents:write and pull-requests:write (typically a
+      GitHub App installation token so merges are attributed to the bot).
+    required: true
+  policy-path:
+    description: "Path to the merge policy file (YAML or JSON)."
+    required: true
+  clean-rebase:
+    description: >
+      Optional override for the clean-rebase check: "true" or "false". When
+      unset, the action infers it from the PR's mergeable state.
+    required: false
+    default: ""
+  dry-run:
+    description: "When 'true', evaluate and emit outputs but perform no mutation."
+    required: false
+    default: "false"
+
+outputs:
+  action:
+    description: "Decision: merge | skip | label."
+  code:
+    description: "Machine-stable reason code (e.g. ready-to-merge, too-large)."
+  reason:
+    description: "Human-readable explanation of the decision."
+  label:
+    description: "Label to apply, when action is 'label'."
+  merged:
+    description: "'true' if the PR was merged by this run, else 'false'."
+
+runs:
+  using: "node20"
+  main: "dist/index.cjs"

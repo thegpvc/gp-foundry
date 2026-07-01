@@ -1,0 +1,51 @@
+name: "wait-for-checks"
+description: >-
+  Poll a named CI workflow (by file name) or a named check-run for a head SHA
+  until it reaches a terminal conclusion or a timeout is hit. Emits a single
+  `conclusion` output (success | failure | cancelled | skipped | timeout | …).
+
+inputs:
+  sha:
+    description: "Head commit SHA to wait on."
+    required: true
+  token:
+    description: "GitHub token used to query the checks/actions API."
+    required: true
+  workflow-name:
+    description: >-
+      Workflow file name to wait on (e.g. "ci.yml"). Mutually exclusive with
+      `check-name`; provide exactly one.
+    required: false
+    default: ""
+  check-name:
+    description: >-
+      Check-run name to wait on. Mutually exclusive with `workflow-name`;
+      provide exactly one.
+    required: false
+    default: ""
+  timeout-seconds:
+    description: "Maximum time to wait before returning `timeout`."
+    required: false
+    default: "900"
+  poll-interval:
+    description: "Seconds to sleep between polls."
+    required: false
+    default: "20"
+  owner:
+    description: "Repository owner. Defaults to the current repository owner."
+    required: false
+    default: ""
+  repo:
+    description: "Repository name. Defaults to the current repository name."
+    required: false
+    default: ""
+
+outputs:
+  conclusion:
+    description: >-
+      Terminal status: success | failure | cancelled | skipped | timed_out |
+      neutral | timeout | not_found | …
+
+runs:
+  using: "node20"
+  main: "dist/index.cjs"

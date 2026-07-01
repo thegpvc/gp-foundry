@@ -1,0 +1,55 @@
+# foundry.config.yaml — consumer-repo global config. Validated against
+# schema/config.schema.json by `gp-foundry validate`/`build`. Every value here was a
+# hardcode in the original hand-wired harness; it is now config you supply. Fill from the
+# interview's Q5 (identity/model/toolchain) and Q4 (labels). No repo-specific literals baked
+# into the generated YAML — it all rides in files like this one.
+
+name: <Your Harness Name>            # e.g. "acme-agent fleet"
+
+auth:                                # how the harness authenticates to GitHub for writes.
+  # Pick ONE mode:
+  #   app          — GitHub App token: clean bot identity, downstream events cascade. Best for orgs.
+  #   pat          — a fine-grained PAT secret: events cascade, one secret, no App. Easiest for a
+  #                  personal/test repo. Scope it to the repo with contents/PR/issues write.
+  #   github-token — the built-in GITHUB_TOKEN: zero setup, BUT commits/PRs made with it do NOT
+  #                  trigger other workflows, so chained stages will NOT cascade. Single-shot only.
+  mode: pat
+  token_secret: AGENT_PAT            # (pat mode) name of the secret holding the PAT
+  # app_id_secret: ACTIONS_SECRET_FOR_APP_ID    # (app mode)
+  # app_key_secret: ACTIONS_SECRET_FOR_APP_KEY  # (app mode)
+
+identity:                            # git author for the agent's commits/PRs
+  bot_login: <your-agent>
+  git_name: <Your Agent>
+  git_email: <agent@example.com>
+
+agent:                               # the coding-agent CLI + default model
+  cli: claude
+  model: <model-id>                  # e.g. a current Claude model id
+  oauth_token_secret: <ACTIONS_SECRET_NAME_FOR_AGENT_TOKEN>
+  # allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)"   # default; roles may narrow
+
+repo:
+  base_branch: main
+  branch_prefix: agent               # branches look like <branch_prefix>/<n>-slug
+
+labels:                              # semantic key -> actual repo label (the drift-killer).
+  build: agent                       #   `when="label=build"` resolves to this label
+  plan: agent-brainstorm
+  # add one entry per label your guards reference
+
+markers:                             # optional: parseable markers shared by prompts + guards
+  # verdict: "**Verdict:**"
+  # closes: "Closes #"
+
+size:                                # merge-gate size policy (additions excl. generated)
+  warn_additions: 300
+  hard_additions: 800
+  exclude_globs:
+    - "**/*.generated.*"
+    - "**/dist/**"
+
+runtime:                             # how generated workflows reference runtime-core actions
+  mode: pinned                       # `pinned` (SHA-pinned central actions) or `vendored`
+  owner_repo: <owner>/gp-foundry
+  ref: <sha-or-tag>                  # pin to a SHA in `pinned` mode

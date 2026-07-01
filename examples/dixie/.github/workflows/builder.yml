@@ -1,0 +1,74 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: builder
+"on":
+  issues:
+    types:
+      - labeled
+concurrency:
+  group: builder-${{ github.event.issue.number }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  builder:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'agent'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    timeout-minutes: 30
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DIXIE_AGENT_APP_ID }}
+          private-key: ${{ secrets.DIXIE_AGENT_APP_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Create branch
+        id: branch
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          PREFIX: agent/
+        run: |-
+          SLUG=$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-50 | sed 's/-$//')
+          BRANCH="$PREFIX$ISSUE_NUMBER-$SLUG"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+      - name: Setup agent toolchain
+        uses: ./.github/agent-setup
+      - name: Fetch context
+        id: ctx
+        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        with:
+          type: issue
+          number: ${{ github.event.issue.number }}
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Run agent
+        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        with:
+          role-file: roles/builder.md
+          model: claude-opus-4-8
+          scope-path: agents/scope.yaml
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          context-file: ${{ steps.ctx.outputs.context-file }}
+      - name: "Fallback: commit / push / PR"
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v1
+        with:
+          branch: ${{ steps.branch.outputs.branch }}
+          token: ${{ steps.app-token.outputs.token }}
+          agent-name: builder
+          base-branch: main
+          issue-number: ${{ github.event.issue.number }}
+          pr-title: "[agent] builder #${{ github.event.issue.number }}"
+          pr-body: |-
+            Automated change for #${{ github.event.issue.number }}.
+
+            Closes #${{ github.event.issue.number }}

@@ -1,0 +1,15 @@
+node_modules/
+/dist/
+*.tsbuildinfo
+.DS_Store
+coverage/
+*.log
+tmp/
+.tmp/
+tsconfig.src.json
+
+# NOTE: actions/*/dist/ is intentionally NOT ignored — GitHub runs the committed
+# bundle, and the check:dist CI gate verifies it stays in sync with src.
+
+# local harness smoke test (not part of gp-foundry)
+.sandbox/

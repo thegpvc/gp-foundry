@@ -1,0 +1,22 @@
+// gp-dixie's autonomous harness, expressed as a graph.
+// `type` = mechanical GitHub interaction; `role` = the job description (content).
+digraph dixie {
+  start       [type=start]
+  scout       [type=issue-agent, role="roles/scout.md",     context=issue]
+  architect   [type=analyst,     role="roles/architect.md", context=issue, output=comment]
+  builder     [type=producer,    role="roles/builder.md",   context=issue]
+  critic      [type=pr-review,   role="roles/critic.md",    context="pr-diff", gates="ci.yml"]
+  fixer       [type=pr-fix,      role="roles/fixer.md",     max_attempts=3]
+  shipper     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
+  needs_human [type=exit]
+
+  start     -> scout       [on="issues.opened"]
+  scout     -> architect   [when="label=agent-brainstorm"]
+  scout     -> builder     [when="label=agent"]
+  architect -> builder     [when="label=agent"]
+  builder   -> critic      [on="pull_request.opened"]
+  critic    -> shipper     [when="verdict=approve"]
+  critic    -> fixer       [when="verdict=request_changes"]
+  fixer     -> critic      [on="push"]
+  fixer     -> needs_human [when="attempts>=3"]
+}

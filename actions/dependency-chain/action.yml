@@ -1,0 +1,57 @@
+name: "Dependency Chain"
+description: >-
+  On a merged PR, unblock dependent issues (swap a blocked→ready label when their
+  declared dependencies are resolved) and close parent tracking issues whose
+  sub-issues are all done. Markers, labels and close-keywords are configurable.
+author: gp-foundry
+
+inputs:
+  token:
+    description: >-
+      Token with `issues: write` used to relabel/close issues. Prefer a GitHub
+      App installation token so downstream label-triggered workflows fire.
+    required: true
+  config:
+    description: >-
+      JSON object configuring the chain behavior. Recognized keys:
+        blockedLabel        label removed when a dependent is unblocked (and the
+                            filter for candidate issues)
+        readyLabel          label added when a dependent is unblocked
+        dependsOnMarker     body marker template, must contain `{n}`
+                            (default: "<!-- depends-on: #{n} -->")
+        parentMarker        body marker template, must contain `{n}`
+                            (default: "<!-- parent: #{n} -->")
+        closeKeywords       array of PR-body close keywords
+                            (default: close/fix/resolve variants)
+        parentCloseComment  comment posted before closing a parent; `{n}` → number
+    required: false
+    default: "{}"
+  pr-body:
+    description: >-
+      Merged PR body to scan for close keywords. If omitted, resolved from
+      `pr-number` (via the API) or the triggering pull_request event payload.
+    required: false
+    default: ""
+  pr-number:
+    description: >-
+      PR number to fetch the body from when `pr-body` is not supplied.
+    required: false
+    default: ""
+  dry-run:
+    description: "Compute and log ops without applying any label/close changes."
+    required: false
+    default: "false"
+
+outputs:
+  closed-issues:
+    description: "JSON array of issue numbers the merged PR closed."
+  unblocked:
+    description: "JSON array of issue numbers that were unblocked."
+  closed-parents:
+    description: "JSON array of parent issue numbers that were closed."
+  ops:
+    description: "JSON array of the full computed ChainOp objects."
+
+runs:
+  using: "node20"
+  main: "dist/index.cjs"

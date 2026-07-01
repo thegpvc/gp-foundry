@@ -1,0 +1,26 @@
+name: gp-foundry
+interactive: true
+runtime: docker
+
+env:
+  ANTHROPIC_MODEL: opus
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: 1
+
+container:
+  memory: 8192
+  cpus: 8
+
+dependencies:
+  - cli-essentials
+  - git
+  - bun
+  - gh
+  - make
+  - claude-code
+  - docker:dind
+  - python
+
+grants:
+  - claude
+  - github
+  - ssh:github.com

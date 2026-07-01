@@ -1,0 +1,182 @@
+name: Run Agent
+description: >-
+  Assemble a prompt file in a documented order and run the Claude Code CLI
+  headlessly. Captures stderr, warns on any stderr output, and never fails the
+  step (the agent's side effects are the product, not its exit code).
+
+inputs:
+  role-file:
+    description: >-
+      Path to the role / job-description markdown file. This is the first
+      section of the assembled prompt and is required — it defines what the
+      agent is.
+    required: true
+  prompt-override-file:
+    description: >-
+      Optional path to a task-specific prompt file appended after the role.
+      When present its contents replace/augment the default instructions for
+      this invocation.
+    required: false
+    default: ""
+  context-file:
+    description: >-
+      Optional path to a file holding the runtime context (issue body, PR diff,
+      review comments, etc.) produced by an upstream context-gathering step.
+      Appended last so the agent sees its instructions before the payload.
+    required: false
+    default: ""
+  conventions:
+    description: >-
+      Optional inline conventions/guardrails string (typically sourced from the
+      foundry config JSON). Inserted between the prompt and the scope so repo
+      conventions are stated once, centrally.
+    required: false
+    default: ""
+  scope-path:
+    description: >-
+      Path to the scope config file (e.g. allowed paths / boundaries). Included
+      verbatim if the file exists. Defaults to .github/agents/scope.yaml.
+    required: false
+    default: ".github/agents/scope.yaml"
+  model:
+    description: Model id passed to `claude --model` (e.g. an Opus or Sonnet id).
+    required: true
+  allowed-tools:
+    description: >-
+      Value for `claude --allowedTools` (comma-separated tool allowlist, e.g.
+      "Read,Write,Edit,Glob,Grep,Bash(git:*)"). If empty, it is read from the
+      role file's `tools:` front-matter, so tool policy lives in the role and is
+      editable without a rebuild.
+    required: false
+    default: ""
+  claude-code-oauth-token:
+    description: >-
+      Claude Code OAuth token. Composites have no secrets context, so this must
+      be passed in explicitly by the caller.
+    required: true
+  extra-args:
+    description: >-
+      Optional extra arguments appended verbatim to the `claude` invocation
+      (passthrough for flags like --max-turns, --add-dir, etc.).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Assemble prompt
+      id: assemble
+      shell: bash
+      env:
+        ROLE_FILE: ${{ inputs.role-file }}
+        PROMPT_OVERRIDE_FILE: ${{ inputs.prompt-override-file }}
+        CONTEXT_FILE: ${{ inputs.context-file }}
+        CONVENTIONS: ${{ inputs.conventions }}
+        SCOPE_PATH: ${{ inputs.scope-path }}
+      run: |
+        set -euo pipefail
+
+        PROMPT_FILE="$(mktemp)"
+        echo "prompt-file=${PROMPT_FILE}" >> "$GITHUB_OUTPUT"
+
+        # Prompt is assembled in a fixed, documented order:
+        #   1. role-file            (required — who the agent is)
+        #   2. prompt-override-file (optional — the task instructions)
+        #   3. conventions          (optional — repo guardrails from config)
+        #   4. scope-path           (optional — path/boundary config)
+        #   5. context-file         (optional — the runtime payload)
+
+        # 1. role — include the BODY only. The YAML front-matter (role/type/tools/
+        #    handoffs) is compiler metadata, not agent instructions; leaving it in
+        #    the prompt makes models echo it back instead of acting.
+        if [ ! -f "$ROLE_FILE" ]; then
+          echo "::error::role-file not found: ${ROLE_FILE}"
+          exit 1
+        fi
+        if head -1 "$ROLE_FILE" | grep -q '^---[[:space:]]*$'; then
+          awk 'BEGIN{fm=0} /^---[[:space:]]*$/{fm++; next} fm>=2{print}' "$ROLE_FILE" >> "$PROMPT_FILE"
+        else
+          cat "$ROLE_FILE" >> "$PROMPT_FILE"
+        fi
+        printf '\n\n' >> "$PROMPT_FILE"
+
+        # 2. prompt override
+        if [ -n "$PROMPT_OVERRIDE_FILE" ] && [ -f "$PROMPT_OVERRIDE_FILE" ]; then
+          cat "$PROMPT_OVERRIDE_FILE" >> "$PROMPT_FILE"
+          printf '\n\n' >> "$PROMPT_FILE"
+        fi
+
+        # 3. conventions (inline string)
+        if [ -n "$CONVENTIONS" ]; then
+          printf '## Conventions\n\n' >> "$PROMPT_FILE"
+          printf '%s\n\n' "$CONVENTIONS" >> "$PROMPT_FILE"
+        fi
+
+        # 4. scope
+        if [ -n "$SCOPE_PATH" ] && [ -f "$SCOPE_PATH" ]; then
+          printf '## Scope\n\n' >> "$PROMPT_FILE"
+          cat "$SCOPE_PATH" >> "$PROMPT_FILE"
+          printf '\n\n' >> "$PROMPT_FILE"
+        fi
+
+        # 5. context payload
+        if [ -n "$CONTEXT_FILE" ] && [ -f "$CONTEXT_FILE" ]; then
+          printf '## Context\n\n' >> "$PROMPT_FILE"
+          cat "$CONTEXT_FILE" >> "$PROMPT_FILE"
+          printf '\n' >> "$PROMPT_FILE"
+        fi
+
+        echo "::notice::Assembled prompt at ${PROMPT_FILE} ($(wc -c < "$PROMPT_FILE") bytes)"
+
+    - name: Run agent
+      shell: bash
+      env:
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        PROMPT_FILE: ${{ steps.assemble.outputs.prompt-file }}
+        ROLE_FILE: ${{ inputs.role-file }}
+        MODEL: ${{ inputs.model }}
+        ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -uo pipefail
+
+        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
+          echo "::error::claude-code-oauth-token is empty"
+          exit 1
+        fi
+
+        # Tool policy lives in the role front-matter. If allowed-tools was not
+        # passed explicitly, read `tools: "..."` from the role file's YAML
+        # front-matter so tools are editable content (no rebuild needed).
+        if [ -z "${ALLOWED_TOOLS}" ] && [ -f "${ROLE_FILE}" ]; then
+          ALLOWED_TOOLS="$(awk '
+            /^---[[:space:]]*$/ { fm = (fm ? 2 : 1); next }
+            fm == 1 && /^[[:space:]]*tools[[:space:]]*:/ {
+              sub(/^[[:space:]]*tools[[:space:]]*:[[:space:]]*/, "")
+              gsub(/^["'"'"']|["'"'"']$/, "")
+              print; exit
+            }
+          ' "${ROLE_FILE}")"
+        fi
+        if [ -z "${ALLOWED_TOOLS}" ]; then
+          echo "::warning::no allowed-tools input and no tools: in role front-matter; claude will use its defaults"
+        fi
+
+        STDERR_LOG="$(mktemp)"
+
+        # Never fail the step: the agent's side effects (commits, comments,
+        # files) are handled by downstream steps. `|| true` swallows a nonzero
+        # exit so a partial run is still committed by a later fallback step.
+        # stderr is captured to a file (not streamed live) so we can surface it
+        # as a single grouped warning afterwards.
+        # shellcheck disable=SC2086
+        claude -p "$(cat "$PROMPT_FILE")" \
+          --model "$MODEL" \
+          --allowedTools "$ALLOWED_TOOLS" \
+          $EXTRA_ARGS \
+          2> "$STDERR_LOG" || true
+
+        if [ -s "$STDERR_LOG" ]; then
+          echo "::warning::Claude produced stderr output:"
+          cat "$STDERR_LOG"
+        fi
