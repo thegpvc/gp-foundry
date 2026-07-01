@@ -1,14 +1,49 @@
 {
-  "name": "gp-foundry",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@thegpvc/gp-foundry",
+  "version": "0.1.0",
   "description": "Compile a directed-graph spec (harness.dot) into an autonomous GitHub Actions agent harness.",
   "type": "module",
+  "license": "MIT",
+  "author": "The General Partnership (https://thegp.com)",
+  "homepage": "https://github.com/thegpvc/gp-foundry#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thegpvc/gp-foundry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thegpvc/gp-foundry/issues"
+  },
+  "keywords": [
+    "github-actions",
+    "agent",
+    "harness",
+    "claude",
+    "codegen",
+    "dot",
+    "graphviz",
+    "automation",
+    "ci",
+    "workflow"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
     "gp-foundry": "./dist/cli/index.cjs"
   },
-  "exports": {
-    ".": "./src/index.ts"
+  "files": [
+    "dist/cli",
+    "actions/*/action.yml",
+    "actions/*/dist",
+    "actions/*/README.md",
+    "schema",
+    "roles",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "cli": "tsx src/cli/index.ts",
@@ -17,7 +52,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check:dist": "npm run build:actions && git diff --exit-code -- 'actions/**/dist/**'"
+    "check:dist": "npm run build:actions && git diff --exit-code -- 'actions/**/dist/**'",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
