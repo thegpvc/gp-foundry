@@ -15,19 +15,19 @@ digraph harness {
   scout     [type=issue-agent, role="agents/roles/scout.md",   context=issue]
 
   // optional advisory lane for big/ambiguous units (read-only, posts a plan)
-  architect     [type=analyst,     role="agents/roles/architect.md",    context=issue, output=comment]
+  planner     [type=analyst,     role="agents/roles/planner.md",    context=issue, output=comment]
 
   // the producer: turns a labeled unit into a tested PR (the only code-writer here)
   builder       [type=producer,    role="agents/roles/builder.md",      context=issue]
 
   // review: reads the diff, runs gates, posts an approve / request-changes verdict
-  critic    [type=pr-review,   role="agents/roles/critic.md",   context="pr-diff", gates="ci.yml"]
+  reviewer    [type=pr-review,   role="agents/roles/reviewer.md",   context="pr-diff", gates="ci.yml"]
 
-  // bounded fix loop with the critic
+  // bounded fix loop with the reviewer
   fixer       [type=pr-fix,      role="agents/roles/fixer.md",      max_attempts=3]
 
   // approval: automated merge policy (swap for a human-gate if approval must be human)
-  shipper     [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  merge_gate     [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
   // scheduled sweep: rebases PRs the merge-gate labelled `needs-rebase` after a conflict
   janitor     [type=scheduled-agent, role="agents/roles/janitor.md", schedule="*/30 * * * *"]
   retro       [type=scheduled-agent, role="agents/roles/retro.md", schedule="0 7 * * 1-5"]  // active learning: mine the record for lessons
@@ -37,12 +37,12 @@ digraph harness {
 
   // ── edges ─────────────────────────────────────────────────────────────────
   start    -> scout     [on="issues.opened"]
-  scout  -> architect     [when="label=plan"]      // label names resolve via foundry.config.yaml
+  scout  -> planner     [when="label=plan"]      // label names resolve via foundry.config.yaml
   scout  -> builder       [when="label=build"]
-  architect  -> builder       [when="label=build"]
-  builder    -> critic    [on="pull_request.opened"]
-  critic -> shipper     [when="verdict=approve"]
-  critic -> fixer       [when="verdict=request_changes"]
-  fixer    -> critic    [on="push"]              // retry loop…
+  planner  -> builder       [when="label=build"]
+  builder    -> reviewer    [on="pull_request.opened"]
+  reviewer -> merge_gate     [when="verdict=approve"]
+  reviewer -> fixer       [when="verdict=request_changes"]
+  fixer    -> reviewer    [on="push"]              // retry loop…
   fixer    -> needs_human [when="attempts>=3"]     // …with a bounded escape (required)
 }

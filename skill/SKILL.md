@@ -36,7 +36,7 @@ artifact carrying a `# GENERATED FROM harness.dot — DO NOT EDIT` header. You e
    loaded at runtime. Editing a role needs **no rebuild**; only topology/policy changes do.
 4. **Generalize.** Nothing is repo-specific by default: no hardcoded bot login, app-secret
    names, label names, model, or paths. All of that is config the user supplies.
-5. **Bounded loops only.** Every cycle in the graph (e.g. fixer↔critic) MUST have a bounded
+5. **Bounded loops only.** Every cycle in the graph (e.g. fixer↔reviewer) MUST have a bounded
    escape edge to an `exit` node (e.g. `attempts>=N`). The model-checker will reject
    unbounded loops; design them in from the start.
 
@@ -48,8 +48,9 @@ A harness is a graph of **nodes** and **edges**.
 
 - A **node** is `type` × `role`. The `type` is the *mechanical* GitHub interaction
   (a small closed set); the `role` is the *behavioral identity* — a job description in
-  `roles/<name>.md` that carries the domain. Builder and Gardener are different roles on
-  the same `producer` type; Scout and Architect share `issue-agent`.
+  `roles/<name>.md` that carries the domain. Builder and a scheduled refactor role can be
+  different roles on the same `producer` type; the Planner (`analyst`) and Reviewer
+  (`pr-review`) are the same idea seen from the other side — different types.
 - An **edge** `a -> b [on="<event>", when="<guard>"]` is a transition: node `b`'s workflow
   triggers on GitHub event `<event>` and runs when the GitHub-observable guard `<guard>`
   holds (a label, a review verdict, a check conclusion, an attempt count).
@@ -107,7 +108,7 @@ This produces the node list and the edge list simultaneously. For each role, cap
 out-edges in `harness.dot`. The validator cross-checks both directions. Draft them together.
 
 Probe for the **loops**: "If review fails, what happens? How many tries before a human is
-pulled in?" A retry loop (fixer → critic → fixer) needs a bounded escape
+pulled in?" A retry loop (fixer → reviewer → fixer) needs a bounded escape
 (`fixer -> needs_human [when="attempts>=3"]`). No loop ships without one.
 
 ### Q4 — Cadence → triggers and schedules

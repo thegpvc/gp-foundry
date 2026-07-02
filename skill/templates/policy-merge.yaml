@@ -7,7 +7,7 @@
 # Only consider PRs whose head branch starts with this prefix.
 branch_prefix: "agent/"
 
-# Approval — the Critic posts its verdict in a review BODY; count a body matching
+# Approval — the Reviewer posts its verdict in a review BODY; count a body matching
 # this regex as approval (a bot can't formally APPROVE its own PR).
 approval_body_regex: "Verdict.*APPROVE"
 approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)

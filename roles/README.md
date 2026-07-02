@@ -46,7 +46,7 @@ inputs:
 outputs:
   - What the role produces / leaves behind.
 handoffs:
-  - to: critic
+  - to: reviewer
     when: pull_request.opened
 tools: Short description of the tools/access the role needs.
 quality_bar: >-
@@ -92,21 +92,21 @@ never disagree about routing; the compiler/validator can cross-check them.
 
 The `software` pack is the autonomous engineering team that takes an issue from
 triage to merge. Its handoffs mirror the edges in
-`examples/dixie/harness.dot`:
+`the default `harness.dot``:
 
 | Role | `type` | Hands off to | When |
 |------|--------|--------------|------|
-| `scout` | issue-agent | `architect` / `builder` | `label=agent-brainstorm` / `label=agent` |
-| `architect` | analyst | `builder` | `label=agent` |
-| `builder` | producer | `critic` | `pull_request.opened` |
-| `critic` | pr-review | `shipper` / `fixer` | `verdict=approve` / `verdict=request_changes` |
-| `fixer` | pr-fix | `critic` / `needs_human` | `push` / `attempts>=3` |
-| `shipper` | merge-gate | — (terminal) | — |
+| `scout` | issue-agent | `planner` / `builder` | `label=plan` / `label=build` |
+| `planner` | analyst | `builder` | `label=build` |
+| `builder` | producer | `reviewer` | `pull_request.opened` |
+| `reviewer` | pr-review | `merge_gate` / `fixer` | `verdict=approve` / `verdict=request_changes` |
+| `fixer` | pr-fix | `reviewer` / `needs_human` | `push` / `attempts>=3` |
+| `merge_gate` | merge-gate | — (terminal) | — |
 
 The flow: **Scout** classifies an incoming issue and routes it to design
-(**Architect**) or straight to build (**Builder**). The Builder opens a PR that
-the **Critic** reviews; approvals go to the **Shipper** (the scheduled merge
-gate), requested changes go to the **Fixer**, which loops back to the Critic —
+(**Planner**) or straight to build (**Builder**). The Builder opens a PR that
+the **Reviewer** reviews; approvals go to the **merge gate** (the scheduled merge
+gate), requested changes go to the **Fixer**, which loops back to the Reviewer —
 until the attempt budget is exhausted, at which point the PR goes to a human.
 
 These roles are generic. A consumer repo supplies its stack via the overlay:

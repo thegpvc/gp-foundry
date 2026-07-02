@@ -120,7 +120,7 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
     await octokit.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [decision.label] });
     core.info(`Labeled PR #${prNumber} \`${decision.label}\``);
     // Explain why it was held back (skipped plain-skips stay quiet; a label is a real block).
-    await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nHeld this PR back and labeled \`${decision.label}\` — ${decision.reason}. A human should take a look.`);
+    await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nHeld this PR back and labeled \`${decision.label}\` — ${decision.reason}. A human should take a look.`);
     return false;
   }
   if (decision.action === "merge") {
@@ -136,7 +136,7 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
       } catch (le) {
         core.warning(`Could not label #${prNumber} \`${rebaseLabel}\`: ${(le as Error).message}`);
       }
-      await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the Fixer can rebase this onto \`${facts.baseRefName}\` and try again.`);
+      await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the Fixer can rebase this onto \`${facts.baseRefName}\` and try again.`);
       return false;
     }
     if (policy.deleteBranchOnMerge ?? true) {
@@ -148,7 +148,7 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
     }
     core.info(`Merged PR #${prNumber}`);
     // Explain the decision on the PR (an audit trail humans can scan).
-    await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nMerged (\`${policy.mergeMethod ?? "rebase"}\`) — ${decision.reason}.`);
+    await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nMerged (\`${policy.mergeMethod ?? "rebase"}\`) — ${decision.reason}.`);
     return true;
   }
   return false;

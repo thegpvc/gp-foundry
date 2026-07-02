@@ -13,16 +13,17 @@ The canonical "issues in → reviewed, auto-merged PRs out" pipeline.
 | role | type | one-line job |
 |------|------|--------------|
 | Scout | `issue-agent` | triage an incoming issue; label it for a lane |
-| Architect | `analyst` (output=comment) | for big/ambiguous issues, post a plan before building |
+| Planner | `analyst` (output=comment) | for big/ambiguous issues, post a plan before building |
 | Builder | `producer` | turn a labeled issue into a small, tested, shippable PR |
-| Critic | `pr-review` | read the diff, run gates, post an approve/request-changes verdict |
-| Fixer | `pr-fix` (max_attempts=3) | apply review feedback; bounded retry loop with Critic |
-| Shipper | `merge-gate` | enforce merge policy; auto-merge or label for a human |
-| Gardener | `producer` (on a schedule) | maintenance/refactor lane; same type as Builder, different role |
+| Reviewer | `pr-review` | read the diff, run gates, post an approve/request-changes verdict |
+| Fixer | `pr-fix` (max_attempts=3) | apply review feedback; bounded retry loop with Reviewer |
+| merge-gate | `merge-gate` | enforce merge policy; auto-merge or label for a human (a gate, not a persona) |
+| Janitor | `scheduled-agent` | rebase PRs the gate flagged `needs-rebase` so they can merge |
+| Retro | `scheduled-agent` | mine the record for recurring lessons; write them to memory |
 
-Default graph: `start → Scout → {Architect|Builder} → Critic ↔ Fixer → Shipper → (exit)`,
-with `Fixer → needs_human [when="attempts>=3"]`. This is the shape in
-`reference/node-types.md`'s example.
+Default graph: `start → Scout → {Planner|Builder} → Reviewer ↔ Fixer → merge-gate`,
+with `Fixer → needs_human [when="attempts>=3"]`, plus a scheduled `Janitor` (rebase sweep) and
+`Retro` (learning). This is the shape in `reference/node-types.md`'s example.
 
 ## Content / marketing pack (proves domain-generality)
 
@@ -65,7 +66,7 @@ Default graph: `start → {Answerer|Planner}`, no `producer`, no merge-gate — 
 ## Adapting a pack
 
 1. Pick the pack from Q1's domain answer.
-2. Rename roles to the repo's vocabulary; drop lanes the repo doesn't need (e.g. no Architect
+2. Rename roles to the repo's vocabulary; drop lanes the repo doesn't need (e.g. no Planner
    if issues are always small).
 3. Re-wire edges to the handoffs the user described in Q3, keeping every loop bounded.
 4. Fill each `roles/<name>.md` repo-specific overlay (stack commands, conventions) — that

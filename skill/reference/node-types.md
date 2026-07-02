@@ -77,21 +77,21 @@ conclusions, schedules) — because GitHub is the executor, not a custom engine.
 digraph harness {
   start       [type=start]
   scout       [type=issue-agent, role="roles/scout.md",     context=issue]
-  architect   [type=analyst,     role="roles/architect.md", context=issue, output=comment]
+  planner   [type=analyst,     role="roles/planner.md", context=issue, output=comment]
   builder     [type=producer,    role="roles/builder.md",   context=issue]
-  critic      [type=pr-review,   role="roles/critic.md",    context="pr-diff", gates="ci.yml"]
+  reviewer      [type=pr-review,   role="roles/reviewer.md",    context="pr-diff", gates="ci.yml"]
   fixer       [type=pr-fix,      role="roles/fixer.md",     max_attempts=3]
-  shipper     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
+  merge_gate     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
   needs_human [type=exit]
 
   start     -> scout       [on="issues.opened"]
-  scout     -> architect   [when="label=brainstorm"]     // label name resolved via config
+  scout     -> planner   [when="label=plan"]     // label name resolved via config
   scout     -> builder     [when="label=build"]
-  architect -> builder     [when="label=build"]
-  builder   -> critic      [on="pull_request.opened"]
-  critic    -> shipper     [when="verdict=approve"]
-  critic    -> fixer       [when="verdict=request_changes"]
-  fixer     -> critic      [on="push"]                    // retry loop…
+  planner -> builder     [when="label=build"]
+  builder   -> reviewer      [on="pull_request.opened"]
+  reviewer    -> merge_gate     [when="verdict=approve"]
+  reviewer    -> fixer       [when="verdict=request_changes"]
+  fixer     -> reviewer      [on="push"]                    // retry loop…
   fixer     -> needs_human [when="attempts>=3"]           // …with a bounded escape
 }
 ```
