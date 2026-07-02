@@ -73,28 +73,34 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
   const bodyRe = policy.approvalBodyRegex ? new RegExp(policy.approvalBodyRegex) : undefined;
-  // Rejections invalidate earlier approvals. Default marker mirrors the approval one.
-  const rejectRe = new RegExp(policy.rejectionBodyRegex ?? "REQUEST_CHANGES");
+  // Rejections invalidate earlier approvals. The default marker is ANCHORED like the
+  // approval one (a bare "REQUEST_CHANGES" substring would misread an approval whose
+  // prose mentions the earlier requested changes — e.g. a fix-loop re-approval).
+  const rejectRe = new RegExp(policy.rejectionBodyRegex ?? "Verdict.*REQUEST_CHANGES");
 
   // Collect verdict-bearing events (reviews + marker comments) in time order, then
   // apply the integrity rule: latest verdict wins, approval must match the head SHA
   // (or, for comments, postdate the head commit). See gate.latestValidApproval.
   const events: VerdictEvent[] = [];
   const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
+  // Approval is tested FIRST: per the reviewer contract the verdict is the body's
+  // final "**Verdict:** …" line, and an approval may legitimately quote or discuss
+  // the earlier REQUEST_CHANGES items in its prose. A body matching the approval
+  // marker is an approval, full stop.
   for (const r of reviews) {
     if (!r.submitted_at) continue;
-    if (r.state === "CHANGES_REQUESTED" || (r.state === "COMMENTED" && r.body && rejectRe.test(r.body))) {
-      events.push({ at: r.submitted_at, kind: "reject", sha: r.commit_id });
-    } else if (isApprovalReview(r, bodyRe)) {
+    if (isApprovalReview(r, bodyRe)) {
       events.push({ at: r.submitted_at, kind: "approve", sha: r.commit_id });
+    } else if (r.state === "CHANGES_REQUESTED" || (r.state === "COMMENTED" && r.body && rejectRe.test(r.body))) {
+      events.push({ at: r.submitted_at, kind: "reject", sha: r.commit_id });
     }
   }
   if (bodyRe) {
     const comments = await octokit.paginate(octokit.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
     for (const c of comments) {
       if (!c.body || !c.created_at) continue;
-      if (rejectRe.test(c.body)) events.push({ at: c.created_at, kind: "reject" });
-      else if (bodyRe.test(c.body)) events.push({ at: c.created_at, kind: "approve" });
+      if (bodyRe.test(c.body)) events.push({ at: c.created_at, kind: "approve" });
+      else if (rejectRe.test(c.body)) events.push({ at: c.created_at, kind: "reject" });
     }
   }
   let headCommittedAt: string | null = null;

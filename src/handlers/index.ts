@@ -146,6 +146,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   // (The graph's `attempts>=N` escape edge is the declaration; this is the mechanism.)
   const maxAttempts = typeof node.attrs.max_attempts === "number" ? node.attrs.max_attempts : 3;
   const marker = `<!-- gp-foundry:attempt:${node.id} -->`;
+  const needsHuman = ctx.config.labels?.["needs-human"] ?? "needs-human";
   steps.push(
     runStep({
       id: "attempts",
@@ -155,8 +156,8 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
         `COUNT=$(gh pr view "$PR" --json comments --jq '[.comments[].body | select(contains("'"$MARKER"'"))] | length')`,
         `echo "attempts so far: $COUNT / $MAX"`,
         `if [ "$COUNT" -ge "$MAX" ]; then`,
-        `  gh pr edit "$PR" --add-label needs-human 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human'`,
-        `  gh pr comment "$PR" --body "$(printf '## 🧑‍🔧 Fixer\\n\\nAttempt budget exhausted (%s/%s) — labeling \`needs-human\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
+        `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}'`,
+        `  gh pr comment "$PR" --body "$(printf '## 🧑‍🔧 Fixer\\n\\nAttempt budget exhausted (%s/%s) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
         `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
         `else`,
         `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$((COUNT+1))" "$MAX")" >/dev/null`,
@@ -267,7 +268,9 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   return {
     jobId: node.id,
     name: node.id,
-    permissions: { contents: "write", issues: "write", "pull-requests": "write" },
+    // `actions: write` lets maintenance roles inspect and re-run workflow runs
+    // (the supervisor's `gh run list` / `gh run rerun` re-drive path).
+    permissions: { contents: "write", issues: "write", "pull-requests": "write", actions: "write" },
     timeoutMinutes: timeoutOf(node, 15),
     steps,
   };

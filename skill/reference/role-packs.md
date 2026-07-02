@@ -29,7 +29,7 @@ default `templates/harness.dot`.
 
 ## Content / marketing pack (proves domain-generality)
 
-Same six node types, same compiler, same runtime core — only roles, gates, and validation
+Same node types, same compiler, same runtime core — only roles, gates, and validation
 change. The `human-gate` matters *more* here (brand risk), which is why it's first-class.
 
 | role | type | one-line job |

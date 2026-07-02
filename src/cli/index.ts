@@ -2,6 +2,7 @@
 /** B8 — the gp-foundry CLI: init / build / validate / graph / explain. */
 import { Command } from "commander";
 import pc from "picocolors";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { RoleSpec } from "../ir/types.js";
@@ -61,7 +62,20 @@ program
       writeFileSync(d, content);
       written.push(dest);
     };
-    for (const [tpl, dest] of INIT_FILES) write(dest, readFileSync(pkgFile(tpl), "utf8"));
+    // A factory that targets a branch the repo doesn't have (main vs master/trunk)
+    // fails only at runtime — detect the actual branch and scaffold with it.
+    let baseBranch = "main";
+    try {
+      const b = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+      if (b) baseBranch = b;
+    } catch { /* not a git repo yet — keep main */ }
+    for (const [tpl, dest] of INIT_FILES) {
+      let content = readFileSync(pkgFile(tpl), "utf8");
+      if (dest.endsWith("foundry.config.yaml") && baseBranch !== "main") {
+        content = content.replace(/^(\s*base_branch:\s*)main\b/m, `$1${baseBranch}`);
+      }
+      write(dest, content);
+    }
     // Scaffold one starter role file per role the harness references (paths are
     // relative to the harness.dot dir, i.e. .github/).
     const dotPath = join(root, ".github/harness.dot");

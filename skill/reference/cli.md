@@ -12,7 +12,7 @@ output you can parse. Non-zero exit = failure; read stderr and surface diagnosti
 ## `gp-foundry init [--dir <path>] [--force]`
 Scaffold the canonical spec layout (`harness.dot`, `foundry.config.yaml`, `scope.yaml`,
 `policy/merge.yaml`, `communication.md`, one `roles/<name>.md` per role the graph
-references, and a no-op `.github/agent-setup/action.yml`). Run this once at the start of
+references, and an `.github/agent-setup/action.yml` shim that installs the agent CLI — add your project toolchain to it). Run this once at the start of
 setup, then fill in the drafted spec. Idempotent — it skips files that already exist (and
 reports them) unless you pass `--force`.
 
@@ -40,7 +40,7 @@ Compile `harness.dot` + spec → `.github/workflows/*.yml` (plus `.github/HARNES
 - **`--check`** — compile in memory and compare against the files on disk; exit non-zero if
   any generated file is out of date. This is the CI drift gate. You rarely run it yourself,
   but explain it to users as the guarantee that the graph and the YAML agree.
-- **`--out <dir>`** — write to a different repo root (default: the dir of `harness.dot`).
+- **`--out <dir>`** — write to a different repo root (default: the repo root — the parent of the `.github/` dir containing `harness.dot`).
 
 ## `gp-foundry explain <node> [--json]`
 Show the workflow a single node compiles to (its permission set, trigger surface `on:`, `if:`
@@ -60,8 +60,9 @@ Copy the packaged runtime-core actions into `.github/actions/` (the self-contain
 ### `gp-foundry up`
 One command from `init` to a runnable factory: create the repo labels
 (`build`/`plan`/`needs-human`/`needs-rebase`), vendor the runtime actions (in vendored mode),
-`build` the workflows, then run `doctor`. Prints the doctor checks and the next steps
-(set secrets, commit `.github/`, push, file an issue).
+`build` the workflows, then run `doctor`. Prints the doctor checks (which flag missing
+secrets with the exact `gh secret set` commands) and exits non-zero until the factory
+is ready — commit `.github/`, push, file an issue.
 
 ### `gp-foundry doctor`
 Preflight: config validity, workflow drift, vendored actions present, `agent-setup` shim

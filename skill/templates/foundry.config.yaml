@@ -8,7 +8,7 @@ auth: # how the harness authenticates to GitHub for writes
   # Pick ONE mode:
   #   pat          — a fine-grained PAT in a repo secret: events cascade, one secret,
   #                  no App to install. Easiest; the default. Scope the PAT to this
-  #                  repo with Contents + Pull requests + Issues read/write.
+  #                  repo with Contents + Pull requests + Issues + Actions read/write.
   #   app          — GitHub App token: clean bot identity, cascades. Best for orgs.
   #                  (set app_id_secret / app_key_secret instead of token_secret)
   #   github-token — the built-in GITHUB_TOKEN: zero setup BUT its commits/PRs never
@@ -39,12 +39,8 @@ labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resol
   build: build
   plan: plan
 
-size: # merge-gate size policy (additions excl. generated files)
-  warn_additions: 300
-  hard_additions: 800
-  exclude_globs:
-    - "**/*.generated.*"
-    - "**/dist/**"
+# NOTE: merge sizing/policy (max additions, protected paths, approval rules) lives in
+# agents/policy/merge.yaml — the merge-gate reads THAT file at runtime, not this one.
 
 runtime: # how generated workflows reference the runtime-core actions
   # vendored — `gp-foundry vendor` copies the actions into .github/actions/ (default;

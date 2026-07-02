@@ -32,5 +32,5 @@ export function renderDiagram(ir: Harness): string {
     lines.push(cond ? `  ${e.from} -->|"${cond}"| ${e.to}` : `  ${e.from} --> ${e.to}`);
   }
   lines.push("```", "");
-  return `<!-- GENERATED FROM harness.dot — DO NOT EDIT. Run \`gp-foundry build\`. -->\n\n# ${ir.name} — harness\n\n${lines.join("\n")}`;
+  return `<!-- GENERATED FROM harness.dot — DO NOT EDIT. Run \`gp-foundry build\`. -->\n\n# ${ir.config?.name && ir.config.name !== "harness" ? ir.config.name : ir.name} — agent harness\n\n${lines.join("\n")}`;
 }

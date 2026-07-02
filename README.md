@@ -32,7 +32,7 @@ repo checks) cleanly when there's no GitHub remote yet, and builds the workflows
 | Secret | What it is | Scopes |
 |--------|-----------|--------|
 | `CLAUDE_CODE_OAUTH_TOKEN` | The coding agent's auth token — how each agent job authenticates to Claude Code. | n/a (agent credential) |
-| `AGENT_PAT` | A fine-grained Personal Access Token used for the agents' git writes, PRs, and comments. Needed because pushes made with the built-in `GITHUB_TOKEN` do **not** trigger downstream workflows, so the pipeline couldn't cascade stage to stage. | Contents · Pull requests · Issues — **read/write**, scoped to this repo |
+| `AGENT_PAT` | A fine-grained Personal Access Token used for the agents' git writes, PRs, and comments. Needed because pushes made with the built-in `GITHUB_TOKEN` do **not** trigger downstream workflows, so the pipeline couldn't cascade stage to stage. | Contents · Pull requests · Issues · Actions — **read/write**, scoped to this repo |
 
 (`AGENT_PAT` is the default `auth.mode: pat`. You can instead run under a GitHub App
 (`mode: app`, set `app_id_secret`/`app_key_secret`) or the built-in token (`mode:

@@ -175,3 +175,59 @@ describe("shipped templates are runnable out of the box", () => {
     }
   });
 });
+
+describe("verification-pass regressions", () => {
+  it("rejection default is anchored; approvals mentioning REQUEST_CHANGES in prose stay approvals", () => {
+    // simulated: approval body that discusses the earlier requested changes
+    const approveRe = /Verdict.*APPROVE/;
+    const rejectRe = /Verdict.*REQUEST_CHANGES/;
+    const reApproval = "## Reviewer\n\nAll REQUEST_CHANGES items addressed.\n\n**Verdict:** APPROVE";
+    expect(approveRe.test(reApproval)).toBe(true);
+    expect(rejectRe.test(reApproval)).toBe(false); // the anchored default must NOT match
+  });
+
+  it("push edge into a PR node gets a post-mapping discriminator (pull_request, not push)", () => {
+    const MIX = `digraph t {
+      start [type=start]
+      builder [type=producer, role="agents/roles/builder.md"]
+      fixer [type=pr-fix, role="agents/roles/fixer.md"]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+      start -> builder [on="issues.opened"]
+      builder -> reviewer [when="label=re-review"]
+      fixer -> reviewer [on="push"]
+    }`;
+    const ir = mkHarness(MIX);
+    const g = wire(ir).perNode.reviewer.guard!;
+    expect(g).not.toContain("github.event_name == 'push'");
+    expect(g).toContain("github.event.action == 'synchronize'");
+  });
+
+  it("scheduled-agent jobs can inspect/re-run workflow runs (actions permission)", () => {
+    const DOT = `digraph t {
+      sup [type=scheduled-agent, role="agents/roles/supervisor.md", schedule="17 * * * *"]
+    }`;
+    const ir = mkHarness(DOT);
+    const { files } = compile(ir);
+    const wf = files.find((f) => f.path.endsWith("sup.yml"))!.contents;
+    expect(wf).toContain("actions: write");
+  });
+
+  it("pr-fix budget respects config.labels needs-human mapping", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+      fixer [type=pr-fix, role="agents/roles/fixer.md"]
+      start -> reviewer [on="pull_request.opened"]
+      reviewer -> fixer [when="verdict=request_changes"]
+    }`;
+    const ir = mkHarness(DOT, { labels: { "needs-human": "escalated" } } as Partial<FoundryConfig>);
+    const { files } = compile(ir);
+    const wf = files.find((f) => f.path.endsWith("fixer.yml"))!.contents;
+    expect(wf).toContain("escalated");
+  });
+
+  it("template config no longer advertises the dead size block", () => {
+    const cfg = yaml.load(readFileSync(tpl("foundry.config.yaml"), "utf8")) as Record<string, any>;
+    expect(cfg.size).toBeUndefined();
+  });
+});

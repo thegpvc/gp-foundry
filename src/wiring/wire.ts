@@ -61,6 +61,17 @@ interface EdgeWire {
 }
 
 /**
+ * The event a workflow ACTUALLY receives for a declared edge event — mirrors
+ * mergeEvent's remapping (a `push` into a PR-target node is delivered as
+ * `pull_request.synchronize`). Discriminator clauses must be computed from THIS,
+ * or they test an event name that never arrives and silently suppress the edge.
+ */
+function effectiveEvent(event: string, target: HarnessNode): string {
+  if (event === "push" && targetIsPr(target)) return "pull_request.synchronize";
+  return event;
+}
+
+/**
  * A GitHub-expression discriminator for one event, so an UNGUARDED edge can still
  * contribute an OR-clause when a sibling edge is guarded. Without this, a node with
  * a guarded edge (e.g. `label=x`) plus an unguarded edge on a different event would
@@ -137,7 +148,7 @@ export function wire(ir: Harness): WiringPlan {
         if (!w) continue;
         for (const ev of w.events) mergeEvent(triggers, ev, node);
         if (w.guard) guards.add(w.guard);
-        else for (const ev of w.events) unguardedEvents.add(ev);
+        else for (const ev of w.events) unguardedEvents.add(effectiveEvent(ev, node));
       }
       // Mixed guarded + unguarded edges: the unguarded events must still pass the
       // job-level `if`, so they contribute an event-discriminator OR-clause.

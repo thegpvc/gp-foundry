@@ -15,7 +15,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync
 import { dirname, join } from "node:path";
 import pc from "picocolors";
 import { compile, hasErrors } from "../index.js";
-import { loadHarness } from "../config/load.js";
+import { loadConfig, loadHarness } from "../config/load.js";
 import { emitJson, pkgFile, resolvePaths } from "./common.js";
 import { relative } from "node:path";
 
@@ -45,15 +45,16 @@ function packagedActions(): string[] {
 }
 
 /** Labels the factory needs: semantic lane labels (resolved) + gate/ops labels. */
-function requiredLabels(configPath: string | undefined, dotDir: string): { name: string; description: string; color: string }[] {
-  const { harness } = loadHarness(join(dotDir, "harness.dot"), configPath);
+function requiredLabels(configPath: string | undefined): { name: string; description: string; color: string }[] {
+  // Only the config matters here (label mapping) — no need to parse the graph.
+  const config = loadConfig(configPath);
   const semantic = new Map<string, string>([
     ["build", "ready to implement"],
     ["plan", "needs design first"],
   ]);
   const labels: { name: string; description: string; color: string }[] = [];
   for (const [key, desc] of semantic) {
-    labels.push({ name: harness.config.labels?.[key] ?? key, description: desc, color: key === "build" ? "0e8a16" : "5319e7" });
+    labels.push({ name: config.labels?.[key] ?? key, description: desc, color: key === "build" ? "0e8a16" : "5319e7" });
   }
   labels.push({ name: "needs-human", description: "agents are blocked; a human should take over", color: "b60205" });
   labels.push({ name: "needs-rebase", description: "PR conflicts with base; the janitor sweep rebases it", color: "d93f0b" });
@@ -154,15 +155,26 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
   }
   checks.push({ name: "gh cli", status: "ok", detail: "authenticated" });
 
-  const repo = ghJson<{ nameWithOwner: string }>(["repo", "view", "--json", "nameWithOwner"], root);
+  const repo = ghJson<{ nameWithOwner: string; defaultBranchRef?: { name?: string } }>(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"], root);
   if (!repo) {
-    checks.push({ name: "github repo", status: "skip", detail: "not a GitHub repo (or no remote) — skipping labels/secrets checks", hint: "create it with `gh repo create`" });
+    checks.push({ name: "github repo", status: "skip", detail: "not a GitHub repo (or no remote) — skipping labels/secrets checks", hint: "create it with `gh repo create`, then re-run `gp-foundry up` to create labels" });
     return { checks, failed: checks.some((c) => c.status === "fail") };
   }
   checks.push({ name: "github repo", status: "ok", detail: repo.nameWithOwner });
 
-  const have = new Set((ghJson<{ name: string }[]>(["label", "list", "--json", "name", "--limit", "100"], root) ?? []).map((l) => l.name));
-  const need = requiredLabels(config, base).map((l) => l.name);
+  // The whole factory targets config.repo.base_branch — a mismatch with the repo's
+  // actual default branch (main vs master/trunk) only fails at runtime otherwise.
+  const defaultBranch = repo.defaultBranchRef?.name;
+  if (defaultBranch) {
+    checks.push(
+      defaultBranch === harness.config.repo.base_branch
+        ? { name: "base branch", status: "ok", detail: defaultBranch }
+        : { name: "base branch", status: "fail", detail: `config says '${harness.config.repo.base_branch}' but the repo default is '${defaultBranch}'`, hint: "fix repo.base_branch in foundry.config.yaml and re-run `gp-foundry up`" },
+    );
+  }
+
+  const have = new Set((ghJson<{ name: string }[]>(["label", "list", "--json", "name", "--limit", "1000"], root) ?? []).map((l) => l.name));
+  const need = requiredLabels(config).map((l) => l.name);
   const missingLabels = need.filter((n) => !have.has(n));
   checks.push(
     missingLabels.length
@@ -209,13 +221,13 @@ interface StatusReport {
   recentFailures: { workflow: string; url: string; ageHours: number }[];
 }
 
-export function runStatus(opts: { dot?: string; config?: string }): StatusReport | { error: string } {
-  const { config, base, root } = resolvePaths(opts);
-  if (!gh(["auth", "status"]).ok) return { error: "gh missing or unauthenticated — status needs the GitHub CLI" };
+export function runStatus(opts: { dot?: string; config?: string }): StatusReport | { error: string; hint?: string } {
+  const { dot, config, root } = resolvePaths(opts);
+  if (!gh(["auth", "status"]).ok) return { error: "gh missing or unauthenticated — status needs the GitHub CLI", hint: "install the GitHub CLI and run `gh auth login`" };
   const repo = ghJson<{ nameWithOwner: string }>(["repo", "view", "--json", "nameWithOwner"], root);
-  if (!repo) return { error: "not a GitHub repo (or no remote)" };
+  if (!repo) return { error: "not a GitHub repo (or no remote)", hint: "create it with `gh repo create`, push, then re-run `gp-foundry status`" };
 
-  const { harness } = loadHarness(join(base, "harness.dot"), config);
+  const { harness } = loadHarness(dot, config);
   const prefix = harness.config.repo.branch_prefix;
   const now = Date.now();
   const hoursAgo = (iso: string) => Math.round((now - Date.parse(iso)) / 36e5);
@@ -303,7 +315,10 @@ export function registerOpsCommands(program: Command): void {
       const report = runStatus(opts);
       if ("error" in report) {
         if (opts.json) emitJson(report);
-        else process.stderr.write(pc.red(report.error + "\n"));
+        else {
+          process.stderr.write(pc.red(report.error + "\n"));
+          if (report.hint) process.stderr.write(pc.dim("hint: " + report.hint + "\n"));
+        }
         process.exit(1);
       }
       if (opts.json) return emitJson(report);
@@ -338,14 +353,14 @@ export function registerOpsCommands(program: Command): void {
       // 1. labels (best-effort; skipped cleanly without gh)
       if (gh(["auth", "status"]).ok && ghJson(["repo", "view", "--json", "nameWithOwner"], root)) {
         const created: string[] = [];
-        for (const l of requiredLabels(config, base)) {
+        for (const l of requiredLabels(config)) {
           if (gh(["label", "create", l.name, "--color", l.color, "--description", l.description], { cwd: root }).ok) created.push(l.name);
         }
         result.labels = created;
         if (!opts.json) process.stdout.write(pc.green(`labels ensured (created: ${created.length ? created.join(", ") : "none — already present"})\n`));
       } else {
         result.labels = "skipped (gh unavailable or no GitHub repo)";
-        if (!opts.json) process.stdout.write(pc.yellow("skipped label creation (gh unavailable or no GitHub repo yet)\n"));
+        if (!opts.json) process.stdout.write(pc.yellow("skipped label creation (gh unavailable or no GitHub repo yet) — re-run `gp-foundry up` once the repo exists\n"));
       }
 
       // 2. vendor (only in vendored mode)
@@ -370,7 +385,8 @@ export function registerOpsCommands(program: Command): void {
         writeFileSync(p, f.contents);
       }
       result.wrote = files.map((f) => f.path);
-      if (!opts.json) process.stdout.write(pc.green(`built ${files.length} workflow file(s)\n`));
+      const wfCount = files.filter((f) => f.path.startsWith(".github/workflows/")).length;
+      if (!opts.json) process.stdout.write(pc.green(`built ${wfCount} workflows + HARNESS.md\n`));
 
       // 4. doctor
       const { checks, failed } = runDoctor(opts);
@@ -384,5 +400,6 @@ export function registerOpsCommands(program: Command): void {
           ? pc.yellow("\nalmost there — fix the ✗ items above, commit .github/, push, then file an issue\n")
           : pc.green("\nfactory is up — commit .github/, push, then file an issue to watch it run\n"),
       );
+      process.exit(failed ? 1 : 0);
     });
 }

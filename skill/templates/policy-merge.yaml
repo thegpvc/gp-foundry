@@ -10,6 +10,10 @@ branch_prefix: "agent/"
 # Approval — the Reviewer posts its verdict in a review BODY; count a body matching
 # this regex as approval (a bot can't formally APPROVE its own PR).
 approval_body_regex: "Verdict.*APPROVE"
+# A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
+# to the verdict line — a bare substring would misread approvals that mention the
+# earlier requested changes in prose.
+rejection_body_regex: "Verdict.*REQUEST_CHANGES"
 approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)
 
 # CI — require the check rollup to be passing; optionally ignore named checks.
@@ -29,7 +33,7 @@ protected_paths:
 # Rebase / conflicts.
 #  - require_clean_rebase: false — GitHub's mergeable_state is computed async and races
 #    on fresh PRs; instead we let the merge ATTEMPT fail and react (see rebase_label).
-#  - rebase_label: applied when a merge attempt fails on a conflict; the 🧟 Janitor
+#  - rebase_label: applied when a merge attempt fails on a conflict; the 🧹 Janitor
 #    (scheduled sweep) picks up this label, rebases, and de-labels.
 require_clean_rebase: false
 rebase_label: needs-rebase
