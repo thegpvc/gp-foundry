@@ -31,6 +31,13 @@ inputs:
     description: "Seconds to sleep between polls."
     required: false
     default: "20"
+  missing-grace-seconds:
+    description: >-
+      If NO runs for the target are observed within this window (workflow missing
+      or never triggers for this SHA), conclude 'skipped' instead of burning the
+      full timeout.
+    required: false
+    default: "90"
   owner:
     description: "Repository owner. Defaults to the current repository owner."
     required: false

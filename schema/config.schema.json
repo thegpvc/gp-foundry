@@ -12,6 +12,31 @@
       "minLength": 1,
       "description": "Human-readable name of the harness/agent fleet."
     },
+    "auth": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "description": "How the harness authenticates to GitHub for writes (commits, PRs, comments). Mirrors src/ir/types.ts AuthConfig.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["app", "pat", "github-token"],
+          "description": "app = GitHub App installation token (bot identity; downstream events cascade). pat = a fine-grained/classic PAT secret used directly (events cascade). github-token = the built-in GITHUB_TOKEN (zero setup, but pushes/PRs made with it do NOT trigger other workflows, so chained stages won't cascade)."
+        },
+        "token_secret": {
+          "type": "string",
+          "description": "Name of the Actions secret holding a PAT, for mode \"pat\"."
+        },
+        "app_id_secret": {
+          "type": "string",
+          "description": "Name of the Actions secret holding the GitHub App id, for mode \"app\"."
+        },
+        "app_key_secret": {
+          "type": "string",
+          "description": "Name of the Actions secret holding the GitHub App private key, for mode \"app\"."
+        }
+      }
+    },
     "identity": {
       "type": "object",
       "additionalProperties": false,
@@ -52,6 +77,10 @@
         "oauth_token_secret": {
           "type": "string",
           "description": "Name of the Actions secret holding the agent OAuth token."
+        },
+        "conventions": {
+          "type": "string",
+          "description": "Optional free-text repo conventions surfaced to every agent (e.g. commit style, stack notes)."
         },
         "allowed_tools": {
           "$ref": "#/$defs/allowedTools",

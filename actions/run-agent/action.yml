@@ -130,6 +130,8 @@ runs:
         if [ -n "$COMMS_FILE" ] && [ -f "$COMMS_FILE" ]; then
           cat "$COMMS_FILE" >> "$PROMPT_FILE"
           printf '\n\n' >> "$PROMPT_FILE"
+        elif [ -n "$COMMS_FILE" ]; then
+          echo "::warning::comms-file '$COMMS_FILE' not found — agents will lack the communication guide"
         fi
 
         # 4. scope
@@ -137,6 +139,8 @@ runs:
           printf '## Scope\n\n' >> "$PROMPT_FILE"
           cat "$SCOPE_PATH" >> "$PROMPT_FILE"
           printf '\n\n' >> "$PROMPT_FILE"
+        elif [ -n "$SCOPE_PATH" ]; then
+          echo "::warning::scope-path '$SCOPE_PATH' not found — agents will run WITHOUT scope guardrails"
         fi
 
         # 5. context payload
@@ -186,19 +190,24 @@ runs:
 
         STDERR_LOG="$(mktemp)"
 
-        # Never fail the step: the agent's side effects (commits, comments,
-        # files) are handled by downstream steps. `|| true` swallows a nonzero
-        # exit so a partial run is still committed by a later fallback step.
-        # stderr is captured to a file (not streamed live) so we can surface it
-        # as a single grouped warning afterwards.
+        # Capture the agent's exit code instead of swallowing it: a dead agent must
+        # be RED, not a green no-op — that's what lets a human (or the supervisor
+        # sweep) notice and re-drive the work. Fallback steps in the generated
+        # workflow run `if: !cancelled()`, so partial work is still salvaged.
+        # stderr goes to a file (not streamed) so it surfaces as one grouped warning.
+        AGENT_EXIT=0
         # shellcheck disable=SC2086
         claude -p "$(cat "$PROMPT_FILE")" \
           --model "$MODEL" \
           --allowedTools "$ALLOWED_TOOLS" \
           $EXTRA_ARGS \
-          2> "$STDERR_LOG" || true
+          2> "$STDERR_LOG" || AGENT_EXIT=$?
 
         if [ -s "$STDERR_LOG" ]; then
           echo "::warning::Claude produced stderr output:"
           cat "$STDERR_LOG"
+        fi
+        if [ "$AGENT_EXIT" -ne 0 ]; then
+          echo "::error::agent exited with code $AGENT_EXIT — failing the step so the run is visibly red"
+          exit "$AGENT_EXIT"
         fi

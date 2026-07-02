@@ -19,11 +19,13 @@ The canonical "issues in → reviewed, auto-merged PRs out" pipeline.
 | Fixer | `pr-fix` (max_attempts=3) | apply review feedback; bounded retry loop with Reviewer |
 | merge-gate | `merge-gate` | enforce merge policy; auto-merge or label for a human (a gate, not a persona) |
 | Janitor | `scheduled-agent` | rebase PRs the gate flagged `needs-rebase` so they can merge |
+| Supervisor | `scheduled-agent` | sweep for stranded issues/PRs and re-drive them; escalate to `needs-human` after repeated nudges |
 | Retro | `scheduled-agent` | mine the record for recurring lessons; write them to memory |
 
 Default graph: `start → Scout → {Planner|Builder} → Reviewer ↔ Fixer → merge-gate`,
-with `Fixer → needs_human [when="attempts>=3"]`, plus a scheduled `Janitor` (rebase sweep) and
-`Retro` (learning). This is the shape in `reference/node-types.md`'s example.
+with `Fixer → needs_human [when="attempts>=3"]`, plus scheduled `Janitor` (rebase sweep),
+`Supervisor` (self-healing re-drive), and `Retro` (learning). This is the shape in the
+default `templates/harness.dot`.
 
 ## Content / marketing pack (proves domain-generality)
 

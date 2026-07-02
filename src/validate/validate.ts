@@ -123,6 +123,60 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   }
 
+  // Unfilled <placeholders> in config compile into workflows GitHub rejects at
+  // parse time (or that reference nonexistent secrets/repos) — with exit 0.
+  // Catch them here so a naive init+build cannot ship a broken factory.
+  const scanPlaceholders = (v: unknown, path: string): void => {
+    if (typeof v === "string") {
+      const m = v.match(/<[A-Za-z][^<>]{0,80}>/);
+      if (m) {
+        diags.push({
+          level: "error",
+          code: "config.placeholder",
+          message: `config value ${path} still contains the placeholder ${m[0]} — fill it in foundry.config.yaml`,
+          hint: "generated workflows would be broken until every <placeholder> is replaced",
+        });
+      }
+    } else if (Array.isArray(v)) {
+      v.forEach((x, i) => scanPlaceholders(x, `${path}[${i}]`));
+    } else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) scanPlaceholders(x, path ? `${path}.${k}` : k);
+    }
+  };
+  scanPlaceholders(ir.config, "");
+
+  // Vendored runtime: the generated `uses: ./.github/actions/<n>` refs (and the
+  // consumer-owned ./.github/agent-setup shim) must actually exist in the repo.
+  if (deps.fileExists && (ir.config.runtime?.mode ?? "pinned") === "vendored") {
+    const needed = new Set<string>();
+    let hasAgent = false;
+    for (const n of ir.nodes) {
+      if (AGENT.has(n.type)) { hasAgent = true; needed.add("run-agent"); }
+      if (AGENT.has(n.type) && n.type !== "scheduled-agent") needed.add("agent-context");
+      if (n.type === "producer") needed.add("agent-fallback");
+      if (n.type === "merge-gate") needed.add("merge-gate");
+      if (n.type === "pr-review" && n.attrs.gates !== undefined) needed.add("wait-for-checks");
+    }
+    for (const a of needed) {
+      if (!deps.fileExists(`actions/${a}/action.yml`)) {
+        diags.push({
+          level: "warning",
+          code: "runtime.action-not-vendored",
+          message: `runtime.mode is 'vendored' but .github/actions/${a}/ is missing`,
+          hint: "run `gp-foundry vendor` to copy the runtime actions into the repo",
+        });
+      }
+    }
+    if (hasAgent && !deps.fileExists("agent-setup/action.yml")) {
+      diags.push({
+        level: "warning",
+        code: "runtime.agent-setup-missing",
+        message: "generated agent jobs use ./.github/agent-setup, which does not exist",
+        hint: "run `gp-foundry vendor` (or `gp-foundry init`) to scaffold the agent-setup shim",
+      });
+    }
+  }
+
   // Auth: github-token cannot trigger downstream workflows, so event-cascade
   // edges (a PR/push produced by one agent that should fire the next) won't run.
   if (resolveAuth(ir.config).mode === "github-token") {
@@ -131,7 +185,10 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     );
     if (cascades.length) {
       diags.push({
-        level: "warning",
+        // Explicitly configured github-token with chained stages ships a factory
+        // that green-stalls after the first stage: ERROR. When auth is merely
+        // absent (mode defaulted), warn — the user hasn't made a choice yet.
+        level: ir.config.auth?.mode === "github-token" ? "error" : "warning",
         code: "auth.github-token-no-cascade",
         message:
           "auth mode 'github-token': commits/PRs made with GITHUB_TOKEN do not trigger other workflows, so " +

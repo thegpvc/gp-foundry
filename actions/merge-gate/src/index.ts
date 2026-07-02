@@ -19,16 +19,20 @@ import yaml from "js-yaml";
 import {
   evaluateMergeGate,
   filterCandidateNumbers,
+  latestValidApproval,
   normalizePolicyKeys,
   type MergePolicy,
   type PullRequestFacts,
   type PrFile,
   type CiStatus,
   type MergeDecision,
+  type VerdictEvent,
 } from "./gate.js";
 
 interface PolicyFile extends MergePolicy {
   approvalBodyRegex?: string;
+  /** Body marker that INVALIDATES earlier approvals (default: "REQUEST_CHANGES"). */
+  rejectionBodyRegex?: string;
   ciIgnoreCheckNames?: string[];
   mergeMethod?: "merge" | "squash" | "rebase";
   deleteBranchOnMerge?: boolean;
@@ -69,18 +73,38 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
   const bodyRe = policy.approvalBodyRegex ? new RegExp(policy.approvalBodyRegex) : undefined;
+  // Rejections invalidate earlier approvals. Default marker mirrors the approval one.
+  const rejectRe = new RegExp(policy.rejectionBodyRegex ?? "REQUEST_CHANGES");
 
-  // Approval from reviews...
+  // Collect verdict-bearing events (reviews + marker comments) in time order, then
+  // apply the integrity rule: latest verdict wins, approval must match the head SHA
+  // (or, for comments, postdate the head commit). See gate.latestValidApproval.
+  const events: VerdictEvent[] = [];
   const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
-  const reviewApprovals = reviews.filter((r) => isApprovalReview(r, bodyRe)).map((r) => r.submitted_at).filter((t): t is string => !!t);
-  // ...and from issue comments (the Critic posts its verdict as a PR comment).
-  const commentApprovals: string[] = [];
+  for (const r of reviews) {
+    if (!r.submitted_at) continue;
+    if (r.state === "CHANGES_REQUESTED" || (r.state === "COMMENTED" && r.body && rejectRe.test(r.body))) {
+      events.push({ at: r.submitted_at, kind: "reject", sha: r.commit_id });
+    } else if (isApprovalReview(r, bodyRe)) {
+      events.push({ at: r.submitted_at, kind: "approve", sha: r.commit_id });
+    }
+  }
   if (bodyRe) {
     const comments = await octokit.paginate(octokit.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
-    for (const c of comments) if (c.body && bodyRe.test(c.body) && c.created_at) commentApprovals.push(c.created_at);
+    for (const c of comments) {
+      if (!c.body || !c.created_at) continue;
+      if (rejectRe.test(c.body)) events.push({ at: c.created_at, kind: "reject" });
+      else if (bodyRe.test(c.body)) events.push({ at: c.created_at, kind: "approve" });
+    }
   }
-  const approvalTimes = [...reviewApprovals, ...commentApprovals].sort();
-  const approvedAt = approvalTimes.length ? approvalTimes[approvalTimes.length - 1]! : null;
+  let headCommittedAt: string | null = null;
+  try {
+    const { data: headCommit } = await octokit.rest.repos.getCommit({ owner, repo, ref: pr.head.sha });
+    headCommittedAt = headCommit.commit.committer?.date ?? headCommit.commit.author?.date ?? null;
+  } catch (e) {
+    core.warning(`Could not resolve head commit time for #${prNumber}: ${(e as Error).message}`);
+  }
+  const approvedAt = latestValidApproval(events, pr.head.sha, headCommittedAt);
 
   const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
@@ -96,7 +120,7 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   if (overrideRebase === "true") cleanRebase = true;
   else if (overrideRebase === "false") cleanRebase = false;
 
-  return { number: prNumber, title: pr.title, headRefName: pr.head.ref, labels, ciStatus, approvedAt, files, cleanRebase };
+  return { number: prNumber, title: pr.title, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, approvedAt, files, cleanRebase };
 }
 
 /** Open PRs on branch-prefix branches targeting base, oldest first. */
@@ -136,7 +160,7 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
       } catch (le) {
         core.warning(`Could not label #${prNumber} \`${rebaseLabel}\`: ${(le as Error).message}`);
       }
-      await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the Fixer can rebase this onto \`${facts.baseRefName}\` and try again.`);
+      await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the janitor sweep can rebase this onto \`${facts.baseRefName ?? "the base branch"}\` and try again.`);
       return false;
     }
     if (policy.deleteBranchOnMerge ?? true) {

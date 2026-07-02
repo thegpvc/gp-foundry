@@ -29,9 +29,9 @@ artifact carrying a `# GENERATED FROM harness.dot — DO NOT EDIT` header. You e
 1. **The graph is the source of truth.** Change the harness by editing the spec and
    running `gp-foundry build` — never by hand-editing generated YAML.
 2. **You are a thin, honest wrapper over a deterministic engine.** Every structural
-   operation (init/build/validate/graph/add/explain) goes through the CLI. If the CLI
-   reports a diagnostic, surface it verbatim with its `file:line` and fix hint; do not
-   paper over it.
+   operation (init/build/validate/graph/explain, plus the ops commands
+   vendor/up/doctor/status) goes through the CLI. If the CLI reports a diagnostic, surface
+   it verbatim with its `file:line` and fix hint; do not paper over it.
 3. **Content is externalized.** Prompts and role job-descriptions live in files and are
    loaded at runtime. Editing a role needs **no rebuild**; only topology/policy changes do.
 4. **Generalize.** Nothing is repo-specific by default: no hardcoded bot login, app-secret
@@ -169,8 +169,9 @@ Then fill in the four spec surfaces you drafted from the interview:
   guidance. **`handoffs` must match the node's out-edges.** See `templates/role.md`.
 - **`policy/merge.yaml`** + **`scope.yaml`** — the approval policy and the immutable/
   forbidden paths from Q2.
-- **`foundry.config.yaml`** — everything from Q5. Validate it against
-  `schema/config.schema.json` (the CLI does this in `build`/`validate`).
+- **`foundry.config.yaml`** — everything from Q5. `schema/config.schema.json` documents
+  its shape (`auth`, `identity`, `agent`, `repo`, `labels`, `size`, `runtime`); keep the
+  file consistent with it.
 
 Every value that was a gp-dixie hardcode is now config: bot login, secret names, label
 names, model, branch prefix, protected paths. If the user doesn't give you one, ask —
@@ -185,11 +186,11 @@ model-check yourself — you call the CLI and interpret its output. Full command
 in `reference/cli.md`. The core loop:
 
 ```bash
-gp-foundry validate           # schema + referential integrity + role↔edge handoffs
-gp-foundry graph              # render HARNESS.md / print topology (also --json)
-gp-foundry build --dry-run    # compile and show the diff WITHOUT writing
-gp-foundry build              # compile → write .github/workflows/*.yml
-gp-foundry build --check      # drift gate: exit non-zero if generated ≠ committed
+gp-foundry validate           # structural + referential integrity + role↔edge handoffs + model-check
+gp-foundry graph              # print the Mermaid topology to stdout (also --json for the IR)
+gp-foundry build --dry-run    # compile and print the files WITHOUT writing
+gp-foundry build              # compile → write .github/workflows/*.yml (+ .github/HARNESS.md)
+gp-foundry build --check      # drift gate: exit non-zero if generated ≠ on disk
 ```
 
 **Always `build --dry-run` first and explain the diff** in plain language before writing:
@@ -206,30 +207,20 @@ If `validate` or `build` returns diagnostics, **stop and surface them**: quote t
 - `human-gate missing environment` → add `environment=<name>` to the node.
 - `unknown role/policy file` → the referenced path doesn't exist; create it or fix the ref.
 
-### Reconciling regeneration against local edits (managed-region markers)
+### Generated vs consumer-owned files
 
-Generated workflows are fully owned by the compiler — if a user hand-edited one, `build`
-overwrites it (that's the point; `build --check` in CI catches the drift). But the
-**consumer-owned** files that the compiler also touches (notably
-`.github/agent-setup/action.yml` and any scaffolded region inside a spec file) use
-**managed-region markers** so your regeneration and their hand edits coexist:
+Keep the two file classes straight so you never clobber a user's work:
 
-```yaml
-# >>> gp-foundry:managed (harness.dot) — do not edit inside this block
-...compiler-owned content...
-# <<< gp-foundry:managed
-# everything outside the markers is yours to edit freely
-```
-
-Reconcile rules (design decision D5 — markers first, Claude-merge as fallback):
-1. The CLI rewrites **only** the content between the markers; anything outside is preserved
-   verbatim. Prefer this for every mechanical update.
-2. If a user edited **inside** a managed region, `build` will report a conflict rather than
-   clobbering it. When that happens, do a **Claude-merge**: read both versions, explain the
-   conflict to the user, propose a merged result that keeps their intent while restoring the
-   invariant the marker protects, and re-run `build`.
-3. Never silently discard a hand edit. Managed-region = "the compiler owns the inside";
-   user edits outside are sacred, and edits inside are surfaced, not steamrolled.
+- **Generated files are fully compiler-owned.** Everything under `.github/workflows/*.yml`
+  and `.github/HARNESS.md` is rewritten every `build`. If a user hand-edited one, `build`
+  overwrites it — that is the point, and `build --check` in CI catches the drift. Steer users
+  away from editing generated YAML; the fix always lives in the spec.
+- **Consumer-owned files are never overwritten by `build`.** `harness.dot`, `roles/*.md`,
+  `policy/*.yaml`, `scope.yaml`, `foundry.config.yaml`, and `.github/agent-setup/action.yml`
+  are the user's to edit. `init` and `vendor` only *scaffold* the ones that are missing:
+  `init` skips any file that already exists unless `--force`; `vendor` writes the
+  `agent-setup` shim only when it is absent. There is no automatic three-way merge — the
+  compiler simply doesn't touch these files.
 
 Always confirm before writing, then commit the spec change and the regenerated workflows
 **together** (they must move as one atomic change, or CI's `build --check` will flag drift).
@@ -238,7 +229,7 @@ Always confirm before writing, then commit the spec change and the regenerated w
 
 ## Evolving an existing harness (E3 — evolve-as-PR)
 
-This is how a live harness (and its own Gardener role) self-modifies. Requests like
+This is how a live harness self-modifies (a topology change is just another PR). Requests like
 "add a Copywriter role", "tighten the merge gate to require two approvals", "add a docs
 lane", or "pull the fixer's escape hatch to 2 attempts" all follow the same PR-shaped flow:
 
@@ -246,11 +237,9 @@ lane", or "pull the fixer's escape hatch to 2 attempts" all follow the same PR-s
    the nodes/edges/policy the request touches. `gp-foundry explain <node>` for specifics.
 2. **Branch.** Create a feature branch (this is a code change to the repo, review-gated
    like any other). Never edit topology on the default branch directly.
-3. **Add or edit the spec.** For a new role/node use the CLI's scaffolder:
-   ```bash
-   gp-foundry add <role-name> --type <node-type>   # scaffold role stub + wire node
-   ```
-   Then edit `harness.dot` edges and the new `roles/<name>.md` handoffs so they agree.
+3. **Add or edit the spec.** For a new role/node, add the node + its edges to `harness.dot`
+   and create `agents/roles/<name>.md` (adapt from `reference/role-packs.md` and
+   `templates/role.md`), making the role's `handoffs` front-matter match the node's out-edges.
    For a policy tweak, edit `policy/*.yaml` / `foundry.config.yaml` directly.
 4. **Validate → dry-run → build.** `gp-foundry validate`, then `gp-foundry build --dry-run`,
    explain the diff, then `gp-foundry build`.
@@ -269,14 +258,16 @@ the guardrail, not just the typist.
 
 **You shell out to (deterministic CLI — see `reference/cli.md`):**
 `gp-foundry init`, `build [--check|--dry-run|--json]`, `validate`, `graph [--json]`,
-`add <role|node>`, `explain <node>`. Plus `gh` for PRs and `git` for branching/committing.
+`explain <node>`, and the ops commands `vendor` / `up` / `doctor` / `status`. Plus `gh` for
+PRs and `git` for branching/committing.
 
 **You never:**
 - Hand-write or hand-edit `.github/workflows/*.yml` (compiler-owned, GENERATED header).
 - Parse DOT, run the model-check, or emit YAML yourself — the CLI is the single engine.
 - Bake a repo-specific value (bot login, secret name, label, model, path) into a spec
   without the user supplying it.
-- Overwrite a hand edit inside a managed region without surfacing the conflict first.
+- Overwrite a consumer-owned file (a role, policy, or `agent-setup`) that a user has edited —
+  the compiler doesn't touch these; edit them deliberately and confirm first.
 - Ship a spec that fails `gp-foundry validate`.
 
 Keep the conversation Socratic on the way in, deterministic on the way out.

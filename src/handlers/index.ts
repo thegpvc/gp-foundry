@@ -113,6 +113,8 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
   steps.push({
     uses: ctx.actionRef("agent-fallback"),
     name: "Fallback: commit / push / PR",
+    // Salvage committed work even when the agent step failed (job still reports red).
+    if: "${{ !cancelled() }}",
     with: {
       branch: "${{ steps.branch.outputs.branch }}",
       token: tokenExpr(ctx),
@@ -139,12 +141,39 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
 function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const steps: StepSpec[] = preamble(ctx, { ref: PR_HEAD_REF, fetchDepth: 0 });
-  steps.push(setupStep());
-  steps.push(contextStep(ctx, "pr-review", PR_NUMBER)); // the Fixer needs the review feedback
-  steps.push(runAgentStep(ctx, { withContext: true }));
+  // Make `max_attempts` REAL: each run stamps a marker comment on the PR; when the
+  // count reaches the limit we label needs-human and stop instead of looping forever.
+  // (The graph's `attempts>=N` escape edge is the declaration; this is the mechanism.)
+  const maxAttempts = typeof node.attrs.max_attempts === "number" ? node.attrs.max_attempts : 3;
+  const marker = `<!-- gp-foundry:attempt:${node.id} -->`;
+  steps.push(
+    runStep({
+      id: "attempts",
+      name: `Enforce attempt budget (max ${maxAttempts})`,
+      env: { GH_TOKEN: tokenExpr(ctx), PR: PR_NUMBER, MARKER: marker, MAX: String(maxAttempts) },
+      run: [
+        `COUNT=$(gh pr view "$PR" --json comments --jq '[.comments[].body | select(contains("'"$MARKER"'"))] | length')`,
+        `echo "attempts so far: $COUNT / $MAX"`,
+        `if [ "$COUNT" -ge "$MAX" ]; then`,
+        `  gh pr edit "$PR" --add-label needs-human 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human'`,
+        `  gh pr comment "$PR" --body "$(printf '## 🧑‍🔧 Fixer\\n\\nAttempt budget exhausted (%s/%s) — labeling \`needs-human\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
+        `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
+        `else`,
+        `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$((COUNT+1))" "$MAX")" >/dev/null`,
+        `  echo "exhausted=false" >> "$GITHUB_OUTPUT"`,
+        `fi`,
+      ].join("\n"),
+    }),
+  );
+  const notExhausted = "steps.attempts.outputs.exhausted != 'true'";
+  steps.push({ ...setupStep(), if: notExhausted });
+  steps.push({ ...contextStep(ctx, "pr-review", PR_NUMBER), if: notExhausted }); // the Fixer needs the review feedback
+  steps.push({ ...runAgentStep(ctx, { withContext: true }), if: notExhausted });
   steps.push(
     runStep({
       name: "Commit and push fixes",
+      // Push committed work even if the agent step failed mid-run (job stays red).
+      if: `${notExhausted} && !cancelled()`,
       env: { BRANCH: PR_HEAD_REF },
       run: [
         `# Commit anything the agent left uncommitted...`,

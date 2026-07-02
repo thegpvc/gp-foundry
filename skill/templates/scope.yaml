@@ -14,6 +14,8 @@ forbidden_paths:                 # prompt-enforced, adjustable by a maintenance 
 forbidden_operations:
   # - <e.g. infrastructure changes>
 
-guidance:                        # soft guidance surfaced to producers
+guidance:                        # soft guidance injected into every agent's prompt
   - prefer small, focused changes
   - when in doubt, open a draft PR and explain what's left
+  # closes the Retro's learning loop: lessons it distills are read before working
+  - "before implementing, check .github/agents/memory/topics/ for relevant prior lessons"

@@ -102,12 +102,21 @@ triage to merge. Its handoffs mirror the edges in
 | `reviewer` | pr-review | `merge_gate` / `fixer` | `verdict=approve` / `verdict=request_changes` |
 | `fixer` | pr-fix | `reviewer` / `needs_human` | `push` / `attempts>=3` |
 | `merge_gate` | merge-gate | — (terminal) | — |
+| `janitor` | scheduled-agent | — (terminal) | — |
+| `supervisor` | scheduled-agent | — (terminal) | — |
+| `retro` | scheduled-agent | — (terminal) | — |
 
 The flow: **Scout** classifies an incoming issue and routes it to design
 (**Planner**) or straight to build (**Builder**). The Builder opens a PR that
 the **Reviewer** reviews; approvals go to the **merge gate** (the scheduled merge
 gate), requested changes go to the **Fixer**, which loops back to the Reviewer —
 until the attempt budget is exhausted, at which point the PR goes to a human.
+
+Three scheduled roles keep the factory healthy without being wired into that
+intake→merge flow (they run on a cron, take no handoffs, and are terminal):
+**Janitor** rebases PRs the gate flagged `needs-rebase`; **Supervisor** re-drives
+stranded issues/PRs and escalates to `needs-human` after repeated nudges; **Retro**
+mines merged PRs/reviews/CI for recurring lessons and writes them to team memory.
 
 These roles are generic. A consumer repo supplies its stack via the overlay:
 the concrete label names, the scope-policy file, the build/test/lint and

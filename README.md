@@ -1,19 +1,63 @@
 # gp-foundry
 
-**Compile a directed graph into an autonomous GitHub Actions agent harness.**
+**Stand up a "dark factory" for your repo: issues in → reviewed, auto-merged PRs out.**
 
-gp-foundry turns an autonomous agent pipeline — *issues in → reviewed, auto-merged
-PRs out* — into something you **declare once as a graph and compile** into a repo.
-A single `harness.dot` (Graphviz DOT) is the source of truth for the harness
-*topology*; a deterministic compiler emits plain GitHub Actions workflows from it.
-**GitHub stays the executor** (native events, per-job least-privilege, Environment
-approvals, secrets, scheduling); a small, pinned **runtime core** of actions are the
-node handlers; and roles/prompts/policy are **externalized content**, edited freely
-(and by the harness itself), never baked into the generated YAML.
+`gp-foundry` turns an autonomous agent pipeline into something you **declare once as a
+directed graph and compile** into a repo. You describe the crew and the flow in a single
+`harness.dot`; a deterministic compiler emits plain GitHub Actions workflows; **GitHub stays
+the executor** (native events, per-job least-privilege, Environment approvals, secrets,
+scheduling). The result runs with minimal effort and keeps itself alive: it is
+**self-healing** (rebases conflicts, re-drives stranded work, escalates to a human only when
+truly stuck) and **self-improving** (mines its own merged PRs and reviews for recurring
+lessons and feeds them back to every agent). Nothing here is code-specific — the same shape
+that ships a library can ship docs, marketing copy, or config.
 
-Nothing here is code-specific: a node's mechanical *type* (a GitHub interaction) is
-separate from its *role* (the job description), so the same pipeline that ships Go
-code can ship marketing copy, docs, or config.
+## Dark factory in 6 commands
+
+```bash
+npm i -g @thegpvc/gp-foundry
+gp-foundry init                          # scaffold .github/harness.dot + config + roles + scope + policy
+gp-foundry up                            # labels + vendor actions + build workflows + doctor
+gh secret set CLAUDE_CODE_OAUTH_TOKEN    # agent auth (paste the Claude Code OAuth token)
+gh secret set AGENT_PAT                  # fine-grained PAT: Contents + Pull requests + Issues RW
+git add .github && git commit -m "add agent harness" && git push
+# then file an issue — the 🕵️ scout triages it and the factory takes it from there
+```
+
+`gp-foundry up` is offline-safe: it skips the `gh`-dependent steps (labels, doctor's
+repo checks) cleanly when there's no GitHub remote yet, and builds the workflows regardless.
+
+### Required secrets
+
+| Secret | What it is | Scopes |
+|--------|-----------|--------|
+| `CLAUDE_CODE_OAUTH_TOKEN` | The coding agent's auth token — how each agent job authenticates to Claude Code. | n/a (agent credential) |
+| `AGENT_PAT` | A fine-grained Personal Access Token used for the agents' git writes, PRs, and comments. Needed because pushes made with the built-in `GITHUB_TOKEN` do **not** trigger downstream workflows, so the pipeline couldn't cascade stage to stage. | Contents · Pull requests · Issues — **read/write**, scoped to this repo |
+
+(`AGENT_PAT` is the default `auth.mode: pat`. You can instead run under a GitHub App
+(`mode: app`, set `app_id_secret`/`app_key_secret`) or the built-in token (`mode:
+github-token`, zero setup but no cascading) — see `foundry.config.yaml`.)
+
+## The crew
+
+The default `init` scaffolds the **software pack** — an autonomous engineering team that
+takes an issue from triage to merge, plus the lanes that keep the factory healthy.
+
+| | Role | What it does |
+|---|------|--------------|
+| 🕵️ | scout | Triage an incoming issue; label it for a lane (`build` / `plan`). |
+| 📋 | planner | For big/ambiguous issues, post a plan before any code is written (read-only). |
+| 👷 | builder | Turn a labeled issue into a small, tested, shippable PR (the only code-writer). |
+| 👩‍⚖️ | reviewer | Read the diff, run gates, post an approve / request-changes verdict. |
+| 🧑‍🔧 | fixer | Apply review feedback in a bounded retry loop with the reviewer. |
+| 🧹 | janitor | Scheduled sweep: rebase PRs the gate flagged `needs-rebase` so they can merge. |
+| 🧑‍✈️ | supervisor | Scheduled sweep: re-drive stranded issues/PRs; escalate to `needs-human` after 2 nudges. |
+| ♻️ | retro | Scheduled: mine merged PRs/reviews/CI for recurring lessons; write them to team memory. |
+| 🔀 | merge_gate | **Policy gate, not a persona** — enforces merge policy (approval, CI green, size, protected paths); auto-merges or labels `needs-rebase`/`needs-human`. |
+
+Roles are generic; a consumer repo supplies its stack (label strings, build/test commands,
+size thresholds, merge policy) via config and the `roles/*.md` overlay, never baked into the
+role's contract.
 
 ## The DOT → Actions model
 
@@ -24,93 +68,119 @@ harness.dot ──▶ parse ──▶ validate ──▶ model-check ──▶ a
 ```
 
 - **Nodes are roles.** Each node has a `type` (mechanical: `analyst`, `issue-agent`,
-  `producer`, `pr-review`, `pr-fix`, `merge-gate`, `human-gate`, plus `start`/`exit`)
-  and a `role="agents/roles/<name>.md"` that carries the domain-specific job description.
+  `producer`, `pr-review`, `pr-fix`, `merge-gate`, `human-gate`, `scheduled-agent`, plus
+  `start`/`exit`) and a `role="agents/roles/<name>.md"` carrying the domain-specific job
+  description. The type is the GitHub interaction; the role is the behavior.
 - **Edges are transitions.** Expressed only in GitHub-observable primitives
-  (`on="issues.opened"`, `when="label=agent"`, `when="verdict=approve"`), so the
+  (`on="issues.opened"`, `when="label=build"`, `when="verdict=approve"`), so the
   platform — not a bespoke engine — drives the loop.
-- **Generated workflows are a build artifact.** Every emitted `.yml` carries a
-  `# GENERATED FROM harness.dot — DO NOT EDIT` header and is drift-checked in CI.
+- **Generated workflows are a build artifact.** Every emitted `.yml` (and `HARNESS.md`)
+  carries a `# GENERATED FROM harness.dot — DO NOT EDIT` header and is drift-checked in CI.
   You evolve a harness by editing the spec and rebuilding in a PR, never by hand.
-- **Content is runtime-loaded.** Editing a prompt or role needs no rebuild; only
-  topology/policy changes recompile.
+- **Content is runtime-loaded.** Editing a prompt, role, or merge policy needs no rebuild;
+  only topology changes (`harness.dot`) recompile.
 
-A minimal spec:
+The default graph `gp-foundry init` scaffolds (`.github/harness.dot`) — a complete dark
+factory with self-healing and self-improving lanes:
 
 ```dot
 digraph harness {
-  start     [type=start]
-  scout     [type=issue-agent, role="agents/roles/scout.md"]
-  builder   [type=producer,    role="agents/roles/builder.md"]
-  reviewer  [type=pr-review,   role="agents/roles/reviewer.md"]
-  fixer     [type=pr-fix,      role="agents/roles/fixer.md", max_attempts=2]
-  gate      [type=merge-gate]
+  start       [type=start]
+  scout       [type=issue-agent,     role="agents/roles/scout.md",   context=issue]
+  planner     [type=analyst,         role="agents/roles/planner.md", context=issue, output=comment]
+  builder     [type=producer,        role="agents/roles/builder.md", context=issue]
+  reviewer    [type=pr-review,       role="agents/roles/reviewer.md", context="pr-diff"]
+  fixer       [type=pr-fix,          role="agents/roles/fixer.md",   max_attempts=3]
+  merge_gate  [type=merge-gate,      policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  janitor     [type=scheduled-agent, role="agents/roles/janitor.md",    schedule="*/30 * * * *"]
+  supervisor  [type=scheduled-agent, role="agents/roles/supervisor.md", schedule="17 * * * *"]
+  retro       [type=scheduled-agent, role="agents/roles/retro.md",   schedule="0 7 * * 1-5"]
+  needs_human [type=exit]
 
-  start    -> scout    [on="issues.opened"]
-  scout    -> builder  [when="label=agent"]
-  builder  -> reviewer [on="pull_request.opened"]
-  reviewer -> gate     [when="verdict=approve"]
-  reviewer -> fixer    [when="verdict=request_changes"]
-  fixer    -> reviewer [on="push"]
+  start    -> scout       [on="issues.opened"]
+  scout    -> planner     [when="label=plan"]
+  scout    -> builder     [when="label=build"]
+  planner  -> builder     [when="label=build"]
+  builder  -> reviewer    [on="pull_request.opened"]
+  reviewer -> merge_gate  [when="verdict=approve"]
+  reviewer -> fixer       [when="verdict=request_changes"]
+  fixer    -> reviewer    [on="push"]              // retry loop…
+  fixer    -> needs_human [when="attempts>=3"]     // …with a bounded escape
 }
 ```
 
-## Quickstart
+Every cycle must keep a bounded escape edge to an `exit` node; the model-checker rejects
+unbounded loops at build time. Full vocabulary in
+[skill/reference/node-types.md](./skill/reference/node-types.md).
 
-There are **two first-class front doors over one engine** — a Claude skill for
-discovery and setup, and a CLI for power users, scripting, and CI's drift-check.
-Both drive the same deterministic compiler.
+## Self-healing & self-improving
 
-### Via the Claude skill (Socratic setup)
+**Self-healing** — the factory does not silently stall:
+- 🧹 **janitor** runs on a schedule and rebases every PR the merge gate flagged
+  `needs-rebase`, so conflicts don't strand mergeable work.
+- 🧑‍✈️ **supervisor** runs on a schedule, re-drives stranded issues and PRs (no PR for a
+  `build`-labeled issue, idle PRs), and escalates to `needs-human` after 2 nudges.
+- The **merge gate** posts a 🔀 audit comment explaining each decision and labels
+  `needs-rebase` on conflicts rather than merging a broken state.
+- Agent **failures are visibly red** — no green no-ops. A failing job fails the run.
+- The 🧑‍🔧 **fixer** has a real attempt budget: it stamps a marker comment each attempt and,
+  at `max_attempts`, labels the PR `needs-human` and stops instead of looping forever.
 
-Inside a target repo, invoke the packaged skill. It interviews you about your
-pipeline, scaffolds `harness.dot` + roles + config, then compiles and explains the
-diff. It shells out to the CLI under the hood, so results are identical to a manual
-build — and it can reconcile against local edits when you regenerate.
+**Self-improving** — the factory learns from its own record:
+- ♻️ **retro** mines merged PRs, reviews, and CI for lessons that recur (≥ 2 occurrences),
+  and writes evidence-cited notes to `.github/agents/memory/topics/`.
+- `scope.yaml` guidance makes every agent **read that memory before working**, so a lesson
+  learned once shapes every subsequent run.
 
-### Via the CLI
+## Day-2 operations
 
-```bash
-gp-foundry init                # scaffold harness.dot + config + roles + scope + policy
-gp-foundry validate            # schema + reachability + bounded-cycle checks
-gp-foundry build               # compile harness.dot → .github/workflows/*.yml
-gp-foundry build --check       # drift gate: fail if generated YAML is out of date
-gp-foundry build --dry-run     # preview the diff without writing
-gp-foundry graph               # render / inspect the topology
-gp-foundry explain <node>      # show what a node compiles to
-```
+| Command | Use |
+|---------|-----|
+| `gp-foundry status` | Operator dashboard: work in flight per lane, agent PRs, stalled items, failed runs (last 24h). |
+| `gp-foundry doctor` | Preflight: config validity, workflow drift, vendored actions, `gh` auth, labels, secrets, committed. |
+| `gp-foundry build --check` | The **CI drift gate** — exit non-zero if the committed workflows are stale vs the graph. Add it to your CI. |
 
-Add `--json` to any command for machine/agent-consumable output. Diagnostics carry a
-stable `code`, the offending node, and a fix hint.
+**Where to make a change** — three surfaces, only one of which recompiles:
 
-**Consumer repo layout after `gp-foundry init` + `build`:**
+| To change… | Edit | Rebuild? |
+|------------|------|----------|
+| An agent's **behavior** (job description, quality bar) | `agents/roles/<name>.md` | No — runtime content |
+| The **merge policy** (size gates, protected paths, approvals) | `agents/policy/merge.yaml` | No — runtime content |
+| The **topology** (add a role/lane, rewire handoffs, change a schedule) | `.github/harness.dot` | Yes — `gp-foundry build` |
 
-```
-.github/
-  harness.dot                 # source of truth (topology)
-  workflows/*.yml             # GENERATED — drift-checked, do not edit
-  agents/
-    foundry.config.yaml       # identity, auth, model, labels, branch prefix
-    scope.yaml                # immutable / forbidden paths (CI-enforced)
-    roles/*.md                # job descriptions (content; runtime-loaded)
-    policy/*.yaml             # merge policy: size gates, protected paths
-```
+Roles and policy are runtime-loaded, so tuning them is a content edit with no regenerated
+YAML. Changing the graph is the only thing that recompiles — do it in a PR, and commit the
+spec change and the regenerated workflows together so `build --check` stays green.
+
+### Distribution: vendored vs pinned
+
+`runtime.mode` controls how the generated workflows reference the runtime-core actions:
+- **`vendored`** (default) — `gp-foundry vendor` (and `up`) copy the actions into
+  `.github/actions/`, and the workflows reference them by local path. Self-contained, no
+  external dependency; upgrade by re-running `vendor`.
+- **`pinned`** — reference `<owner_repo>/actions/<name>@<ref>` centrally (set a SHA/tag).
+  Smaller consumer repos, central upgrades — available once the actions repo is public.
 
 ## Repository layout
 
 | Path | Contents |
 |------|----------|
-| `src/`        | the compiler — parser, IR types, validate, model-check, role & step handlers |
-| `actions/`    | the pinned runtime core (JS + composite actions the generated workflows call) |
-| `examples/`   | example harness specs (e.g. `examples/dixie/harness.dot`) and their generated output |
-| `schema/`     | JSON Schemas for `foundry.config.yaml` and related content |
-| `docs/plans/` | dated, append-only design specs |
+| `src/`      | the compiler — parser, IR types, validate, model-check, role & step handlers, CLI |
+| `actions/`  | the runtime core (JS + composite actions the generated workflows call) |
+| `roles/`    | generic role packs (`software/`, `content/`, `docs/`) — the job descriptions |
+| `skill/`    | the packaged Claude skill: `SKILL.md`, `reference/`, and the scaffolding `templates/` |
+| `schema/`   | JSON Schema for `foundry.config.yaml` |
+| `examples/` | example harness specs (`examples/dixie/`, `examples/marketing/`) |
+| `docs/`     | design docs (`docs/plans/`) |
 
 ## Docs
 
 - **[docs/plans/](./docs/plans/)** — dated design specs (start with the
   [system design](./docs/plans/2026-07-01-gp-foundry-system-design.md)).
-- Each runtime-core action documents its contract in `actions/<name>/README.md`.
+- **[skill/SKILL.md](./skill/SKILL.md)** — the Socratic setup skill and its
+  [CLI](./skill/reference/cli.md), [node-type](./skill/reference/node-types.md), and
+  [role-pack](./skill/reference/role-packs.md) references.
+- Each runtime-core action documents its contract in `actions/<name>/`.
 
 ## Development
 
@@ -118,11 +188,11 @@ stable `code`, the offending node, and a fix hint.
 npm ci
 npm run typecheck      # tsc --noEmit
 npm test               # vitest run
+npm run build          # bundle the CLI to dist/cli/index.cjs
 npm run build:actions  # bundle the runtime-core actions to actions/*/dist/
-npm run check:dist     # fail if bundled dist drifts from source
+npm run check:dist     # fail if bundled action dist drifts from source
 ```
 
-CI (`.github/workflows/ci.yml`) runs the above, plus `actionlint` + `zizmor` over
-this repo's workflows and every generated example harness, and guards that no
-generated workflow uses a local action path or splices `${{ github.event.* }}` into
-a shell.
+CI runs the above, plus `actionlint` + `zizmor` over this repo's workflows and every
+generated example harness, and guards that no generated workflow uses a local action path or
+splices `${{ github.event.* }}` into a shell.

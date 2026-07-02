@@ -1,0 +1,177 @@
+/**
+ * Regression tests for the dark-factory audit findings: label mapping, guard
+ * OR-merge, placeholder detection, vendored-actions check, the real attempt
+ * budget, approval integrity, and out-of-the-box template runnability.
+ */
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
+import { parseDot } from "../src/parser/parse.js";
+import { loadConfig } from "../src/config/load.js";
+import { wire } from "../src/wiring/wire.js";
+import { validate } from "../src/validate/validate.js";
+import { compile } from "../src/index.js";
+import { latestValidApproval } from "../actions/merge-gate/src/gate.js";
+import type { FoundryConfig, Harness } from "../src/ir/types.js";
+
+const tpl = (rel: string) => fileURLToPath(new URL(`../skill/templates/${rel}`, import.meta.url));
+
+function mkHarness(dotSrc: string, cfg: Partial<FoundryConfig> = {}): Harness {
+  const g = parseDot(dotSrc);
+  const config = { ...loadConfig(undefined), ...cfg } as FoundryConfig;
+  return { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "test.dot" };
+}
+
+const LANE_DOT = `digraph t {
+  start [type=start]
+  scout [type=issue-agent, role="agents/roles/scout.md"]
+  builder [type=producer, role="agents/roles/builder.md"]
+  reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+  start -> scout [on="issues.opened"]
+  scout -> builder [when="label=build"]
+  builder -> reviewer [on="pull_request.opened"]
+}`;
+
+describe("label mapping (config.labels is live, not dead config)", () => {
+  it("resolves semantic keys through config.labels", () => {
+    const ir = mkHarness(LANE_DOT, { labels: { build: "agent-go" } } as Partial<FoundryConfig>);
+    const guard = wire(ir).perNode.builder.guard!;
+    expect(guard).toContain("github.event.label.name == 'agent-go'");
+  });
+
+  it("defaults to identity when unmapped", () => {
+    const ir = mkHarness(LANE_DOT);
+    expect(wire(ir).perNode.builder.guard!).toContain("== 'build'");
+  });
+});
+
+describe("guard OR-merge: unguarded events survive a guarded sibling edge", () => {
+  // reviewer has BOTH a label-guarded in-edge and an unguarded pull_request in-edge
+  const MIXED = `digraph t {
+    start [type=start]
+    builder [type=producer, role="agents/roles/builder.md"]
+    nudge [type=issue-agent, role="agents/roles/nudge.md"]
+    reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+    start -> builder [on="issues.opened"]
+    builder -> reviewer [on="pull_request.opened"]
+    nudge -> reviewer [when="label=re-review"]
+  }`;
+  it("reviewer keeps firing on pull_request events despite the label guard", () => {
+    const ir = mkHarness(MIXED);
+    const w = wire(ir).perNode.reviewer;
+    // the label guard must be OR'd with a discriminator for the unguarded event
+    expect(w.guard).toContain("github.event.label.name == 're-review'");
+    expect(w.guard).toContain("github.event_name == 'pull_request'");
+    expect(w.guard).toContain("github.event.action == 'opened'");
+  });
+});
+
+describe("placeholder detection", () => {
+  it("errors when config values still contain <placeholders>", () => {
+    const ir = mkHarness(LANE_DOT, { identity: { git_email: "<agent@example.com>" } } as Partial<FoundryConfig>);
+    const diags = validate(ir);
+    expect(diags.some((d) => d.code === "config.placeholder" && d.level === "error")).toBe(true);
+  });
+
+  it("is silent on a fully-filled config", () => {
+    const ir = mkHarness(LANE_DOT);
+    expect(validate(ir).filter((d) => d.code === "config.placeholder")).toEqual([]);
+  });
+});
+
+describe("vendored-runtime checks", () => {
+  it("warns when vendored actions / agent-setup are missing", () => {
+    const ir = mkHarness(LANE_DOT, { runtime: { mode: "vendored" } } as Partial<FoundryConfig>);
+    const diags = validate(ir, { fileExists: (p) => p.startsWith("agents/") });
+    expect(diags.some((d) => d.code === "runtime.action-not-vendored")).toBe(true);
+    expect(diags.some((d) => d.code === "runtime.agent-setup-missing")).toBe(true);
+  });
+});
+
+describe("auth github-token severity", () => {
+  it("explicit github-token + cascade edges = error", () => {
+    const ir = mkHarness(LANE_DOT, { auth: { mode: "github-token" } } as Partial<FoundryConfig>);
+    const d = validate(ir).find((x) => x.code === "auth.github-token-no-cascade");
+    expect(d?.level).toBe("error");
+  });
+  it("defaulted auth = warning (no choice made yet)", () => {
+    const ir = mkHarness(LANE_DOT);
+    const d = validate(ir).find((x) => x.code === "auth.github-token-no-cascade");
+    expect(d?.level).toBe("warning");
+  });
+});
+
+describe("attempt budget is real (pr-fix)", () => {
+  const FIX_DOT = `digraph t {
+    start [type=start]
+    reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+    fixer [type=pr-fix, role="agents/roles/fixer.md", max_attempts=2]
+    start -> reviewer [on="pull_request.opened"]
+    reviewer -> fixer [when="verdict=request_changes"]
+  }`;
+  it("emits an attempts gate that labels needs-human at the limit", () => {
+    const ir = mkHarness(FIX_DOT);
+    const { files } = compile(ir);
+    const fixer = files.find((f) => f.path.endsWith("fixer.yml"))!.contents;
+    expect(fixer).toContain("Enforce attempt budget (max 2)");
+    expect(fixer).toContain("needs-human");
+    // downstream steps are gated on the budget
+    expect(fixer).toContain("steps.attempts.outputs.exhausted != 'true'");
+  });
+});
+
+describe("merge-gate approval integrity (latestValidApproval)", () => {
+  const HEAD = "abc123";
+  it("a later REQUEST_CHANGES invalidates an earlier APPROVE", () => {
+    expect(latestValidApproval([
+      { at: "2026-01-01T10:00:00Z", kind: "approve", sha: HEAD },
+      { at: "2026-01-01T11:00:00Z", kind: "reject", sha: HEAD },
+    ], HEAD)).toBeNull();
+  });
+  it("an approval for a stale SHA does not count", () => {
+    expect(latestValidApproval([
+      { at: "2026-01-01T10:00:00Z", kind: "approve", sha: "oldsha" },
+    ], HEAD)).toBeNull();
+  });
+  it("approve on the current head counts", () => {
+    expect(latestValidApproval([
+      { at: "2026-01-01T10:00:00Z", kind: "reject", sha: "oldsha" },
+      { at: "2026-01-01T11:00:00Z", kind: "approve", sha: HEAD },
+    ], HEAD)).toBe("2026-01-01T11:00:00Z");
+  });
+  it("a comment verdict (no SHA) must postdate the head commit", () => {
+    const events = [{ at: "2026-01-01T10:00:00Z", kind: "approve" as const }];
+    expect(latestValidApproval(events, HEAD, "2026-01-01T11:00:00Z")).toBeNull();
+    expect(latestValidApproval(events, HEAD, "2026-01-01T09:00:00Z")).toBe("2026-01-01T10:00:00Z");
+  });
+  it("no events → no approval", () => {
+    expect(latestValidApproval([], HEAD)).toBeNull();
+  });
+});
+
+describe("shipped templates are runnable out of the box", () => {
+  it("template config has no <placeholders> and uses vendored runtime", () => {
+    const cfg = yaml.load(readFileSync(tpl("foundry.config.yaml"), "utf8")) as Record<string, any>;
+    expect(JSON.stringify(cfg)).not.toMatch(/<[A-Za-z][^<>]*>/);
+    expect(cfg.runtime.mode).toBe("vendored");
+    expect(cfg.repo.branch_prefix).toBe("agent/"); // must match policy branch_prefix
+  });
+
+  it("template harness compiles with zero errors and includes the self-healing/-improving lanes", () => {
+    const g = parseDot(readFileSync(tpl("harness.dot"), "utf8"));
+    const cfgRaw = yaml.load(readFileSync(tpl("foundry.config.yaml"), "utf8")) as Partial<FoundryConfig>;
+    const config = { ...loadConfig(undefined), ...cfgRaw } as FoundryConfig;
+    const ir: Harness = { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "harness.dot" };
+    const { files, diagnostics } = compile(ir);
+    expect(diagnostics.filter((d) => d.level === "error")).toEqual([]);
+    const paths = files.map((f) => f.path);
+    for (const wf of ["scout", "planner", "builder", "reviewer", "fixer", "merge_gate", "janitor", "supervisor", "retro"]) {
+      expect(paths).toContain(`.github/workflows/${wf}.yml`);
+    }
+    // no placeholder leaks into any generated WORKFLOW (HARNESS.md has legit mermaid HTML)
+    for (const f of files.filter((x) => x.path.startsWith(".github/workflows/"))) {
+      expect(f.contents).not.toMatch(/<[A-Za-z][^<>]{0,40}>/);
+    }
+  });
+});

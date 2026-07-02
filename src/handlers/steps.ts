@@ -88,6 +88,8 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
     "github-token": tokenExpr(ctx),
   };
   if (opts.withContext) withBlock["context-file"] = "${{ steps.ctx.outputs.context-file }}";
+  // Optional repo-wide conventions string from config (inserted before the scope).
+  if (cfg.agent.conventions) withBlock["conventions"] = cfg.agent.conventions;
   const override = node.files.prompt;
   if (override) withBlock["prompt-override-file"] = resolveFile(ctx, override);
   return { uses: ctx.actionRef("run-agent"), name: "Run agent", with: withBlock };

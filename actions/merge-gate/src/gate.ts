@@ -38,6 +38,8 @@ export interface PullRequestFacts {
   title?: string;
   /** Head branch name, e.g. "agent/foo". */
   headRefName: string;
+  /** Base branch name, e.g. "main" (used in operator-facing messages). */
+  baseRefName?: string;
   /** Labels currently on the PR (names only). */
   labels: string[];
   /** CI rollup for the head SHA. */
@@ -255,6 +257,40 @@ export function filterCandidateNumbers(
 export function isApprovalBody(body: string | null | undefined, regexSource?: string): boolean {
   if (!regexSource || !body) return false;
   return new RegExp(regexSource).test(body);
+}
+
+/** One verdict-bearing event on a PR (a review or a marker comment), in time order. */
+export interface VerdictEvent {
+  /** ISO timestamp of the review submission / comment creation. */
+  at: string;
+  kind: "approve" | "reject";
+  /** The commit the review was submitted against (undefined for comments). */
+  sha?: string | null;
+}
+
+/**
+ * The approval integrity rule: the LATEST verdict wins (a newer REQUEST_CHANGES
+ * invalidates any earlier APPROVE), and an approval only counts for the CURRENT
+ * head — a review must carry the head SHA; a marker comment (no SHA) must be
+ * newer than the head commit itself. Returns the qualifying approval timestamp,
+ * or null. This is what stops a cron poller from merging code that was approved
+ * three pushes ago or explicitly rejected since.
+ */
+export function latestValidApproval(
+  events: VerdictEvent[],
+  headSha: string,
+  headCommittedAt?: string | number | null,
+): string | null {
+  if (events.length === 0) return null;
+  const sorted = [...events].sort((a, b) => parseTimestamp(a.at) - parseTimestamp(b.at));
+  const last = sorted[sorted.length - 1]!;
+  if (last.kind === "reject") return null;
+  if (last.sha) return last.sha === headSha ? last.at : null;
+  // Comment verdict: no SHA to compare — require it to postdate the head commit.
+  if (headCommittedAt !== undefined && headCommittedAt !== null) {
+    return parseTimestamp(last.at) > parseTimestamp(headCommittedAt) ? last.at : null;
+  }
+  return last.at;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -124,7 +124,7 @@ export interface FoundryConfig {
     git_name?: string;
     git_email?: string;
   };
-  agent: { cli: string; model: string; oauth_token_secret?: string };
+  agent: { cli: string; model: string; oauth_token_secret?: string; conventions?: string };
   repo: { base_branch: string; branch_prefix: string };
   /** semantic role -> repo label (the drift-killer). */
   labels: Record<string, string>;

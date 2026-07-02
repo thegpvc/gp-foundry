@@ -92,6 +92,10 @@ async function run(): Promise<void> {
 
   const timeoutSeconds = intInput("timeout-seconds", 900, 1);
   const pollInterval = intInput("poll-interval", 20, 1);
+  // A gated workflow that doesn't exist (or never triggers for this SHA) must not
+  // burn the whole timeout — that starves the caller's own job timeout. After this
+  // grace with ZERO runs observed, conclude "skipped" and let the caller proceed.
+  const missingGraceSeconds = intInput("missing-grace-seconds", 90, 1);
 
   if (!workflowName && !checkName) {
     core.setFailed(
@@ -116,6 +120,8 @@ async function run(): Promise<void> {
 
   let conclusion: Conclusion = "timeout";
   let attempt = 0;
+  const missingDeadline = Date.now() + missingGraceSeconds * 1000;
+  let everSawRuns = false;
 
   while (Date.now() < deadline) {
     attempt += 1;
@@ -130,12 +136,29 @@ async function run(): Promise<void> {
         checkName,
       );
     } catch (err) {
+      // A 404 on the workflow-name path means the workflow file does not exist
+      // in this repo at all — waiting cannot help. Conclude "skipped" at once.
+      const status = (err as { status?: number }).status;
+      if (workflowName && status === 404) {
+        core.warning(`${target} does not exist in ${owner}/${repo} — concluding 'skipped'.`);
+        conclusion = "skipped";
+        break;
+      }
       // Transient API errors should not abort the wait; log and retry.
       core.warning(
         `Attempt ${attempt}: error querying checks: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+
+    if (runs.length > 0) everSawRuns = true;
+    if (!everSawRuns && Date.now() >= missingDeadline) {
+      core.warning(
+        `No runs for ${target} after ${missingGraceSeconds}s — it likely never triggers for this SHA; concluding 'skipped'.`,
+      );
+      conclusion = "skipped";
+      break;
     }
 
     const decision = aggregate(runs);

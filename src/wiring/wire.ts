@@ -6,9 +6,17 @@
  * labels, review state, schedules). Rich runtime conditions are represented as
  * label/state writes by a prior node, exactly as dixie already coordinates.
  */
-import type { Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
+import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 
 const PR_CONTEXT_TYPES = new Set(["pr-review", "pr-fix"]);
+
+/**
+ * Resolve a semantic label key through config.labels (identity when unmapped).
+ * `when="label=build"` guards on the label the CONSUMER's repo actually uses.
+ */
+function resolveLabel(key: string, cfg: FoundryConfig): string {
+  return cfg.labels?.[key] ?? key;
+}
 
 function targetIsPr(node: HarnessNode): boolean {
   return (
@@ -52,27 +60,40 @@ interface EdgeWire {
   guard?: string;
 }
 
-function wireEdge(edge: HarnessEdge, target: HarnessNode): EdgeWire | undefined {
+/**
+ * A GitHub-expression discriminator for one event, so an UNGUARDED edge can still
+ * contribute an OR-clause when a sibling edge is guarded. Without this, a node with
+ * a guarded edge (e.g. `label=x`) plus an unguarded edge on a different event would
+ * apply the guard to BOTH events and silently suppress the unguarded one.
+ */
+function eventClause(event: string): string {
+  const [name, action] = event.split(".");
+  if (!action) return `github.event_name == '${name}'`;
+  return `(github.event_name == '${name}' && github.event.action == '${action}')`;
+}
+
+function wireEdge(edge: HarnessEdge, target: HarnessNode, cfg: FoundryConfig): EdgeWire | undefined {
   if (edge.on) {
     // `on` may list several events, e.g. "pull_request.opened, pull_request.synchronize".
     const events = edge.on.split(",").map((s) => s.trim()).filter(Boolean);
-    return { events, guard: edge.when ? guardFor(edge.when, target) : undefined };
+    return { events, guard: edge.when ? guardFor(edge.when, target, cfg) : undefined };
   }
   if (!edge.when) return undefined;
   const w = edge.when;
   if (w.startsWith("label=")) {
-    return { events: [targetIsPr(target) ? "pull_request.labeled" : "issues.labeled"], guard: guardFor(w, target) };
+    return { events: [targetIsPr(target) ? "pull_request.labeled" : "issues.labeled"], guard: guardFor(w, target, cfg) };
   }
   if (w.startsWith("verdict=")) {
-    return { events: ["pull_request_review.submitted"], guard: guardFor(w, target) };
+    return { events: ["pull_request_review.submitted"], guard: guardFor(w, target, cfg) };
   }
   // internal-only transitions (attempts>=N, ci=...) are not triggers for this node
   return undefined;
 }
 
-function guardFor(when: string, _target: HarnessNode): string | undefined {
+function guardFor(when: string, _target: HarnessNode, cfg: FoundryConfig): string | undefined {
   if (when.startsWith("label=")) {
-    return `github.event.label.name == '${when.slice("label=".length)}'`;
+    // semantic key -> actual repo label via config.labels (identity by default)
+    return `github.event.label.name == '${resolveLabel(when.slice("label=".length), cfg)}'`;
   }
   // A bot cannot APPROVE/REQUEST_CHANGES its own PR, so the Critic submits a
   // COMMENTED review with the verdict in the body; guard on the body marker.
@@ -103,6 +124,7 @@ export function wire(ir: Harness): WiringPlan {
 
     const triggers: Record<string, any> = {};
     const guards = new Set<string>();
+    const unguardedEvents = new Set<string>();
     const dispatches: { toNode: string; when?: string }[] = [];
 
     // scheduled nodes (e.g. merge-gate) are driven by cron + manual dispatch only
@@ -111,10 +133,16 @@ export function wire(ir: Harness): WiringPlan {
       triggers.workflow_dispatch = {};
     } else {
       for (const e of incoming.get(node.id) ?? []) {
-        const w = wireEdge(e, node);
+        const w = wireEdge(e, node, ir.config);
         if (!w) continue;
         for (const ev of w.events) mergeEvent(triggers, ev, node);
         if (w.guard) guards.add(w.guard);
+        else for (const ev of w.events) unguardedEvents.add(ev);
+      }
+      // Mixed guarded + unguarded edges: the unguarded events must still pass the
+      // job-level `if`, so they contribute an event-discriminator OR-clause.
+      if (guards.size && unguardedEvents.size) {
+        for (const ev of unguardedEvents) guards.add(eventClause(ev));
       }
     }
 

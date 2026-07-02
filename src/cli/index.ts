@@ -4,8 +4,7 @@ import { Command } from "commander";
 import pc from "picocolors";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Diagnostic, RoleSpec } from "../ir/types.js";
+import type { RoleSpec } from "../ir/types.js";
 import { compile, hasErrors } from "../index.js";
 import { loadHarness } from "../config/load.js";
 import { parseDot } from "../parser/parse.js";
@@ -13,40 +12,11 @@ import { parseRoleFrontmatter } from "../roles/role.js";
 import { validate } from "../validate/validate.js";
 import { modelCheck } from "../modelcheck/check.js";
 import { renderDiagram } from "../diagram/render.js";
+import { emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
+import { registerOpsCommands } from "./ops.js";
 
 const program = new Command();
 program.name("gp-foundry").description("Compile a DOT harness spec into GitHub Actions.").version("0.1.0");
-
-/** Resolve a path inside the installed package (works in dev via tsx and when bundled/published). */
-function pkgFile(rel: string): string {
-  return fileURLToPath(new URL(`../../${rel}`, import.meta.url));
-}
-
-function emitJson(obj: unknown): void {
-  process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
-}
-
-function printDiagnostics(diags: Diagnostic[]): void {
-  for (const d of diags) {
-    const tag =
-      d.level === "error" ? pc.red("error") : d.level === "warning" ? pc.yellow("warn") : pc.blue("info");
-    const where = d.where?.node ? pc.dim(` [${d.where.node}]`) : "";
-    process.stderr.write(`${tag} ${pc.dim(d.code)}${where}  ${d.message}\n`);
-    if (d.hint) process.stderr.write(`      ${pc.dim("hint: " + d.hint)}\n`);
-  }
-}
-
-function resolvePaths(opts: { dot?: string; config?: string }): { dot: string; config?: string; base: string } {
-  const dot = resolve(opts.dot ?? ".github/harness.dot");
-  const base = dirname(dot);
-  let config = opts.config ? resolve(opts.config) : undefined;
-  if (!config) {
-    for (const c of [join(base, "foundry.config.yaml"), join(base, "agents/foundry.config.yaml")]) {
-      if (existsSync(c)) { config = c; break; }
-    }
-  }
-  return { dot, config, base };
-}
 
 function loadRoles(ir: ReturnType<typeof loadHarness>["harness"], base: string): Map<string, RoleSpec> {
   const roles = new Map<string, RoleSpec>();
@@ -69,6 +39,9 @@ const INIT_FILES: [tpl: string, dest: string][] = [
   ["skill/templates/scope.yaml", ".github/agents/scope.yaml"],
   ["skill/templates/policy-merge.yaml", ".github/agents/policy/merge.yaml"],
   ["skill/templates/communication.md", ".github/agents/communication.md"],
+  // Every agent job runs `uses: ./.github/agent-setup` — the consumer-owned
+  // toolchain shim. Scaffolding it is what makes a fresh init runnable.
+  ["skill/templates/agent-setup.yml", ".github/agent-setup/action.yml"],
 ];
 
 program
@@ -106,7 +79,18 @@ program
     for (const w of written) process.stdout.write(pc.green(`created ${w}\n`));
     for (const s of skipped) process.stderr.write(pc.yellow(`skipped ${s} (exists; --force to overwrite)\n`));
     process.stdout.write(
-      pc.dim("\nNext: fill in .github/harness.dot + .github/agents/{foundry.config.yaml,roles/}, then run `gp-foundry build`.\n"),
+      [
+        "",
+        pc.bold("Next steps — dark factory in 4 moves:"),
+        `  1. ${pc.cyan("gp-foundry up")}          vendor actions, create labels, build workflows, run checks`,
+        `  2. set two secrets:       ${pc.cyan("gh secret set CLAUDE_CODE_OAUTH_TOKEN")} (agent auth)`,
+        `                            ${pc.cyan("gh secret set AGENT_PAT")} (fine-grained PAT: contents/PRs/issues RW)`,
+        `  3. commit + push ${pc.cyan(".github/")}`,
+        `  4. file an issue → the 🕵️ scout triages it and the factory takes it from there`,
+        "",
+        pc.dim("Tune later: .github/harness.dot (topology) · agents/roles/*.md (behavior) · agents/policy/merge.yaml (merge rules)"),
+        "",
+      ].join("\n"),
     );
   });
 
@@ -121,7 +105,7 @@ program
   .option("--force", "write even if there are error diagnostics")
   .option("--json", "machine-readable output")
   .action((opts) => {
-    const { dot, config, base } = resolvePaths(opts);
+    const { dot, config, base, root } = resolvePaths(opts);
     if (!existsSync(dot)) {
       if (opts.json) emitJson({ error: `no harness.dot at ${dot}` });
       else process.stderr.write(pc.red(`no harness.dot at ${dot}\n`));
@@ -133,9 +117,10 @@ program
       else for (const e of parseErrors) process.stderr.write(pc.red(`parse: ${e.message}${e.line ? ` (line ${e.line})` : ""}\n`));
       process.exit(1);
     }
-    const out = resolve(opts.out ?? base);
+    const out = resolve(opts.out ?? root);
     const specDir = relative(out, base).replace(/\\/g, "/");
-    const { files, diagnostics } = compile(harness, {}, { specDir });
+    const fileExists = (rel: string) => existsSync(join(base, rel));
+    const { files, diagnostics } = compile(harness, { fileExists }, { specDir });
     if (!opts.json) printDiagnostics(diagnostics);
 
     if (opts.check) {
@@ -224,5 +209,7 @@ program
     if (opts.json) emitJson({ node, path: f.path, contents: f.contents });
     else process.stdout.write(f.contents + "\n");
   });
+
+registerOpsCommands(program);
 
 program.parseAsync(process.argv);
