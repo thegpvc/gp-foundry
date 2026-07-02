@@ -1,36 +1,50 @@
-# policy/merge.yaml — the merge-gate's policy (interview Q2 approvals). Evaluated by the
-# runtime-core merge-gate action into a {merge | skip | label} decision + audit trail.
-# Everything here is config; no hardcoded label names or paths (those come from
-# foundry.config.yaml / scope.yaml).
+# policy/merge.yaml — the merge-gate's policy. Read by the runtime-core merge-gate
+# action and evaluated into a {merge | skip | label} decision + audit comment.
+#
+# IMPORTANT: these are FLAT snake_case keys (normalized to camelCase at runtime).
+# The action reads exactly these names — do not nest them under approval:/ci:/etc.
 
-# squash — NOT rebase: the Janitor resolves conflicts with a merge commit, and a
-# rebase-merge cannot rebase a branch that contains merge commits.
-merge_method: squash
-rebase_label: needs-rebase      # applied on a merge conflict; the Janitor sweeps this
+# Only consider PRs whose head branch starts with this prefix.
+branch_prefix: "agent/"
 
-approval:
-  required_reviews: 1            # human/agent approvals required before merge
-  approval_delay_minutes: 0     # cool-off after approval before auto-merge (0 = none)
+# Approval — the Critic posts its verdict in a review BODY; count a body matching
+# this regex as approval (a bot can't formally APPROVE its own PR).
+approval_body_regex: "Verdict.*APPROVE"
+approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)
 
-ci:
-  require_pass: true            # all required checks must conclude success
-  required_checks:
-    - ci.yml                     # named check workflows that must be green
+# CI — require the check rollup to be passing; optionally ignore named checks.
+require_ci: true
+ci_ignore_check_names: []
 
-size:
-  # additions cap for auto-merge (over this -> label for a human instead of merging).
-  # Uses foundry.config.yaml `size.exclude_globs` to discount generated files.
-  hard_additions: 800
+# Size — hand-written additions cap; over this, label for a human instead of merging.
+# exclude_globs discount generated files/lockfiles from the count.
+max_additions: 800
+exclude_globs:
+  - "**/__pycache__/**"
 
+# Protected paths — touching any of these blocks auto-merge (labels needs-human).
 protected_paths:
-  # If a PR touches any of these, do NOT auto-merge — label for human review.
-  # (immutable_paths in scope.yaml are a harder boundary enforced separately.)
-  from_scope: true             # inherit scope.yaml forbidden/immutable paths as protected
-  extra: []
+  - ".github/"
 
-rebase:
-  require_clean: true          # refuse to merge a PR that needs a non-trivial rebase
+# Rebase / conflicts.
+#  - require_clean_rebase: false — GitHub's mergeable_state is computed async and races
+#    on fresh PRs; instead we let the merge ATTEMPT fail and react (see rebase_label).
+#  - rebase_label: applied when a merge attempt fails on a conflict; the 🧟 Janitor
+#    (scheduled sweep) picks up this label, rebases, and de-labels.
+require_clean_rebase: false
+rebase_label: needs-rebase
 
-on_block:
-  action: label                # what to do when a gate fails: `label` (for a human) or `skip`
-  label: needs-human           # semantic key resolved via foundry.config.yaml labels
+# Merge — squash, NOT rebase: the Janitor resolves conflicts with a merge commit, and a
+# rebase-merge cannot rebase a branch containing merge commits.
+merge_method: squash
+delete_branch_on_merge: true
+
+# A PR already carrying one of these is skipped (the Janitor/human owns it, not the gate).
+blocking_labels:
+  - needs-human
+  - needs-rebase
+
+# Labels applied on a skip outcome, so skips route to the right owner.
+labels:
+  needs_human: needs-human       # too-large / protected-path
+  rebase_needed: needs-rebase    # proactive rebase label (used if require_clean_rebase: true)
