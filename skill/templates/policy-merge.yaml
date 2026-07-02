@@ -3,6 +3,11 @@
 # Everything here is config; no hardcoded label names or paths (those come from
 # foundry.config.yaml / scope.yaml).
 
+# squash — NOT rebase: the Janitor resolves conflicts with a merge commit, and a
+# rebase-merge cannot rebase a branch that contains merge commits.
+merge_method: squash
+rebase_label: needs-rebase      # applied on a merge conflict; the Janitor sweeps this
+
 approval:
   required_reviews: 1            # human/agent approvals required before merge
   approval_delay_minutes: 0     # cool-off after approval before auto-merge (0 = none)

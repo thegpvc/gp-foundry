@@ -32,6 +32,8 @@ interface PolicyFile extends MergePolicy {
   ciIgnoreCheckNames?: string[];
   mergeMethod?: "merge" | "squash" | "rebase";
   deleteBranchOnMerge?: boolean;
+  // Label applied when a merge fails on a conflict, so a Fixer can pick it up and rebase.
+  rebaseLabel?: string;
 }
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -126,9 +128,15 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
       await octokit.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: policy.mergeMethod ?? "rebase" });
     } catch (e) {
       // A merge can still fail at merge time (e.g. a conflict that appeared after
-      // another PR landed). Don't crash the whole poller — explain and move on.
+      // another PR landed). Don't crash the poller — label it so a Fixer rebases it.
       core.warning(`Merge of #${prNumber} rejected: ${(e as Error).message}`);
-      await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge (usually a conflict that appeared after another PR landed). This branch needs a rebase onto \`${policy.branchPrefix ? "the base branch" : "main"}\` before it can merge.`);
+      const rebaseLabel = policy.rebaseLabel ?? "needs-rebase";
+      try {
+        await octokit.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [rebaseLabel] });
+      } catch (le) {
+        core.warning(`Could not label #${prNumber} \`${rebaseLabel}\`: ${(le as Error).message}`);
+      }
+      await comment(octokit, owner, repo, prNumber, `## 🤖 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the Fixer can rebase this onto \`${facts.baseRefName}\` and try again.`);
       return false;
     }
     if (policy.deleteBranchOnMerge ?? true) {

@@ -28,6 +28,8 @@ digraph harness {
 
   // approval: automated merge policy (swap for a human-gate if approval must be human)
   shipper     [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  // scheduled sweep: rebases PRs the merge-gate labelled `needs-rebase` after a conflict
+  janitor     [type=scheduled-agent, role="agents/roles/janitor.md", schedule="*/30 * * * *"]
 
   // bounded escape hatch — the terminal a stuck unit lands in
   needs_human [type=exit]
