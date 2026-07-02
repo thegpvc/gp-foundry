@@ -30,6 +30,7 @@ digraph harness {
   shipper     [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
   // scheduled sweep: rebases PRs the merge-gate labelled `needs-rebase` after a conflict
   janitor     [type=scheduled-agent, role="agents/roles/janitor.md", schedule="*/30 * * * *"]
+  retro       [type=scheduled-agent, role="agents/roles/retro.md", schedule="0 7 * * 1-5"]  // active learning: mine the record for lessons
 
   // bounded escape hatch — the terminal a stuck unit lands in
   needs_human [type=exit]
