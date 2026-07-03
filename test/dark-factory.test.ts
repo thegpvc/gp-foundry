@@ -281,3 +281,19 @@ describe("skill dry-run regressions", () => {
     expect(wf).not.toContain("🧑‍🔧 Fixer");
   });
 });
+
+describe("AGENT.md bootstrap (zero-install front door)", () => {
+  const agentMd = readFileSync(fileURLToPath(new URL("../AGENT.md", import.meta.url)), "utf8");
+  it("is shipped in the npm package", async () => {
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+    expect(pkg.files).toContain("AGENT.md");
+  });
+  it("uses npx (no global install) and names the real commands + secrets", () => {
+    expect(agentMd).toContain("npx -y @thegpvc/gp-foundry@latest init");
+    expect(agentMd).toContain("npx -y @thegpvc/gp-foundry@latest up");
+    expect(agentMd).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(agentMd).toContain("AGENT_PAT");
+    expect(agentMd).not.toContain("npm i -g");
+    expect(agentMd).not.toMatch(/<[A-Za-z][^<>]{0,40}>/); // no placeholders
+  });
+});

@@ -12,6 +12,19 @@ truly stuck) and **self-improving** (mines its own merged PRs and reviews for re
 lessons and feeds them back to every agent). Nothing here is code-specific — the same shape
 that ships a library can ship docs, marketing copy, or config.
 
+## Zero-install: point your coding agent at this
+
+The fastest path — don't install anything yourself. Paste this into your coding agent
+(Claude Code, Cursor, or any agent with shell access), inside the target repo:
+
+> Fetch https://unpkg.com/@thegpvc/gp-foundry/AGENT.md and follow it to set up an
+> autonomous delivery pipeline in this repository.
+
+[`AGENT.md`](./AGENT.md) walks the agent through the whole bring-up via `npx` (no global
+install): scaffold, adapt the toolchain/scope/roles to the repo with you, `up`, and the
+two secrets only a human can set. Claude Code agents are steered to the richer
+[Socratic skill](#or-set-it-up-conversationally-the-claude-skill) instead.
+
 ## Dark factory in 6 commands
 
 ```bash
