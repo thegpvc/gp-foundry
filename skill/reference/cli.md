@@ -57,6 +57,11 @@ Copy the packaged runtime-core actions into `.github/actions/` (the self-contain
 `runtime.mode: vendored` layout the generated workflows reference by local path). Scaffolds
 `.github/agent-setup/action.yml` if absent, never overwriting it. Commit `.github/actions/`.
 
+### `gp-foundry skill [--user] [--dir <path>]`
+Install this skill into `.claude/skills/gp-foundry/` (project) or `~/.claude/skills/`
+(`--user`), so Claude Code can run the Socratic setup: `/gp-foundry` or "set up an agent
+pipeline for this repo".
+
 ### `gp-foundry up`
 One command from `init` to a runnable factory: create the repo labels
 (`build`/`plan`/`needs-human`/`needs-rebase`), vendor the runtime actions (in vendored mode),

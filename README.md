@@ -38,6 +38,26 @@ repo checks) cleanly when there's no GitHub remote yet, and builds the workflows
 (`mode: app`, set `app_id_secret`/`app_key_secret`) or the built-in token (`mode:
 github-token`, zero setup but no cascading) — see `foundry.config.yaml`.)
 
+### Or: set it up conversationally (the Claude skill)
+
+The package ships a **Claude skill** — a Socratic front door that interviews you about your
+repo and builds the harness for you, instead of you editing the spec files by hand:
+
+```bash
+gp-foundry skill          # install into this repo (.claude/skills/gp-foundry/)
+gp-foundry skill --user   # or once, for every project (~/.claude/skills/)
+```
+
+Then in Claude Code, type **`/gp-foundry`** — or just ask *"set up an agent pipeline for
+this repo"*. The skill runs a five-question interview (what does this repo produce? who
+approves? what must agents never touch? what roles and handoffs? what cadence and
+identity?), drafts `harness.dot` + roles + policy from your answers, shows you the graph,
+and then drives the same `gp-foundry` CLI — it never hand-writes workflow YAML. It also
+handles **evolving** an existing harness ("add a docs lane", "tighten the merge gate").
+
+The CLI quickstart above and the skill produce the same thing; the skill is for people who'd
+rather answer questions than read `reference/node-types.md`.
+
 ## The crew
 
 The default `init` scaffolds the **software pack** — an autonomous engineering team that

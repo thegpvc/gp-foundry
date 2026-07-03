@@ -157,7 +157,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
         `echo "attempts so far: $COUNT / $MAX"`,
         `if [ "$COUNT" -ge "$MAX" ]; then`,
         `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}'`,
-        `  gh pr comment "$PR" --body "$(printf '## 🧑‍🔧 Fixer\\n\\nAttempt budget exhausted (%s/%s) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
+        `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
         `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
         `else`,
         `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$((COUNT+1))" "$MAX")" >/dev/null`,

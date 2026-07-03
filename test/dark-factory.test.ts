@@ -231,3 +231,53 @@ describe("verification-pass regressions", () => {
     expect(cfg.size).toBeUndefined();
   });
 });
+
+describe("skill install", () => {
+  it("copies SKILL.md to the skill root with reference/ + templates/ beside it", async () => {
+    const { installSkillInto } = await import("../src/cli/ops.js");
+    const { mkdtempSync, existsSync: ex, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const d = mkdtempSync(j(tmpdir(), "gpf-skill-"));
+    try {
+      installSkillInto(d);
+      expect(ex(j(d, "SKILL.md"))).toBe(true);
+      expect(ex(j(d, "reference/cli.md"))).toBe(true);
+      expect(ex(j(d, "templates/harness.dot"))).toBe(true);
+      const fm = readFileSync(j(d, "SKILL.md"), "utf8");
+      expect(fm.startsWith("---\nname: gp-foundry")).toBe(true);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skill dry-run regressions", () => {
+  it("human-gate concurrency is PR-scoped (verdict edges ride pull_request_review)", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+      publish [type=human-gate, environment=production]
+      start -> reviewer [on="pull_request.opened"]
+      reviewer -> publish [when="verdict=approve"]
+    }`;
+    const ir = mkHarness(DOT);
+    const w = wire(ir).perNode.publish;
+    expect(w.concurrency?.group).toContain("github.event.pull_request.number");
+  });
+
+  it("attempt-budget escalation names the node, not a hardcoded Fixer persona", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+      editor [type=pr-fix, role="agents/roles/editor.md", max_attempts=2]
+      start -> reviewer [on="pull_request.opened"]
+      reviewer -> editor [when="verdict=request_changes"]
+    }`;
+    const ir = mkHarness(DOT);
+    const { files } = compile(ir);
+    const wf = files.find((f) => f.path.endsWith("editor.yml"))!.contents;
+    expect(wf).toContain("Attempt budget (editor)");
+    expect(wf).not.toContain("🧑‍🔧 Fixer");
+  });
+});

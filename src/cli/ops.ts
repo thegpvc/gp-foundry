@@ -98,6 +98,16 @@ export function vendorInto(root: string): string[] {
   return written;
 }
 
+/** Install the packaged Claude skill into a skills dir (SKILL.md at the root). */
+export function installSkillInto(dest: string): void {
+  // SKILL.md must sit at the skill root; reference/ + templates/ ride along so
+  // its relative links (reference/cli.md, templates/harness.dot) keep working.
+  mkdirSync(dest, { recursive: true });
+  cpSync(pkgFile("skill/SKILL.md"), join(dest, "SKILL.md"));
+  cpSync(pkgFile("skill/reference"), join(dest, "reference"), { recursive: true });
+  cpSync(pkgFile("skill/templates"), join(dest, "templates"), { recursive: true });
+}
+
 // ── doctor ────────────────────────────────────────────────────────────────────
 
 export function runDoctor(opts: { dot?: string; config?: string }): { checks: Check[]; failed: boolean } {
@@ -287,6 +297,28 @@ export function registerOpsCommands(program: Command): void {
       if (opts.json) return emitJson({ written });
       for (const w of written) process.stdout.write(pc.green(`vendored ${w}\n`));
       process.stdout.write(pc.dim("commit .github/actions/ — the generated workflows reference these local paths\n"));
+    });
+
+  program
+    .command("skill")
+    .description("Install the Claude skill (Socratic setup) into .claude/skills/gp-foundry/")
+    .option("--user", "install for all projects (~/.claude/skills/) instead of this repo")
+    .option("--dir <path>", "target repo root (project mode)", ".")
+    .option("--json", "machine-readable output")
+    .action((opts) => {
+      const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
+      const dest = opts.user
+        ? join(home, ".claude/skills/gp-foundry")
+        : join(opts.dir, ".claude/skills/gp-foundry");
+      installSkillInto(dest);
+      if (opts.json) return emitJson({ installed: dest });
+      process.stdout.write(pc.green(`installed skill → ${dest}\n`));
+      process.stdout.write(
+        pc.dim(
+          "In Claude Code, type /gp-foundry (or just ask: \"set up an agent pipeline for this repo\").\n" +
+          "The skill interviews you Socratically, drafts harness.dot + roles, and drives this CLI.\n",
+        ),
+      );
     });
 
   program

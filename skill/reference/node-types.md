@@ -16,6 +16,7 @@ the **role** is the behavioral identity (a `roles/<name>.md` file, open set, run
 | `pr-review` | analyst specialized on a PR diff; posts a **verdict** | `contents: read` + PR write | pr-diff | no |
 | `producer` | issue → branch → tested PR (the code-writer; "code-agent" is a fine synonym) | `contents: write` + PR write | issue | **yes** |
 | `pr-fix` | reads review feedback, pushes fixes to the PR branch; bounded by `max_attempts` | `contents: write` + PR write | pr-review | **yes** |
+| `scheduled-agent` | a maintenance agent on `schedule=` cron + manual dispatch, NO triggering issue/PR — it gathers its own work via `gh` (janitor rebase sweep, supervisor re-drive, retro learning) and its commits push to the base branch | `contents: write` + issues/PR write + `actions: write` | none | **yes** |
 | `merge-gate` | evaluates merge policy (approval delay, CI green, size, protected paths, clean rebase) → merge / skip / label | `contents: write` + PR write | none | no (merges) |
 | `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off) | per environment | none | no |
 | `parallel` | fans a unit out into legs | none (orchestration) | — | no |
@@ -35,7 +36,7 @@ Rules of thumb:
 | attr | on types | meaning |
 |------|----------|---------|
 | `type=` | all | the node type (required) |
-| `role="roles/x.md"` | agent types | job-description file (referenced, never inlined) |
+| `role="agents/roles/x.md"` | agent types | job-description file (referenced, never inlined) |
 | `context=` | agent types | `issue` \| `pr-diff` \| `pr-review` \| `codebase` \| `none` |
 | `output=` | `analyst` | `comment` \| `doc:<path-glob>` (docs-only write allowlist) |
 | `gates="ci.yml,..."` | `pr-review` | named check workflows the review depends on |

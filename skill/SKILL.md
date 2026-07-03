@@ -22,7 +22,7 @@ Your job is to **interview the user Socratically**, draft the spec files from th
 answers, and then **shell out to the `gp-foundry` CLI** to compile, validate, render,
 and evolve. You never write `.github/workflows/*.yml` yourself — those are a build
 artifact carrying a `# GENERATED FROM harness.dot — DO NOT EDIT` header. You edit the
-**spec** (`harness.dot`, `roles/*.md`, `policy/*.yaml`, `scope.yaml`,
+**spec** (`harness.dot`, `agents/roles/*.md`, `agents/policy/*.yaml`, `agents/scope.yaml`,
 `foundry.config.yaml`) and let the CLI compile it.
 
 **Golden rules**
@@ -48,7 +48,7 @@ A harness is a graph of **nodes** and **edges**.
 
 - A **node** is `type` × `role`. The `type` is the *mechanical* GitHub interaction
   (a small closed set); the `role` is the *behavioral identity* — a job description in
-  `roles/<name>.md` that carries the domain. Builder and a scheduled refactor role can be
+  `agents/roles/<name>.md` that carries the domain. Builder and a scheduled refactor role can be
   different roles on the same `producer` type; the Planner (`analyst`) and Reviewer
   (`pr-review`) are the same idea seen from the other side — different types.
 - An **edge** `a -> b [on="<event>", when="<guard>"]` is a transition: node `b`'s workflow
@@ -100,12 +100,14 @@ Listen for:
 
 This produces the node list and the edge list simultaneously. For each role, capture:
 - its `type` (map the described behavior to a node type — see `reference/node-types.md`);
-- its `role` file path (`roles/<name>.md`);
+- its `role` file path (`agents/roles/<name>.md`, relative to the harness.dot dir);
 - **its handoffs** — "hands off to X *when* Y". Each handoff becomes an out-edge, and the
   `when=`/`on=` guard is Y expressed as a GitHub-observable condition.
 
 **Critical:** a role's declared `handoffs` in its front-matter MUST equal that node's
-out-edges in `harness.dot`. The validator cross-checks both directions. Draft them together.
+out-edges in `harness.dot`, and each `handoffs.to` is the target **node id** exactly as
+written in the DOT (e.g. `to: merge_gate`, not a prettified role name). The validator
+cross-checks both directions. Draft them together.
 
 Probe for the **loops**: "If review fails, what happens? How many tries before a human is
 pulled in?" A retry loop (fixer → reviewer → fixer) needs a bounded escape
@@ -169,10 +171,10 @@ Then fill in the four spec surfaces you drafted from the interview:
   attrs (`context`, `gates`, `max_attempts`, `schedule`, `policy`, `environment`,
   `output`). Edges carry `on=` and/or `when=`. See `templates/harness.dot` and
   `reference/node-types.md`.
-- **`roles/<name>.md`** — one per agent node. Front-matter (`role`, `type`, `mission`,
+- **`agents/roles/<name>.md`** — one per agent node. Front-matter (`role`, `type`, `mission`,
   `accountable_for`, `inputs`, `outputs`, `handoffs`, `tools`, `quality_bar`) + prose
   guidance. **`handoffs` must match the node's out-edges.** See `templates/role.md`.
-- **`policy/merge.yaml`** + **`scope.yaml`** — the approval policy and the immutable/
+- **`agents/policy/merge.yaml`** + **`agents/scope.yaml`** — the approval policy and the immutable/
   forbidden paths from Q2.
 - **`foundry.config.yaml`** — everything from Q5. `schema/config.schema.json` documents
   its shape (`auth`, `identity`, `agent`, `repo`, `labels`, `size`, `runtime`); keep the
@@ -220,8 +222,8 @@ Keep the two file classes straight so you never clobber a user's work:
   and `.github/HARNESS.md` is rewritten every `build`. If a user hand-edited one, `build`
   overwrites it — that is the point, and `build --check` in CI catches the drift. Steer users
   away from editing generated YAML; the fix always lives in the spec.
-- **Consumer-owned files are never overwritten by `build`.** `harness.dot`, `roles/*.md`,
-  `policy/*.yaml`, `scope.yaml`, `foundry.config.yaml`, and `.github/agent-setup/action.yml`
+- **Consumer-owned files are never overwritten by `build`.** `harness.dot`, `agents/roles/*.md`,
+  `agents/policy/*.yaml`, `agents/scope.yaml`, `agents/foundry.config.yaml`, and `.github/agent-setup/action.yml`
   are the user's to edit. `init` and `vendor` only *scaffold* the ones that are missing:
   `init` skips any file that already exists unless `--force`; `vendor` writes the
   `agent-setup` shim only when it is absent. There is no automatic three-way merge — the
@@ -245,7 +247,7 @@ lane", or "pull the fixer's escape hatch to 2 attempts" all follow the same PR-s
 3. **Add or edit the spec.** For a new role/node, add the node + its edges to `harness.dot`
    and create `agents/roles/<name>.md` (adapt from `reference/role-packs.md` and
    `templates/role.md`), making the role's `handoffs` front-matter match the node's out-edges.
-   For a policy tweak, edit `policy/*.yaml` / `foundry.config.yaml` directly.
+   For a policy tweak, edit `agents/policy/*.yaml` / `agents/foundry.config.yaml` directly.
 4. **Validate → dry-run → build.** `gp-foundry validate`, then `gp-foundry build --dry-run`,
    explain the diff, then `gp-foundry build`.
 5. **Open a PR** with `gh`, summarizing the graph change in prose *and* the rendered diagram

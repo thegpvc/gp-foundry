@@ -117,7 +117,11 @@ function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress
   if (node.attrs.schedule !== undefined) {
     return { group: node.id, "cancel-in-progress": false };
   }
-  const num = targetIsPr(node)
+  // human-gate approvals ride PR events (verdict edges → pull_request_review), whose
+  // payload has pull_request.number, not issue.number — an issue-scoped key would
+  // render empty and collapse every gate into one concurrency slot.
+  const prScoped = targetIsPr(node) || node.type === "human-gate";
+  const num = prScoped
     ? "${{ github.event.pull_request.number }}"
     : "${{ github.event.issue.number }}";
   return { group: `${node.id}-${num}`, "cancel-in-progress": node.type === "issue-agent" };

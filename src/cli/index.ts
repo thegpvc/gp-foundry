@@ -179,6 +179,11 @@ program
   .option("--json", "machine-readable output")
   .action((opts) => {
     const { dot, config, base } = resolvePaths(opts);
+    if (!existsSync(dot)) {
+      if (opts.json) emitJson({ ok: false, error: `no harness.dot at ${dot}` });
+      else process.stderr.write(pc.red(`no harness.dot at ${dot} — run \`gp-foundry init\` first\n`));
+      process.exit(1);
+    }
     const { harness, parseErrors } = loadHarness(dot, config);
     const fileExists = (rel: string) => existsSync(join(base, rel));
     const roles = loadRoles(harness, base);
@@ -199,6 +204,12 @@ program
   .option("--json", "output the parsed nodes/edges as JSON")
   .action((opts) => {
     const { dot } = resolvePaths(opts);
+    if (!existsSync(dot)) {
+      // A clean, machine-readable "no harness" signal — orientation probes rely on it.
+      if (opts.json) emitJson({ error: `no harness.dot at ${dot}` });
+      else process.stderr.write(pc.red(`no harness.dot at ${dot} — run \`gp-foundry init\` first\n`));
+      process.exit(1);
+    }
     const { harness } = loadHarness(dot);
     if (opts.json) emitJson({ name: harness.name, nodes: harness.nodes, edges: harness.edges });
     else process.stdout.write(renderDiagram(harness) + "\n");
@@ -212,6 +223,11 @@ program
   .option("--json", "machine-readable output")
   .action((node: string, opts) => {
     const { dot, config } = resolvePaths(opts);
+    if (!existsSync(dot)) {
+      if (opts.json) emitJson({ error: `no harness.dot at ${dot}` });
+      else process.stderr.write(pc.red(`no harness.dot at ${dot} — run \`gp-foundry init\` first\n`));
+      process.exit(1);
+    }
     const { harness } = loadHarness(dot, config);
     const { files } = compile(harness);
     const f = files.find((x) => x.path.endsWith(`/${node}.yml`));

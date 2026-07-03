@@ -10,7 +10,7 @@ accountable_for:                # the definition-of-done, as checkable bullets
   - <e.g. tests pass>
   - <e.g. stays in scope (scope.yaml)>
 handoffs:                       # MUST equal this node's out-edges in harness.dot (validated both ways)
-  - to: <TargetRole>            #   e.g. Reviewer
+  - to: <target-node-id>        #   the node id from harness.dot, e.g. merge_gate
     when: <guard>               #   e.g. PR opened  (mirrors the edge's on=/when=)
 tools: "<allowed-tools list, e.g. Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)>"
 quality_bar: <the non-negotiable, e.g. never report success with failing tests>
