@@ -1,5 +1,8 @@
 # gp-foundry — agent bootstrap
 
+<!-- Contributing to gp-foundry itself? This file is the CONSUMER bootstrap (setting up a
+     pipeline in another repo). For hacking on gp-foundry, see README.md → Development. -->
+
 > **You are a coding agent.** A human pointed you here to set up an autonomous delivery
 > pipeline ("dark factory") in the repository you're working in: issues in → triaged,
 > planned, implemented, reviewed, auto-merged PRs out — self-healing and self-improving.

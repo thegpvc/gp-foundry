@@ -282,11 +282,11 @@ describe("skill dry-run regressions", () => {
   });
 });
 
-describe("AGENT.md bootstrap (zero-install front door)", () => {
-  const agentMd = readFileSync(fileURLToPath(new URL("../AGENT.md", import.meta.url)), "utf8");
+describe("AGENTS.md bootstrap (zero-install front door)", () => {
+  const agentMd = readFileSync(fileURLToPath(new URL("../AGENTS.md", import.meta.url)), "utf8");
   it("is shipped in the npm package", async () => {
     const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
-    expect(pkg.files).toContain("AGENT.md");
+    expect(pkg.files).toContain("AGENTS.md");
   });
   it("uses npx (no global install) and names the real commands + secrets", () => {
     expect(agentMd).toContain("npx -y @thegpvc/gp-foundry@latest init");

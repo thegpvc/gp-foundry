@@ -17,10 +17,10 @@ that ships a library can ship docs, marketing copy, or config.
 The fastest path — don't install anything yourself. Paste this into your coding agent
 (Claude Code, Cursor, or any agent with shell access), inside the target repo:
 
-> Fetch https://unpkg.com/@thegpvc/gp-foundry/AGENT.md and follow it to set up an
+> Fetch https://unpkg.com/@thegpvc/gp-foundry/AGENTS.md and follow it to set up an
 > autonomous delivery pipeline in this repository.
 
-[`AGENT.md`](./AGENT.md) walks the agent through the whole bring-up via `npx` (no global
+[`AGENTS.md`](./AGENTS.md) walks the agent through the whole bring-up via `npx` (no global
 install): scaffold, adapt the toolchain/scope/roles to the repo with you, `up`, and the
 two secrets only a human can set. Claude Code agents are steered to the richer
 [Socratic skill](#or-set-it-up-conversationally-the-claude-skill) instead.
