@@ -297,3 +297,15 @@ describe("AGENTS.md bootstrap (zero-install front door)", () => {
     expect(agentMd).not.toMatch(/<[A-Za-z][^<>]{0,40}>/); // no placeholders
   });
 });
+
+describe("honesty guards", () => {
+  it("warns when parallel/fan_in (unimplemented) are used", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      fan [type=parallel]
+      start -> fan [on="issues.opened"]
+    }`;
+    const ir = mkHarness(DOT);
+    expect(validate(ir).some((d) => d.code === "node.type-not-implemented")).toBe(true);
+  });
+});

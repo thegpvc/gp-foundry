@@ -52,6 +52,15 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         where: { node: n.id, line: n.line },
       });
     }
+    if (n.type === "parallel" || n.type === "fan_in") {
+      diags.push({
+        level: "warning",
+        code: "node.type-not-implemented",
+        message: `node '${n.id}' uses type '${n.type}', which is NOT implemented yet — no workflow will be generated for it`,
+        where: { node: n.id, line: n.line },
+        hint: "model the fan-out as separate label-guarded lanes for now, or wait for parallel/fan_in support",
+      });
+    }
     if (n.type === "merge-gate" && !n.files.policy) {
       diags.push({
         level: "warning",

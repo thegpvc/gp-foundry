@@ -12,6 +12,27 @@ truly stuck) and **self-improving** (mines its own merged PRs and reviews for re
 lessons and feeds them back to every agent). Nothing here is code-specific — the same shape
 that ships a library can ship docs, marketing copy, or config.
 
+## Why this exists (and what it deliberately isn't)
+
+Most agent-pipeline systems ship an **orchestrator**: a long-running engine that walks the
+graph, holds state, and executes agents (StrongDM's Attractor is the best-articulated
+version — gp-foundry borrows its DOT-graph representation directly). That model buys rich
+control flow and millisecond hops, at the price of a new stateful service you must deploy,
+secure, and trust. gp-foundry makes the opposite bet: **compile the graph away and let
+GitHub be the executor.** There is no server — state lives in labels, PRs, reviews, and
+cron; every transition is an artifact your team already knows how to read *and override*;
+and the compiler can verify the topology (bounded loops, livelock detection) before
+anything runs.
+
+The honest cost: everything must round-trip through GitHub-observable events. Hops take
+minutes, not milliseconds; gates poll on cron; rich dataflow between agents is reduced to
+labels and comment markers; and GitHub's event model has sharp edges the runtime works
+around rather than owns. gp-foundry targets the **issue → PR → review → merge granularity**
+— where hops are naturally slow and auditability matters more than latency — and covers
+that case with roughly 1% of the infrastructure. If you need tight multi-agent
+choreography, dynamic subgraphs, or streaming state between nodes, run an orchestrator;
+this isn't one.
+
 ## Zero-install: point your coding agent at this
 
 The fastest path — don't install anything yourself. Paste this into your coding agent
@@ -164,6 +185,22 @@ unbounded loops at build time. Full vocabulary in
   and writes evidence-cited notes to `.github/agents/memory/topics/`.
 - `scope.yaml` guidance makes every agent **read that memory before working**, so a lesson
   learned once shapes every subsequent run.
+
+## Costs, security, limits
+
+- **Cost** — every agent hop is a model call inside an Actions run: a busy factory spends
+  real tokens and CI minutes. Start with the scheduled lanes at modest cadence, watch
+  `gp-foundry status`, and cap intake (labels are your throttle). There are no built-in
+  per-day budget caps yet.
+- **Security** — agents write with `AGENT_PAT`; scope it to the one repo. On public repos,
+  issue text is untrusted input to the agents: keep `scope.yaml` immutable paths tight
+  (`.github/` at minimum), keep the merge gate's protected paths on, and treat the
+  human-gate as mandatory for anything irreversible. The reviewer is also an LLM — the
+  gate's policy (CI green, size caps, protected paths) is the non-negotiable backstop.
+- **Limits** — `parallel` / `fan_in` node types are **not implemented** (declared for the
+  roadmap; they compile to no workflow today). Merges are serialized one per gate sweep.
+  Cross-workflow races (e.g. janitor and fixer pushing together) resolve by retry, not
+  transactions — the supervisor sweep is the safety net.
 
 ## Day-2 operations
 

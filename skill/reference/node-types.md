@@ -19,8 +19,8 @@ the **role** is the behavioral identity (a `roles/<name>.md` file, open set, run
 | `scheduled-agent` | a maintenance agent on `schedule=` cron + manual dispatch, NO triggering issue/PR — it gathers its own work via `gh` (janitor rebase sweep, supervisor re-drive, retro learning) and its commits push to the base branch | `contents: write` + issues/PR write + `actions: write` | none | **yes** |
 | `merge-gate` | evaluates merge policy (approval delay, CI green, size, protected paths, clean rebase) → merge / skip / label | `contents: write` + PR write | none | no (merges) |
 | `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off) | per environment | none | no |
-| `parallel` | fans a unit out into legs | none (orchestration) | — | no |
-| `fan_in` | joins parallel legs (collects via artifacts / state re-query, never job outputs) | read | none | no |
+| `parallel` | **NOT IMPLEMENTED YET** — parses/validates but emits no workflow. fans a unit out into legs | none (orchestration) | — | no |
+| `fan_in` | **NOT IMPLEMENTED YET** — parses/validates but emits no workflow. joins parallel legs | read | none | no |
 
 Rules of thumb:
 - **Read-and-advise vs create-a-change is the deepest split, and it IS the permission
