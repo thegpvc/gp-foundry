@@ -309,3 +309,19 @@ describe("honesty guards", () => {
     expect(validate(ir).some((d) => d.code === "node.type-not-implemented")).toBe(true);
   });
 });
+
+describe("gate ordering (vendored local actions need checkout first)", () => {
+  it("pr-review with gates= checks out before wait-for-checks", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      builder [type=producer, role="agents/roles/builder.md"]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", gates="ci.yml"]
+      start -> builder [on="issues.opened"]
+      builder -> reviewer [on="pull_request.opened"]
+    }`;
+    const ir = mkHarness(DOT, { runtime: { mode: "vendored" } } as Partial<FoundryConfig>);
+    const { files } = compile(ir);
+    const wf = files.find((f) => f.path.endsWith("reviewer.yml"))!.contents;
+    expect(wf.indexOf("actions/checkout")).toBeLessThan(wf.indexOf("wait-for-checks"));
+  });
+});

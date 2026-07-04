@@ -58,6 +58,10 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   const app = appTokenStep(ctx);
   if (app) steps.push(app);
 
+  // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
+  // action (./.github/actions/…) that cannot resolve before checkout.
+  steps.push(checkoutStep(ctx, isPr ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
+
   // pr-review waits for named CI gates before reviewing
   const gates = typeof node.attrs.gates === "string" ? node.attrs.gates : undefined;
   if (isPr && gates) {
@@ -70,7 +74,6 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
     }
   }
 
-  steps.push(checkoutStep(ctx, isPr ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
   steps.push(setupStep());
   const ctxType = context === "pr-diff" ? "pr-diff" : context === "pr-review" ? "pr-review" : "issue";
   steps.push(contextStep(ctx, ctxType, isPr ? PR_NUMBER : ISSUE_NUMBER));
