@@ -230,7 +230,11 @@ program
     }
     const { harness } = loadHarness(dot, config);
     const { files } = compile(harness);
-    const f = files.find((x) => x.path.endsWith(`/${node}.yml`));
+    // Diamond legs ride inside their fan_in's workflow — fall back to the file
+    // whose jobs: block contains this node id.
+    const f =
+      files.find((x) => x.path.endsWith(`/${node}.yml`)) ??
+      files.find((x) => x.path.startsWith(".github/workflows/") && new RegExp(`^  ${node}:`, "m").test(x.contents));
     if (!f) {
       if (opts.json) emitJson({ error: `no generated workflow for node '${node}'` });
       else process.stderr.write(pc.red(`no generated workflow for node '${node}'\n`));

@@ -7,6 +7,7 @@
 import type { Diagnostic, Harness, HarnessNode, RoleSpec } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
+import { detectDiamonds } from "../wiring/diamond.js";
 
 export interface ValidateDeps {
   /** returns true if a consumer-repo-relative path exists. Omit to skip file checks. */
@@ -50,15 +51,6 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         code: "node.human-gate-no-environment",
         message: `human-gate '${n.id}' must set environment=<name> (maps to a protected GitHub Environment)`,
         where: { node: n.id, line: n.line },
-      });
-    }
-    if (n.type === "parallel" || n.type === "fan_in") {
-      diags.push({
-        level: "warning",
-        code: "node.type-not-implemented",
-        message: `node '${n.id}' uses type '${n.type}', which is NOT implemented yet — no workflow will be generated for it`,
-        where: { node: n.id, line: n.line },
-        hint: "model the fan-out as separate label-guarded lanes for now, or wait for parallel/fan_in support",
       });
     }
     if (n.type === "merge-gate" && !n.files.policy) {
@@ -186,11 +178,69 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   }
 
+  // parallel/fan_in: v1 supports CLEAN DIAMONDS ONLY — one entry edge into the
+  // parallel, ≥2 bare edges to agent legs, every leg exactly one-in-one-out into a
+  // single fan_in. A well-formed diamond compiles to one workflow (legs + a
+  // `needs:`-joined fan_in job); anything else is an error, not a silent no-op.
+  {
+    const { byFanin, memberIds } = detectDiamonds(ir);
+    for (const n of ir.nodes) {
+      if (n.type === "parallel" && !memberIds.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "diamond.malformed",
+          message: `parallel '${n.id}' is not part of a clean diamond (need: exactly one in-edge carrying on=, ≥2 bare out-edges to agent legs that each flow into one fan_in)`,
+          where: { node: n.id, line: n.line },
+          hint: "see reference/node-types.md — v1 supports clean parallel→legs→fan_in diamonds only",
+        });
+      }
+      if (n.type === "fan_in") {
+        const d = byFanin.get(n.id);
+        if (!d) {
+          diags.push({
+            level: "error",
+            code: "diamond.malformed",
+            message: `fan_in '${n.id}' is not the join of a clean diamond (need ≥2 legs, each with exactly one in-edge from a shared parallel and one out-edge into this fan_in)`,
+            where: { node: n.id, line: n.line },
+            hint: "see reference/node-types.md — v1 supports clean parallel→legs→fan_in diamonds only",
+          });
+        } else {
+          if (!n.files.role && n.attrs.on_complete_label === undefined) {
+            diags.push({
+              level: "error",
+              code: "diamond.unobservable-join",
+              message: `fan_in '${n.id}' has neither a role nor on_complete_label — its completion would be unobservable`,
+              where: { node: n.id, line: n.line },
+              hint: 'give it a role="..." (synthesize the lanes) and/or on_complete_label=<label> to cascade the next stage',
+            });
+          }
+          // The verdict-bypass trap: a pr-review-typed LANE that posts a
+          // '**Verdict:**' review would trigger the merge gate / verdict guards
+          // directly, bypassing the join entirely.
+          const prLegs = d.legIds.filter((id) => byId.get(id)?.type === "pr-review");
+          if (prLegs.length) {
+            diags.push({
+              level: "warning",
+              code: "diamond.lane-verdict-risk",
+              message: `fan_in '${n.id}' lanes [${prLegs.join(", ")}] are pr-review typed — if a lane role posts a '**Verdict:**' review, the merge gate acts on ONE lane's opinion and the join is bypassed`,
+              where: { node: n.id },
+              hint: "lane roles must post ANALYSES (plain comments); only the fan_in role posts the verdict",
+            });
+          }
+        }
+      }
+    }
+  }
+
   // Auth: github-token cannot trigger downstream workflows, so event-cascade
   // edges (a PR/push produced by one agent that should fire the next) won't run.
   if (resolveAuth(ir.config).mode === "github-token") {
-    const cascades = ir.edges.filter((e) =>
-      /^(pull_request\.opened|pull_request\.synchronize|push)/.test(e.on ?? ""),
+    const cascades = ir.edges.filter(
+      (e) =>
+        /^(pull_request\.opened|pull_request\.synchronize|push)/.test(e.on ?? "") ||
+        // label= / verdict= guards synthesize issues.labeled / pull_request_review
+        // triggers — those events are ALSO suppressed for GITHUB_TOKEN-made writes.
+        /^(label=|verdict=)/.test(e.when ?? ""),
     );
     if (cascades.length) {
       diags.push({

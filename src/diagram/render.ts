@@ -10,6 +10,11 @@ function shape(n: HarnessNode): [string, string] {
       return ["{{", "}}"];
     case "merge-gate":
       return ["[/", "/]"];
+    case "parallel":
+    case "fan_in":
+      // fork/join bars: virtual nodes — the diamond compiles into the fan_in's
+      // single workflow, so neither gets a standalone file.
+      return ["[[", "]]"];
     default:
       return ["[", "]"];
   }

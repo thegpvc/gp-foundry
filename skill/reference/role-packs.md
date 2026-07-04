@@ -27,6 +27,24 @@ with `Fixer → needs_human [when="attempts>=3"]`, plus scheduled `Janitor` (reb
 `Supervisor` (self-healing re-drive), and `Retro` (learning). This is the shape in the
 default `templates/harness.dot`.
 
+## Review panel (parallel lanes on any pack)
+
+Fan a PR review out to independent lanes and join them into ONE verdict:
+
+```dot
+builder -> split [on="pull_request.opened, pull_request.synchronize"]
+split   [type=parallel]
+split -> lane_correct   // [type=analyst, context="pr-diff"] posts an ANALYSIS comment
+split -> lane_security  //   (never a '**Verdict:**' — the validator warns if lanes could)
+lane_correct -> panel
+lane_security -> panel
+panel   [type=fan_in, role="agents/roles/panel.md"]  // synthesizes lanes → THE verdict review
+panel -> merge_gate [when="verdict=approve"]
+```
+
+The diamond compiles to one workflow: lanes run as parallel jobs, the panel job
+`needs:` them (native join — a failed lane is a visibly red run, not a silent stall).
+
 ## Content / marketing pack (proves domain-generality)
 
 Same node types, same compiler, same runtime core — only roles, gates, and validation

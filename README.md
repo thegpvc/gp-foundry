@@ -197,8 +197,10 @@ unbounded loops at build time. Full vocabulary in
   (`.github/` at minimum), keep the merge gate's protected paths on, and treat the
   human-gate as mandatory for anything irreversible. The reviewer is also an LLM — the
   gate's policy (CI green, size caps, protected paths) is the non-negotiable backstop.
-- **Limits** — `parallel` / `fan_in` node types are **not implemented** (declared for the
-  roadmap; they compile to no workflow today). Merges are serialized one per gate sweep.
+- **Limits** — `parallel`/`fan_in` support **clean diamonds only** (one fan-out event, ≥2
+  agent lanes, one join): the diamond compiles to a single workflow whose fan_in job
+  `needs:` the lane jobs. Staggered/non-diamond joins are a v2 concern. Merges are
+  serialized one per gate sweep.
   Cross-workflow races (e.g. janitor and fixer pushing together) resolve by retry, not
   transactions — the supervisor sweep is the safety net.
 

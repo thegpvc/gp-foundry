@@ -279,6 +279,42 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   };
 }
 
+// ── fan_in: the join job of a parallel diamond (native `needs:` on the leg jobs) ──
+export function emitFanIn(ctx: EmitContext, legIds: string[], prScoped: boolean): WorkflowJobFragment {
+  const node = ctx.node;
+  const steps: StepSpec[] = [];
+  const app = appTokenStep(ctx);
+  if (app) steps.push(app);
+  steps.push(checkoutStep(ctx, prScoped ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
+  steps.push(setupStep());
+  // The thread context contains every lane's posted analysis — that's the join input.
+  steps.push(contextStep(ctx, prScoped ? "pr-review" : "issue", prScoped ? PR_NUMBER : ISSUE_NUMBER));
+  if (node.files.role) steps.push(runAgentStep(ctx, { withContext: true }));
+  // Optional completion label (resolved through config.labels) — cascades the next
+  // stage via the existing label guards.
+  const rawLabel = node.attrs.on_complete_label;
+  if (typeof rawLabel === "string" && rawLabel) {
+    const label = ctx.config.labels?.[rawLabel] ?? rawLabel;
+    steps.push(
+      runStep({
+        name: "Apply completion label",
+        env: { GH_TOKEN: tokenExpr(ctx), NUM: prScoped ? PR_NUMBER : ISSUE_NUMBER },
+        run: `gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$NUM/labels" -f 'labels[]=${label}'`,
+      }),
+    );
+  }
+  return {
+    jobId: node.id,
+    name: node.id,
+    needs: legIds,
+    permissions: prScoped
+      ? { contents: "read", "pull-requests": "write", issues: "write" }
+      : { contents: "read", issues: "write" },
+    timeoutMinutes: timeoutOf(node, 15),
+    steps,
+  };
+}
+
 export type EmitFn = (ctx: EmitContext) => WorkflowJobFragment | null;
 
 export const HANDLERS: Partial<Record<NodeType, EmitFn>> = {

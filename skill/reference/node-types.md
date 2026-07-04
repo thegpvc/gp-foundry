@@ -19,8 +19,8 @@ the **role** is the behavioral identity (a `roles/<name>.md` file, open set, run
 | `scheduled-agent` | a maintenance agent on `schedule=` cron + manual dispatch, NO triggering issue/PR — it gathers its own work via `gh` (janitor rebase sweep, supervisor re-drive, retro learning) and its commits push to the base branch | `contents: write` + issues/PR write + `actions: write` | none | **yes** |
 | `merge-gate` | evaluates merge policy (approval delay, CI green, size, protected paths, clean rebase) → merge / skip / label | `contents: write` + PR write | none | no (merges) |
 | `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off) | per environment | none | no |
-| `parallel` | **NOT IMPLEMENTED YET** — parses/validates but emits no workflow. fans a unit out into legs | none (orchestration) | — | no |
-| `fan_in` | **NOT IMPLEMENTED YET** — parses/validates but emits no workflow. joins parallel legs | read | none | no |
+| `parallel` | fork bar of a **clean diamond**: exactly one in-edge (carrying the trigger), ≥2 bare out-edges to agent legs. Virtual — the whole diamond compiles into the fan_in's single workflow | none (virtual) | — | no |
+| `fan_in` | join of the diamond: compiles to ONE workflow with each leg as a job plus this node `needs:`-joined after them (native Actions join — no polling, no markers). Role synthesizes the lanes' comments (e.g. THE verdict); optional `on_complete_label=` cascades a label. Lane roles must post ANALYSES, never `**Verdict:**` (validator warns) | `contents: read` + PR/issues write | pr-review / issue | no |
 
 Rules of thumb:
 - **Read-and-advise vs create-a-change is the deepest split, and it IS the permission
@@ -37,6 +37,7 @@ Rules of thumb:
 |------|----------|---------|
 | `type=` | all | the node type (required) |
 | `role="agents/roles/x.md"` | agent types | job-description file (referenced, never inlined) |
+| `on_complete_label=` | fan_in | label applied on join completion (resolves via config.labels) |
 | `context=` | agent types | `issue` \| `pr-diff` \| `pr-review` \| `codebase` \| `none` |
 | `output=` | `analyst` | `comment` \| `doc:<path-glob>` (docs-only write allowlist) |
 | `gates="ci.yml,..."` | `pr-review` | named check workflows the review depends on |

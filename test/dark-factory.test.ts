@@ -299,14 +299,14 @@ describe("AGENTS.md bootstrap (zero-install front door)", () => {
 });
 
 describe("honesty guards", () => {
-  it("warns when parallel/fan_in (unimplemented) are used", () => {
+  it("errors when parallel is used outside a clean diamond", () => {
     const DOT = `digraph t {
       start [type=start]
       fan [type=parallel]
       start -> fan [on="issues.opened"]
     }`;
     const ir = mkHarness(DOT);
-    expect(validate(ir).some((d) => d.code === "node.type-not-implemented")).toBe(true);
+    expect(validate(ir).some((d) => d.code === "diamond.malformed" && d.level === "error")).toBe(true);
   });
 });
 
@@ -323,5 +323,93 @@ describe("gate ordering (vendored local actions need checkout first)", () => {
     const { files } = compile(ir);
     const wf = files.find((f) => f.path.endsWith("reviewer.yml"))!.contents;
     expect(wf.indexOf("actions/checkout")).toBeLessThan(wf.indexOf("wait-for-checks"));
+  });
+});
+
+describe("parallel/fan_in diamonds (needs-join)", () => {
+  const PANEL = `digraph t {
+    start [type=start]
+    builder [type=producer, role="agents/roles/builder.md"]
+    split [type=parallel]
+    lane_correctness [type=analyst, role="agents/roles/lane-correctness.md", context="pr-diff"]
+    lane_security [type=analyst, role="agents/roles/lane-security.md", context="pr-diff"]
+    panel [type=fan_in, role="agents/roles/panel.md"]
+    start -> builder [on="issues.opened"]
+    builder -> split [on="pull_request.opened, pull_request.synchronize"]
+    split -> lane_correctness
+    split -> lane_security
+    lane_correctness -> panel
+    lane_security -> panel
+  }`;
+
+  it("compiles the diamond into ONE workflow: legs + needs-joined fan_in", () => {
+    const ir = mkHarness(PANEL);
+    const { files, diagnostics } = compile(ir);
+    expect(diagnostics.filter((d) => d.level === "error")).toEqual([]);
+    const paths = files.map((f) => f.path);
+    expect(paths).toContain(".github/workflows/panel.yml");
+    // legs and the parallel node get no standalone workflows
+    for (const p of ["split", "lane_correctness", "lane_security"]) {
+      expect(paths).not.toContain(`.github/workflows/${p}.yml`);
+    }
+    const wf = yaml.load(files.find((f) => f.path.endsWith("panel.yml"))!.contents.replace(/^#.*\n#.*\n/, "")) as any;
+    expect(Object.keys(wf.jobs).sort()).toEqual(["lane_correctness", "lane_security", "panel"]);
+    expect(wf.jobs.panel.needs.sort()).toEqual(["lane_correctness", "lane_security"]);
+    // triggered by the diamond's entry edge
+    expect(wf.on.pull_request.types).toContain("opened");
+    expect(wf.on.pull_request.types).toContain("synchronize");
+    // PR-scoped concurrency, node-id prefixed, never cancel mid-join
+    expect(wf.concurrency.group).toContain("panel-");
+    expect(wf.concurrency.group).toContain("github.event.pull_request.number");
+    expect(wf.concurrency["cancel-in-progress"]).toBe(false);
+  });
+
+  it("errors on a malformed diamond (fan_in without a shared parallel)", () => {
+    const BAD = `digraph t {
+      start [type=start]
+      a [type=analyst, role="agents/roles/a.md"]
+      f [type=fan_in, role="agents/roles/f.md"]
+      start -> a [on="issues.opened"]
+      a -> f
+      start -> f [on="issues.opened"]
+    }`;
+    const ir = mkHarness(BAD);
+    expect(validate(ir).some((d) => d.code === "diamond.malformed" && d.level === "error")).toBe(true);
+  });
+
+  it("errors on an unobservable join (no role, no on_complete_label)", () => {
+    const NOOBS = PANEL.replace('panel [type=fan_in, role="agents/roles/panel.md"]', "panel [type=fan_in]");
+    const ir = mkHarness(NOOBS);
+    expect(validate(ir).some((d) => d.code === "diamond.unobservable-join")).toBe(true);
+  });
+
+  it("warns when lanes are pr-review typed (verdict-bypass trap)", () => {
+    const RISKY = PANEL
+      .replace('lane_correctness [type=analyst', 'lane_correctness [type=pr-review')
+      .replace('lane_security [type=analyst', 'lane_security [type=pr-review');
+    const ir = mkHarness(RISKY);
+    expect(validate(ir).some((d) => d.code === "diamond.lane-verdict-risk")).toBe(true);
+  });
+
+  it("on_complete_label resolves through config.labels and emits the label step", () => {
+    const LBL = PANEL.replace('panel [type=fan_in, role="agents/roles/panel.md"]',
+      'panel [type=fan_in, role="agents/roles/panel.md", on_complete_label=reviewed]');
+    const ir = mkHarness(LBL, { labels: { reviewed: "panel-done" } } as Partial<FoundryConfig>);
+    const { files } = compile(ir);
+    const wf = files.find((f) => f.path.endsWith("panel.yml"))!.contents;
+    expect(wf).toContain("panel-done");
+  });
+
+  it("github-token mode + verdict/label cascade edges are flagged", () => {
+    const DOT = `digraph t {
+      start [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+      fixer [type=pr-fix, role="agents/roles/fixer.md"]
+      start -> reviewer [on="issues.labeled"]
+      reviewer -> fixer [when="verdict=request_changes"]
+    }`;
+    const ir = mkHarness(DOT, { auth: { mode: "github-token" } } as Partial<FoundryConfig>);
+    const d = validate(ir).find((x) => x.code === "auth.github-token-no-cascade");
+    expect(d?.level).toBe("error");
   });
 });

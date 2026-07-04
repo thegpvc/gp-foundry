@@ -7,6 +7,7 @@
  * label/state writes by a prior node, exactly as dixie already coordinates.
  */
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
+import { detectDiamonds } from "./diamond.js";
 
 const PR_CONTEXT_TYPES = new Set(["pr-review", "pr-fix"]);
 
@@ -134,8 +135,32 @@ export function wire(ir: Harness): WiringPlan {
   for (const n of ir.nodes) incoming.set(n.id, []);
   for (const e of ir.edges) incoming.get(e.to)?.push(e);
 
+  // parallel→legs→fan_in diamonds compile to ONE workflow (the fan_in's), triggered
+  // by the diamond's entry edge; the members get no standalone wiring.
+  const diamonds = detectDiamonds(ir);
+
   for (const node of ir.nodes) {
     if (node.type === "start" || node.type === "exit") continue;
+    if (diamonds.memberIds.has(node.id)) continue;
+    const diamond = diamonds.byFanin.get(node.id);
+    if (diamond) {
+      const entry = diamond.entryEdge;
+      const firstLeg = byId.get(diamond.legIds[0]!)!;
+      const triggers: Record<string, any> = {};
+      const events = (entry.on ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+      for (const ev of events) mergeEvent(triggers, ev, firstLeg);
+      const nw: NodeWiring = { nodeId: node.id, triggers, dispatches: [] };
+      const g = entry.when ? guardFor(entry.when, firstLeg, ir.config) : undefined;
+      if (g) nw.guard = g;
+      // Unit scope follows the entry event; convention `<node-id>-<num>`, never cancel
+      // a mid-synthesis join.
+      const prScoped = events.some((ev) => effectiveEvent(ev, firstLeg).startsWith("pull_request"));
+      const num = prScoped ? "${{ github.event.pull_request.number }}" : "${{ github.event.issue.number }}";
+      nw.concurrency = { group: `${node.id}-${num}`, "cancel-in-progress": false };
+      perNode[node.id] = nw;
+      continue;
+    }
+    if (node.type === "parallel" || node.type === "fan_in") continue; // malformed: validation flags it
 
     const triggers: Record<string, any> = {};
     const guards = new Set<string>();

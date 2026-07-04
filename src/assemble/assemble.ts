@@ -1,6 +1,9 @@
 /**
  * B6 — Assembler / serializer. fragments + wiring + top-level scaffold → workflow YAML.
  * Every generated file carries the GENERATED header and is drift-checked.
+ *
+ * parallel/fan_in diamonds assemble into ONE workflow: the legs as sibling jobs plus
+ * the fan_in job joined with GitHub's native `needs:` (see src/wiring/diamond.ts).
  */
 import yaml from "js-yaml";
 import type {
@@ -11,9 +14,11 @@ import type {
   HarnessNode,
   StepSpec,
   WiringPlan,
+  WorkflowJobFragment,
 } from "../ir/types.js";
 import { isUsesStep } from "../ir/types.js";
-import { emitNode } from "../handlers/index.js";
+import { emitFanIn, emitNode } from "../handlers/index.js";
+import { detectDiamonds } from "../wiring/diamond.js";
 
 const HEADER =
   "# GENERATED FROM harness.dot — DO NOT EDIT.\n" +
@@ -50,6 +55,7 @@ function displayName(node: HarnessNode): string {
 export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): GeneratedFile[] {
   const files: GeneratedFile[] = [];
   const actionRef = makeActionRef(ir.config);
+  const byId = new Map(ir.nodes.map((n) => [n.id, n] as const));
   const outByNode = new Map<string, typeof ir.edges>();
   const inByNode = new Map<string, typeof ir.edges>();
   for (const n of ir.nodes) {
@@ -61,24 +67,19 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     inByNode.get(e.to)?.push(e);
   }
 
-  for (const node of ir.nodes) {
-    const nw = wiring.perNode[node.id];
-    if (!nw || Object.keys(nw.triggers).length === 0) continue;
+  const mkCtx = (node: HarnessNode): EmitContext => ({
+    config: ir.config,
+    node,
+    outEdges: outByNode.get(node.id) ?? [],
+    inEdges: inByNode.get(node.id) ?? [],
+    actionRef,
+    specDir,
+  });
 
-    const ctx: EmitContext = {
-      config: ir.config,
-      node,
-      outEdges: outByNode.get(node.id) ?? [],
-      inEdges: inByNode.get(node.id) ?? [],
-      actionRef,
-      specDir,
-    };
-    const fragment = emitNode(node, ir, ctx);
-    if (!fragment) continue;
-
+  const fragmentToJob = (fragment: WorkflowJobFragment, guard?: string): Record<string, unknown> => {
     const job: Record<string, unknown> = { "runs-on": "ubuntu-latest" };
-    const guard = fragment.if ?? nw.guard;
-    if (guard) job.if = guard;
+    const g = fragment.if ?? guard;
+    if (g) job.if = g;
     if (fragment.environment) job.environment = fragment.environment;
     if (fragment.permissions && Object.keys(fragment.permissions).length) {
       job.permissions = fragment.permissions;
@@ -87,20 +88,51 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     if (fragment.needs?.length) job.needs = fragment.needs;
     if (fragment.strategy) job.strategy = fragment.strategy;
     job.steps = fragment.steps.map(stepToObject);
+    return job;
+  };
 
-    const workflow: Record<string, unknown> = {
+  const emitFile = (nodeId: string, workflow: Record<string, unknown>): void => {
+    const body = yaml.dump(workflow, { lineWidth: -1, noRefs: true, quotingType: '"' });
+    files.push({ path: `.github/workflows/${nodeId}.yml`, contents: HEADER + body, generated: true });
+  };
+
+  const diamonds = detectDiamonds(ir);
+
+  for (const node of ir.nodes) {
+    if (diamonds.memberIds.has(node.id)) continue; // legs/parallel ride in the fan_in's file
+    const nw = wiring.perNode[node.id];
+    if (!nw || Object.keys(nw.triggers).length === 0) continue;
+
+    const diamond = diamonds.byFanin.get(node.id);
+    if (diamond) {
+      const jobs: Record<string, unknown> = {};
+      for (const legId of diamond.legIds) {
+        const leg = byId.get(legId)!;
+        const legFragment = emitNode(leg, ir, mkCtx(leg));
+        // The entry-edge guard gates the LEGS; the fan_in is gated by `needs:` instead.
+        if (legFragment) jobs[legFragment.jobId] = fragmentToJob(legFragment, nw.guard);
+      }
+      const prScoped = JSON.stringify(nw.triggers).includes('"pull_request"');
+      const fragment = emitFanIn(mkCtx(node), diamond.legIds, prScoped);
+      jobs[fragment.jobId] = fragmentToJob(fragment);
+      emitFile(node.id, {
+        name: displayName(node),
+        on: nw.triggers,
+        ...(nw.concurrency ? { concurrency: nw.concurrency } : {}),
+        permissions: { contents: "read" },
+        jobs,
+      });
+      continue;
+    }
+
+    const fragment = emitNode(node, ir, mkCtx(node));
+    if (!fragment) continue;
+    emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,
       ...(nw.concurrency ? { concurrency: nw.concurrency } : {}),
       permissions: { contents: "read" },
-      jobs: { [fragment.jobId]: job },
-    };
-
-    const body = yaml.dump(workflow, { lineWidth: -1, noRefs: true, quotingType: '"' });
-    files.push({
-      path: `.github/workflows/${node.id}.yml`,
-      contents: HEADER + body,
-      generated: true,
+      jobs: { [fragment.jobId]: fragmentToJob(fragment, nw.guard) },
     });
   }
 
