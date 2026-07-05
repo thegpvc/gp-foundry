@@ -24,6 +24,8 @@ jobs:
     steps:
       # actions/checkout@v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       # actions/setup-node@v4.1.0
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
@@ -53,6 +55,8 @@ jobs:
     steps:
       # actions/checkout@v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       # actionlint: rhysd publishes no root action.yml, so we run it via his
       # official installer fetched at a pinned commit (rhysd/actionlint@v1.7.12,
@@ -83,17 +87,15 @@ jobs:
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
 
       - name: Run zizmor
+        # Audits THIS repo's workflows only. Example harness outputs are excluded:
+        # generated consumer workflows pin the runtime core to a release tag by
+        # design (consumers may pin a SHA via runtime.ref), which zizmor's
+        # unpinned-uses audit would flag; actionlint still covers the examples.
         run: |
-          shopt -s nullglob globstar
-          targets=( .github/workflows )
-          for d in examples/**/.github/workflows; do
-            targets+=( "$d" )
-          done
-          echo "Auditing: ${targets[*]}"
           # --no-online-audits keeps the run hermetic (no token required,
           # deterministic in CI). Default persona: fails on real findings without
           # the noise of low-confidence pedantic ones.
-          uvx --from zizmor==1.26.1 zizmor --no-online-audits "${targets[@]}"
+          uvx --from zizmor==1.26.1 zizmor --no-online-audits .github/workflows
 
   guard:
     name: generated-workflow guards
@@ -103,6 +105,8 @@ jobs:
     steps:
       # actions/checkout@v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       # Invariants for GENERATED harness workflows (system-design §7):
       #   1. never `uses: ./` — generated workflows must reference the pinned

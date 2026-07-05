@@ -36,13 +36,13 @@ const LANE_DOT = `digraph t {
 describe("label mapping (config.labels is live, not dead config)", () => {
   it("resolves semantic keys through config.labels", () => {
     const ir = mkHarness(LANE_DOT, { labels: { build: "agent-go" } } as Partial<FoundryConfig>);
-    const guard = wire(ir).perNode.builder.guard!;
+    const guard = wire(ir).perNode.builder!.guard!;
     expect(guard).toContain("github.event.label.name == 'agent-go'");
   });
 
   it("defaults to identity when unmapped", () => {
     const ir = mkHarness(LANE_DOT);
-    expect(wire(ir).perNode.builder.guard!).toContain("== 'build'");
+    expect(wire(ir).perNode.builder!.guard!).toContain("== 'build'");
   });
 });
 
@@ -59,7 +59,7 @@ describe("guard OR-merge: unguarded events survive a guarded sibling edge", () =
   }`;
   it("reviewer keeps firing on pull_request events despite the label guard", () => {
     const ir = mkHarness(MIXED);
-    const w = wire(ir).perNode.reviewer;
+    const w = wire(ir).perNode.reviewer!;
     // the label guard must be OR'd with a discriminator for the unguarded event
     expect(w.guard).toContain("github.event.label.name == 're-review'");
     expect(w.guard).toContain("github.event_name == 'pull_request'");
@@ -197,7 +197,7 @@ describe("verification-pass regressions", () => {
       fixer -> reviewer [on="push"]
     }`;
     const ir = mkHarness(MIX);
-    const g = wire(ir).perNode.reviewer.guard!;
+    const g = wire(ir).perNode.reviewer!.guard!;
     expect(g).not.toContain("github.event_name == 'push'");
     expect(g).toContain("github.event.action == 'synchronize'");
   });
@@ -262,7 +262,7 @@ describe("skill dry-run regressions", () => {
       reviewer -> publish [when="verdict=approve"]
     }`;
     const ir = mkHarness(DOT);
-    const w = wire(ir).perNode.publish;
+    const w = wire(ir).perNode.publish!;
     expect(w.concurrency?.group).toContain("github.event.pull_request.number");
   });
 
