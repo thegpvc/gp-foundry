@@ -413,3 +413,13 @@ describe("parallel/fan_in diamonds (needs-join)", () => {
     expect(d?.level).toBe("error");
   });
 });
+
+describe("npm packaging", () => {
+  it("files globs use the recursive form for action dists (0.1.0 shipped without them)", () => {
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+    // npm-packlist does NOT recurse a glob'd directory entry ("actions/*/dist"
+    // matches the dir itself, packs nothing) — the /** suffix is load-bearing.
+    expect(pkg.files).toContain("actions/*/dist/**");
+    expect(pkg.files).not.toContain("actions/*/dist");
+  });
+});

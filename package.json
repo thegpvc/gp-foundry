@@ -1,6 +1,6 @@
 {
   "name": "@thegpvc/gp-foundry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Compile a directed-graph spec (harness.dot) into an autonomous GitHub Actions agent harness.",
   "type": "module",
   "license": "MIT",
@@ -34,7 +34,7 @@
   "files": [
     "dist/cli",
     "actions/*/action.yml",
-    "actions/*/dist",
+    "actions/*/dist/**",
     "actions/*/README.md",
     "schema",
     "roles",
