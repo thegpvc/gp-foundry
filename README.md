@@ -102,10 +102,10 @@ takes an issue from triage to merge, plus the lanes that keep the factory health
 | 🕵️ | scout | Triage an incoming issue; label it for a lane (`build` / `plan`). |
 | 📋 | planner | For big/ambiguous issues, post a plan before any code is written (read-only). |
 | 👷 | builder | Turn a labeled issue into a small, tested, shippable PR (the only code-writer). |
-| 👩‍⚖️ | reviewer | Read the diff, run gates, post an approve / request-changes verdict. |
-| 🧑‍🔧 | fixer | Apply review feedback in a bounded retry loop with the reviewer. |
+| ⚖️ | reviewer | Read the diff, run gates, post an approve / request-changes verdict. |
+| 🔧 | fixer | Apply review feedback in a bounded retry loop with the reviewer. |
 | 🧹 | janitor | Scheduled sweep: rebase PRs the gate flagged `needs-rebase` so they can merge. |
-| 🧑‍✈️ | supervisor | Scheduled sweep: re-drive stranded issues/PRs; escalate to `needs-human` after 2 nudges. |
+| 🧭 | supervisor | Scheduled sweep: re-drive stranded issues/PRs; escalate to `needs-human` after 2 nudges. |
 | ♻️ | retro | Scheduled: mine merged PRs/reviews/CI for recurring lessons; write them to team memory. |
 | 🔀 | merge_gate | **Policy gate, not a persona** — enforces merge policy (approval, CI green, size, protected paths); auto-merges or labels `needs-rebase`/`needs-human`. |
 
@@ -172,12 +172,12 @@ unbounded loops at build time. Full vocabulary in
 **Self-healing** — stuck work gets re-driven or escalated, not left silently stranded:
 - 🧹 **janitor** runs on a schedule and rebases every PR the merge gate flagged
   `needs-rebase`, so conflicts don't strand mergeable work.
-- 🧑‍✈️ **supervisor** runs on a schedule, re-drives stranded issues and PRs (no PR for a
+- 🧭 **supervisor** runs on a schedule, re-drives stranded issues and PRs (no PR for a
   `build`-labeled issue, idle PRs), and escalates to `needs-human` after 2 nudges.
 - The **merge gate** posts a 🔀 audit comment explaining each decision and labels
   `needs-rebase` on conflicts rather than merging a broken state.
 - Agent **failures are visibly red** — no green no-ops. A failing job fails the run.
-- The 🧑‍🔧 **fixer** has a real attempt budget: it stamps a marker comment each attempt and,
+- The 🔧 **fixer** has a real attempt budget: it stamps a marker comment each attempt and,
   at `max_attempts`, labels the PR `needs-human` and stops instead of looping forever.
 
 **Self-improving** — the factory learns from its own record:

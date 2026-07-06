@@ -17,15 +17,15 @@ issues.opened
    └────────── label=build ──▶ 👷 builder ◀── label=build
                                    │ opens a PR
                                    ▼
-                              👩‍⚖️ reviewer ──verdict=approve──▶ 🔀 merge_gate
+                              ⚖️ reviewer ──verdict=approve──▶ 🔀 merge_gate
                                    │  ▲                          (policy: CI green,
                           request_changes│ push                  size, protected paths)
                                    ▼  │
-                              🧑‍🔧 fixer ──attempts≥3──▶ 🙋 needs_human
+                              🔧 fixer ──attempts≥3──▶ 🙋 needs_human
 ```
 
 Plus three scheduled lanes that keep it alive without a human babysitting it:
-**🧹 janitor** (rebases PRs that fell behind), **🧑‍✈️ supervisor** (re-drives stranded
+**🧹 janitor** (rebases PRs that fell behind), **🧭 supervisor** (re-drives stranded
 issues/PRs, escalates after 2 nudges), **♻️ retro** (mines merged PRs/reviews for recurring
 lessons → team memory that every agent reads before working).
 

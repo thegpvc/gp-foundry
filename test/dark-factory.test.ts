@@ -278,7 +278,7 @@ describe("skill dry-run regressions", () => {
     const { files } = compile(ir);
     const wf = files.find((f) => f.path.endsWith("editor.yml"))!.contents;
     expect(wf).toContain("Attempt budget (editor)");
-    expect(wf).not.toContain("🧑‍🔧 Fixer");
+    expect(wf).not.toContain("🔧 Fixer");
   });
 });
 
