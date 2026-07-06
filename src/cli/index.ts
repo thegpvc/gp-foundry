@@ -17,7 +17,9 @@ import { emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
 import { registerOpsCommands } from "./ops.js";
 
 const program = new Command();
-program.name("gp-foundry").description("Compile a DOT harness spec into GitHub Actions.").version("0.1.0");
+// Version comes from the packaged manifest — a hardcoded string shipped 0.1.1 reporting 0.1.0.
+const pkgVersion = (JSON.parse(readFileSync(pkgFile("package.json"), "utf8")) as { version: string }).version;
+program.name("gp-foundry").description("Compile a DOT harness spec into GitHub Actions.").version(pkgVersion);
 
 function loadRoles(ir: ReturnType<typeof loadHarness>["harness"], base: string): Map<string, RoleSpec> {
   const roles = new Map<string, RoleSpec>();
