@@ -1,0 +1,21 @@
+# scope.yaml — the invariants from interview Q2. Canonical, CI-enforced.
+# immutable_paths: agents can NEVER modify these; a CI check fails the PR and
+#   agent-fallback strips any such edits before pushing. This is the hard safety boundary.
+# forbidden_paths / forbidden_operations: prompt-enforced (softer); an improve/gardener lane
+#   may adjust these, but never immutable_paths.
+
+immutable_paths:                 # enforced by CI check, never modifiable by agents
+  - .github/workflows/           # the generated harness itself — agents must not self-edit YAML
+  # - <add paths that must never change, e.g. infra, secrets config>
+
+forbidden_paths:                 # prompt-enforced, adjustable by a maintenance lane
+  # - <e.g. terraform/>
+
+forbidden_operations:
+  # - <e.g. infrastructure changes>
+
+guidance:                        # soft guidance injected into every agent's prompt
+  - prefer small, focused changes
+  - when in doubt, open a draft PR and explain what's left
+  # closes the Retro's learning loop: lessons it distills are read before working
+  - "before implementing, check .github/agents/memory/topics/ for relevant prior lessons"

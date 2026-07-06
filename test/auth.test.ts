@@ -6,7 +6,7 @@ import { parseDot } from "../src/parser/parse.js";
 import { compile } from "../src/index.js";
 import type { AuthConfig, FoundryConfig, Harness } from "../src/ir/types.js";
 
-const dot = readFileSync(fileURLToPath(new URL("../examples/dixie/harness.dot", import.meta.url)), "utf8");
+const dot = readFileSync(fileURLToPath(new URL("./fixtures/dixie/harness.dot", import.meta.url)), "utf8");
 
 function harnessWith(auth: AuthConfig | undefined, identity: FoundryConfig["identity"] = {}): Harness {
   const g = parseDot(dot);

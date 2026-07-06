@@ -5,8 +5,8 @@ import { loadHarness } from "../src/config/load.js";
 import { compile, hasErrors } from "../src/index.js";
 import type { GeneratedFile } from "../src/ir/types.js";
 
-const dot = fileURLToPath(new URL("../examples/dixie/harness.dot", import.meta.url));
-const config = fileURLToPath(new URL("../examples/dixie/foundry.config.yaml", import.meta.url));
+const dot = fileURLToPath(new URL("./fixtures/dixie/harness.dot", import.meta.url));
+const config = fileURLToPath(new URL("./fixtures/dixie/foundry.config.yaml", import.meta.url));
 
 const { harness } = loadHarness(dot, config);
 const { files, diagnostics } = compile(harness);

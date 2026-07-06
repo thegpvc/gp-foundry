@@ -1,0 +1,49 @@
+# foundry.config.yaml — consumer-repo global config, read at BUILD time by `gp-foundry`.
+# Every value ships with a working default: a fresh `gp-foundry init && gp-foundry up`
+# builds a runnable factory with NO edits here. Tune when you outgrow the defaults.
+
+name: starter
+
+auth: # how the harness authenticates to GitHub for writes
+  # Pick ONE mode:
+  #   pat          — a fine-grained PAT in a repo secret: events cascade, one secret,
+  #                  no App to install. Easiest; the default. Scope the PAT to this
+  #                  repo with Contents + Pull requests + Issues + Actions read/write.
+  #   app          — GitHub App token: clean bot identity, cascades. Best for orgs.
+  #                  (set app_id_secret / app_key_secret instead of token_secret)
+  #   github-token — the built-in GITHUB_TOKEN: zero setup BUT its commits/PRs never
+  #                  trigger other workflows, so any chained pipeline stalls. `validate`
+  #                  errors on this mode when the graph has chained stages.
+  mode: pat
+  token_secret: AGENT_PAT # gh secret set AGENT_PAT --body <fine-grained-pat>
+
+identity: # git author for the agent's commits/PRs
+  bot_login: agent-bot
+  git_name: Agent Bot
+  git_email: agent-bot@users.noreply.github.com
+
+agent: # the coding-agent CLI + default model
+  cli: claude
+  model: claude-opus-4-8
+  oauth_token_secret: CLAUDE_CODE_OAUTH_TOKEN # gh secret set CLAUDE_CODE_OAUTH_TOKEN --body <token>
+  # allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)"  # roles may widen/narrow
+
+repo:
+  base_branch: main
+  branch_prefix: agent/ # branches look like agent/<issue>-slug (matches policy branch_prefix)
+
+labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resolve
+  # through this map, so renaming a repo label is a one-line change HERE —
+  # but the role prose tells agents to apply the semantic name, so if you
+  # remap, update the role instructions to apply the mapped label too.
+  build: build
+  plan: plan
+
+# NOTE: merge sizing/policy (max additions, protected paths, approval rules) lives in
+# agents/policy/merge.yaml — the merge-gate reads THAT file at runtime, not this one.
+
+runtime: # how generated workflows reference the runtime-core actions
+  # vendored — `gp-foundry vendor` copies the actions into .github/actions/ (default;
+  #            self-contained, no external dependency, upgrade by re-running vendor).
+  # pinned   — reference <owner_repo>/actions/<name>@<ref> centrally (set a SHA/tag).
+  mode: pinned

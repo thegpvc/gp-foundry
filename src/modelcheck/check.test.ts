@@ -20,7 +20,7 @@ function harness(dot: string): Harness {
 }
 
 const dixie = harness(
-  readFileSync(fileURLToPath(new URL("../../examples/dixie/harness.dot", import.meta.url)), "utf8"),
+  readFileSync(fileURLToPath(new URL("../../test/fixtures/dixie/harness.dot", import.meta.url)), "utf8"),
 );
 
 describe("modelCheck", () => {

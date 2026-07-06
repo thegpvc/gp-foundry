@@ -1,0 +1,15 @@
+name: agent-setup
+description: >-
+  Consumer-owned toolchain setup, run before every agent job. gp-foundry scaffolds
+  this shim; EDIT IT to add your project's toolchain (setup-python, setup-go, pnpm,
+  system deps, …) so agents can build and test your code.
+runs:
+  using: composite
+  steps:
+    # Installs node + the coding-agent CLI (from the vendored runtime core).
+    - uses: ./.github/actions/setup-agent
+      with:
+        node-version: "22"
+    # Add your project toolchain below, e.g.:
+    # - uses: actions/setup-python@v5
+    #   with: { python-version: "3.12" }

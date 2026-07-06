@@ -1,17 +1,17 @@
 # GENERATED FROM harness.dot — DO NOT EDIT.
 # Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
-name: shipper
+name: merge_gate
 "on":
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
 concurrency:
-  group: shipper
+  group: merge_gate
   cancel-in-progress: false
 permissions:
   contents: read
 jobs:
-  shipper:
+  merge_gate:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -19,29 +19,23 @@ jobs:
       issues: write
     timeout-minutes: 10
     steps:
-      - name: Mint app token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.DIXIE_AGENT_APP_ID }}
-          private-key: ${{ secrets.DIXIE_AGENT_APP_PRIVATE_KEY }}
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ secrets.AGENT_PAT }}
           fetch-depth: 0
       - name: Configure git identity
         shell: bash
         env:
-          GIT_NAME: dixie-agent[bot]
-          GIT_EMAIL: dixie-agent@users.noreply.github.com
+          GIT_NAME: Agent Bot
+          GIT_EMAIL: agent-bot@users.noreply.github.com
         run: |-
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
       - name: Evaluate merge gate
         uses: thegpvc/gp-foundry/actions/merge-gate@v1
         with:
-          token: ${{ steps.app-token.outputs.token }}
-          policy-path: policy/merge.yaml
+          token: ${{ secrets.AGENT_PAT }}
+          policy-path: .github/agents/policy/merge.yaml
           base-branch: main
           branch-prefix: agent/

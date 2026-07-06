@@ -1,0 +1,62 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: supervisor
+"on":
+  schedule:
+    - cron: 17 * * * *
+  workflow_dispatch: {}
+concurrency:
+  group: supervisor
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  supervisor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.AGENT_PAT }}
+          fetch-depth: 0
+      - name: Configure git identity
+        shell: bash
+        env:
+          GIT_NAME: Agent Bot
+          GIT_EMAIL: agent-bot@users.noreply.github.com
+        run: |-
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
+      - name: Setup agent toolchain
+        uses: ./.github/agent-setup
+      - name: Run agent
+        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        with:
+          role-file: .github/agents/roles/supervisor.md
+          model: claude-opus-4-8
+          comms-file: .github/agents/communication.md
+          scope-path: .github/agents/scope.yaml
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github-token: ${{ secrets.AGENT_PAT }}
+      - name: Commit changes
+        shell: bash
+        env:
+          BRANCH: main
+        run: |-
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore(supervisor): scheduled update"
+          fi
+          git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)" ]; then
+            git push origin "HEAD:$BRANCH"
+            echo "pushed changes to $BRANCH"
+          else
+            echo "no changes to commit"
+          fi

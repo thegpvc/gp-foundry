@@ -73,7 +73,9 @@ conclusions, schedules) — because GitHub is the executor, not a custom engine.
 - **human-gate has an environment;** analyst nodes are `contents: read`; `output=doc:<glob>`
   means the only committed paths match `<glob>`.
 
-## Reference example (dixie's harness, generalized)
+## Reference example (the `starter` harness)
+
+The complete, generated version lives in [`examples/starter/`](../../examples/starter/).
 
 ```dot
 digraph harness {

@@ -1,0 +1,54 @@
+// harness.dot — the single source of truth for this repo's agent harness topology.
+// `type` = mechanical GitHub interaction (chosen at build time); `role` = job description
+// (a roles/*.md file, loaded at runtime). Edges are transitions: `on=` GitHub event,
+// `when=` GitHub-observable guard. Compile with `gp-foundry build`. NEVER hand-edit the
+// generated .github/workflows/*.yml — edit this graph and rebuild.
+//
+// This default graph is a complete "dark factory": issues in → reviewed, auto-merged PRs
+// out, with self-healing (janitor + supervisor) and self-improving (retro) lanes. Every
+// cycle MUST keep a bounded escape edge to an `exit` node.
+
+digraph harness {
+  // ── nodes ─────────────────────────────────────────────────────────────────
+  start       [type=start]
+
+  // intake: triage an incoming issue and route it to a lane
+  scout       [type=issue-agent, role="agents/roles/scout.md",   context=issue]
+
+  // optional design lane for big/ambiguous issues (read-only, posts a plan)
+  planner     [type=analyst,     role="agents/roles/planner.md", context=issue, output=comment]
+
+  // the producer: turns a labeled issue into a tested PR (the only code-writer here)
+  builder     [type=producer,    role="agents/roles/builder.md", context=issue]
+
+  // review: reads the diff, posts an approve / request-changes verdict
+  // (add gates="ci.yml" once the repo has a CI workflow the reviewer should wait for)
+  reviewer    [type=pr-review,   role="agents/roles/reviewer.md", context="pr-diff"]
+
+  // bounded fix loop with the reviewer
+  fixer       [type=pr-fix,      role="agents/roles/fixer.md",   max_attempts=3]
+
+  // approval: automated merge policy (swap for a human-gate if approval must be human)
+  merge_gate  [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+
+  // self-healing: rebase conflicted PRs; re-drive stranded issues/PRs
+  janitor     [type=scheduled-agent, role="agents/roles/janitor.md",    schedule="*/30 * * * *"]
+  supervisor  [type=scheduled-agent, role="agents/roles/supervisor.md", schedule="17 * * * *"]
+
+  // self-improving: mine the record for recurring lessons → team memory
+  retro       [type=scheduled-agent, role="agents/roles/retro.md", schedule="0 7 * * 1-5"]
+
+  // bounded escape hatch — the terminal a stuck unit lands in
+  needs_human [type=exit]
+
+  // ── edges ─────────────────────────────────────────────────────────────────
+  start    -> scout       [on="issues.opened"]
+  scout    -> planner     [when="label=plan"]      // label names resolve via foundry.config.yaml
+  scout    -> builder     [when="label=build"]
+  planner  -> builder     [when="label=build"]
+  builder  -> reviewer    [on="pull_request.opened"]
+  reviewer -> merge_gate  [when="verdict=approve"]
+  reviewer -> fixer       [when="verdict=request_changes"]
+  fixer    -> reviewer    [on="push"]              // retry loop…
+  fixer    -> needs_human [when="attempts>=3"]     // …with a bounded escape (enforced at runtime)
+}

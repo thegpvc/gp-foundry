@@ -242,7 +242,7 @@ spec change and the regenerated workflows together so `build --check` stays gree
 | `roles/`    | generic role packs (`software/`, `content/`, `docs/`) — the job descriptions |
 | `skill/`    | the packaged Claude skill: `SKILL.md`, `reference/`, and the scaffolding `templates/` |
 | `schema/`   | JSON Schema for `foundry.config.yaml` |
-| `examples/` | example harness specs (`examples/dixie/`, `examples/marketing/`) |
+| `examples/` | a complete reference harness — [`examples/starter/`](./examples/starter/), exactly what `init` scaffolds |
 | `docs/`     | design docs (`docs/plans/`) |
 
 ## Docs

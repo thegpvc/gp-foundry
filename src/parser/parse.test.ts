@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { parseDot } from "./parse.js";
 
 const dixie = readFileSync(
-  fileURLToPath(new URL("../../examples/dixie/harness.dot", import.meta.url)),
+  fileURLToPath(new URL("../../test/fixtures/dixie/harness.dot", import.meta.url)),
   "utf8",
 );
 
