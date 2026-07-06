@@ -2,36 +2,36 @@
 
 **Stand up a "dark factory" for your repo: issues in → reviewed, auto-merged PRs out.**
 
-`gp-foundry` turns an autonomous agent pipeline into something you **declare once as a
-directed graph and compile** into a repo. You describe the crew and the flow in a single
-`harness.dot`; a deterministic compiler emits plain GitHub Actions workflows; **GitHub stays
-the executor** (native events, per-job least-privilege, Environment approvals, secrets,
-scheduling). The result runs with minimal effort and keeps itself alive: it is
-**self-healing** (rebases conflicts, re-drives stranded work, escalates to a human only when
-truly stuck) and **self-improving** (mines its own merged PRs and reviews for recurring
-lessons and feeds them back to every agent). Nothing here is code-specific — the same shape
-that ships a library can ship docs, marketing copy, or config.
+`gp-foundry` lets you **declare an autonomous agent pipeline as a directed graph and compile
+it** into a repo. You describe the crew and the flow in one `harness.dot`; a deterministic
+compiler emits plain GitHub Actions workflows. There's no orchestrator to run — **GitHub is
+the executor** (native events, per-job least-privilege, Environment approvals, secrets, cron).
+
+The pipeline keeps itself moving: it's **self-healing** (rebases conflicts, re-drives
+stranded work, escalates to a human only when truly stuck) and **self-improving** (mines its
+own merged PRs and reviews for recurring lessons, then feeds them back to every agent). And
+it isn't code-specific — the same shape that ships a library can ship docs or marketing copy.
 
 ## Why this exists (and what it deliberately isn't)
 
-Most agent-pipeline systems ship an **orchestrator**: a long-running engine that walks the
-graph, holds state, and executes agents (StrongDM's Attractor is the best-articulated
-version — gp-foundry borrows its DOT-graph representation directly). That model buys rich
-control flow and millisecond hops, at the price of a new stateful service you must deploy,
-secure, and trust. gp-foundry makes the opposite bet: **compile the graph away and let
-GitHub be the executor.** There is no server — state lives in labels, PRs, reviews, and
-cron; every transition is an artifact your team already knows how to read *and override*;
-and the compiler can verify the topology (bounded loops, livelock detection) before
-anything runs.
+Most agent-pipeline systems ship an **orchestrator** — a long-running engine that walks the
+graph, holds state, and runs the agents. (StrongDM's Attractor is one well-articulated
+example; gp-foundry borrows its DOT-graph representation.) That buys rich control flow and
+fast hops, but it's a stateful service you have to deploy, secure, and trust.
 
-The honest cost: everything must round-trip through GitHub-observable events. Hops take
-minutes, not milliseconds; gates poll on cron; rich dataflow between agents is reduced to
-labels and comment markers; and GitHub's event model has sharp edges the runtime works
-around rather than owns. gp-foundry targets the **issue → PR → review → merge granularity**
-— where hops are naturally slow and auditability matters more than latency — and covers
-that case with roughly 1% of the infrastructure. If you need tight multi-agent
-choreography, dynamic subgraphs, or streaming state between nodes, run an orchestrator;
-this isn't one.
+gp-foundry takes the opposite bet: **compile the graph away and let GitHub run it.** No
+server — state lives in labels, PRs, reviews, and cron. Every transition is an artifact your
+team already knows how to read *and override*, and the compiler checks the topology (bounded
+loops, livelock detection) before anything runs.
+
+The cost is real: everything round-trips through GitHub-observable events. Hops take minutes,
+not milliseconds; gates poll on cron; data between agents narrows to labels and comment
+markers; and GitHub's event model has sharp edges the runtime works around rather than owns.
+
+So gp-foundry aims at one altitude — **issue → PR → review → merge** — where hops are slow
+anyway and auditability matters more than latency, and it covers that without running any
+infrastructure of its own. Need tight multi-agent choreography, dynamic subgraphs, or
+streaming state between nodes? Run an orchestrator — this isn't one.
 
 ## Zero-install: point your coding agent at this
 
@@ -41,9 +41,9 @@ The fastest path — don't install anything yourself. Paste this into your codin
 > Fetch https://unpkg.com/@thegpvc/gp-foundry/AGENTS.md and follow it to set up an
 > autonomous delivery pipeline in this repository.
 
-[`AGENTS.md`](./AGENTS.md) walks the agent through the whole bring-up via `npx` (no global
-install): scaffold, adapt the toolchain/scope/roles to the repo with you, `up`, and the
-two secrets only a human can set. Claude Code agents are steered to the richer
+[`AGENTS.md`](./AGENTS.md) walks the agent through the bring-up via `npx` — no global
+install: scaffold, adapt the toolchain/scope/roles with you, run `up`, then hand off the two
+secrets only a human can set. Claude Code agents get steered to the richer
 [Socratic skill](#or-set-it-up-conversationally-the-claude-skill) instead.
 
 ## Dark factory in 6 commands
@@ -169,7 +169,7 @@ unbounded loops at build time. Full vocabulary in
 
 ## Self-healing & self-improving
 
-**Self-healing** — the factory does not silently stall:
+**Self-healing** — stuck work gets re-driven or escalated, not left silently stranded:
 - 🧹 **janitor** runs on a schedule and rebases every PR the merge gate flagged
   `needs-rebase`, so conflicts don't strand mergeable work.
 - 🧑‍✈️ **supervisor** runs on a schedule, re-drives stranded issues and PRs (no PR for a
@@ -198,11 +198,9 @@ unbounded loops at build time. Full vocabulary in
   human-gate as mandatory for anything irreversible. The reviewer is also an LLM — the
   gate's policy (CI green, size caps, protected paths) is the non-negotiable backstop.
 - **Limits** — `parallel`/`fan_in` support **clean diamonds only** (one fan-out event, ≥2
-  agent lanes, one join): the diamond compiles to a single workflow whose fan_in job
-  `needs:` the lane jobs. Staggered/non-diamond joins are a v2 concern. Merges are
-  serialized one per gate sweep.
-  Cross-workflow races (e.g. janitor and fixer pushing together) resolve by retry, not
-  transactions — the supervisor sweep is the safety net.
+  agent lanes, one join); staggered/non-diamond joins are a v2 concern. Merges are serialized
+  one per gate sweep. Cross-workflow races (e.g. janitor and fixer pushing at once) resolve by
+  retry, not transactions — the supervisor sweep is the safety net.
 
 ## Day-2 operations
 
