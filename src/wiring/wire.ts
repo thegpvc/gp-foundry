@@ -109,9 +109,72 @@ function guardFor(when: string, _target: HarnessNode, cfg: FoundryConfig): strin
   }
   // A bot cannot APPROVE/REQUEST_CHANGES its own PR, so the Critic submits a
   // COMMENTED review with the verdict in the body; guard on the body marker.
-  if (when === "verdict=approve") return "contains(github.event.review.body, '**Verdict:** APPROVE')";
-  if (when === "verdict=request_changes") return "contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES')";
+  // The marker alone is not a gate — any user can submit a review containing it —
+  // so the reviewing ACTOR is checked alongside it whenever a bot login is known.
+  const verdict =
+    when === "verdict=approve"
+      ? "APPROVE"
+      : when === "verdict=request_changes"
+        ? "REQUEST_CHANGES"
+        : undefined;
+  if (verdict) {
+    const marker = `contains(github.event.review.body, '**Verdict:** ${verdict}')`;
+    const actor = reviewActorClause(cfg);
+    return actor ? `${marker} && ${actor}` : marker;
+  }
   return undefined;
+}
+
+/**
+ * `github.event.review.user.login == '<bot>'` — the actor half of a verdict
+ * guard. Omitted when the config names no bot: there is nothing to compare
+ * against, and validate() warns about the resulting hole.
+ */
+export function reviewActorClause(cfg: FoundryConfig): string | undefined {
+  const bot = cfg.identity?.bot_login;
+  return bot ? `github.event.review.user.login == '${bot}'` : undefined;
+}
+
+/** Events whose payload carries `pull_request` (so a head-ref guard can read it). */
+function carriesPrPayload(event: string): boolean {
+  return /^(pull_request|pull_request_review|pull_request_target)\b/.test(event);
+}
+
+/**
+ * `startsWith(github.event.pull_request.head.ref, '<prefix>')` — the guard that
+ * keeps agent lanes off human branches. Without it a `pull_request` trigger
+ * fires the reviewer on EVERY PR in the repo, and a request-changes verdict
+ * sends the fixer to push commits onto someone's own branch.
+ */
+export function branchPrefixClause(cfg: FoundryConfig): string | undefined {
+  const prefix = cfg.repo?.branch_prefix;
+  return prefix ? `startsWith(github.event.pull_request.head.ref, '${prefix}')` : undefined;
+}
+
+/**
+ * AND the branch-prefix guard onto a workflow that PR events can reach, so an
+ * agent lane never runs against a human's branch.
+ *
+ * The existing guard is an OR of edge conditions, so it has to be parenthesized
+ * before the AND — `a || b && prefix` would only constrain `b`. When the node
+ * also listens to non-PR events (an issue lane that a PR event can re-enter),
+ * the prefix is required only of the PR events: for an issue event the
+ * event-name clause is already true and the OR short-circuits.
+ */
+function applyBranchPrefix(
+  guard: string | undefined,
+  events: Set<string>,
+  cfg: FoundryConfig,
+): string | undefined {
+  const branch = branchPrefixClause(cfg);
+  const prEvents = [...events].filter(carriesPrPayload);
+  if (!branch || prEvents.length === 0) return guard;
+
+  const otherEvents = [...events].filter((e) => !carriesPrPayload(e));
+  const clause = otherEvents.length
+    ? `(${otherEvents.map(eventClause).join(" || ")} || ${branch})`
+    : branch;
+  return guard ? `(${guard}) && ${clause}` : clause;
 }
 
 function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress": boolean } {
@@ -165,6 +228,7 @@ export function wire(ir: Harness): WiringPlan {
     const triggers: Record<string, any> = {};
     const guards = new Set<string>();
     const unguardedEvents = new Set<string>();
+    const allEvents = new Set<string>();
     const dispatches: { toNode: string; when?: string }[] = [];
 
     // scheduled nodes (e.g. merge-gate) are driven by cron + manual dispatch only
@@ -176,6 +240,7 @@ export function wire(ir: Harness): WiringPlan {
         const w = wireEdge(e, node, ir.config);
         if (!w) continue;
         for (const ev of w.events) mergeEvent(triggers, ev, node);
+        for (const ev of w.events) allEvents.add(effectiveEvent(ev, node));
         if (w.guard) guards.add(w.guard);
         else for (const ev of w.events) unguardedEvents.add(effectiveEvent(ev, node));
       }
@@ -193,7 +258,11 @@ export function wire(ir: Harness): WiringPlan {
       }
     }
 
-    const guard = guards.size ? [...guards].join(" || ") : undefined;
+    const guard = applyBranchPrefix(
+      guards.size ? [...guards].join(" || ") : undefined,
+      allEvents,
+      ir.config,
+    );
     const nw: NodeWiring = {
       nodeId: node.id,
       triggers,

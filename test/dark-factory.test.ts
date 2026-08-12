@@ -13,6 +13,7 @@ import { wire } from "../src/wiring/wire.js";
 import { validate } from "../src/validate/validate.js";
 import { compile } from "../src/index.js";
 import { latestValidApproval } from "../actions/merge-gate/src/gate.js";
+import { evalGuard } from "../src/sim/gh-expr.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
 const tpl = (rel: string) => fileURLToPath(new URL(`../skill/templates/${rel}`, import.meta.url));
@@ -421,5 +422,148 @@ describe("npm packaging", () => {
     // matches the dir itself, packs nothing) — the /** suffix is load-bearing.
     expect(pkg.files).toContain("actions/*/dist/**");
     expect(pkg.files).not.toContain("actions/*/dist");
+  });
+});
+
+// ── trigger scoping: agent lanes must not run on human PRs ────────────────
+
+describe("branch-prefix guard (item 5)", () => {
+  const REVIEW_DOT = `digraph t {
+    start [type=start]
+    reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+    fixer [type=pr-fix, role="agents/roles/fixer.md"]
+    start -> reviewer [on="pull_request.opened, pull_request.synchronize"]
+    reviewer -> fixer [when="verdict=request_changes"]
+  }`;
+
+  it("guards a PR-triggered reviewer on the configured branch prefix", () => {
+    const ir = mkHarness(REVIEW_DOT);
+    const guard = wire(ir).perNode.reviewer!.guard!;
+    expect(guard).toBe("startsWith(github.event.pull_request.head.ref, 'agent/')");
+  });
+
+  it("parenthesizes the existing OR before ANDing the prefix", () => {
+    const ir = mkHarness(REVIEW_DOT, { identity: { bot_login: "bot" } } as Partial<FoundryConfig>);
+    const guard = wire(ir).perNode.fixer!.guard!;
+    // `a || b && prefix` would only constrain b — the OR must be grouped.
+    expect(guard).toMatch(/^\(.*\) && startsWith\(github\.event\.pull_request\.head\.ref, 'agent\/'\)$/);
+  });
+
+  it("requires the prefix only of PR events on a mixed-trigger node", () => {
+    const ir = mkHarness(`digraph t {
+      start [type=start]
+      scout [type=issue-agent, role="agents/roles/scout.md"]
+      start -> scout [on="issues.opened, pull_request.opened"]
+    }`);
+    const guard = wire(ir).perNode.scout!.guard!;
+    expect(guard).toContain("github.event_name == 'issues'");
+    expect(guard).toContain("startsWith(github.event.pull_request.head.ref, 'agent/')");
+    // An issue event still fires: its own clause satisfies the OR.
+    expect(evalGuard(guard, { github: { event_name: "issues", event: { action: "opened" } } })).toBe(true);
+    // A PR on a human branch does not.
+    expect(
+      evalGuard(guard, {
+        github: { event_name: "pull_request", event: { action: "opened", pull_request: { head: { ref: "dpup/hotfix" } } } },
+      }),
+    ).toBe(false);
+  });
+
+  it("leaves issue-only lanes untouched", () => {
+    const ir = mkHarness(LANE_DOT);
+    expect(wire(ir).perNode.builder!.guard).not.toContain("startsWith");
+  });
+});
+
+describe("verdict guards check the reviewing actor (item 6)", () => {
+  const VERDICT_DOT = `digraph t {
+    reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+    fixer [type=pr-fix, role="agents/roles/fixer.md"]
+    reviewer -> fixer [when="verdict=request_changes"]
+  }`;
+
+  it("ANDs the bot login onto the verdict marker", () => {
+    const ir = mkHarness(VERDICT_DOT, { identity: { bot_login: "agent-bot" } } as Partial<FoundryConfig>);
+    const guard = wire(ir).perNode.fixer!.guard!;
+    expect(guard).toContain("github.event.review.user.login == 'agent-bot'");
+    const payload = (login: string) => ({
+      github: {
+        event_name: "pull_request_review",
+        event: {
+          action: "submitted",
+          review: { body: "**Verdict:** REQUEST_CHANGES", user: { login } },
+          pull_request: { head: { ref: "agent/1-x" } },
+        },
+      },
+    });
+    expect(evalGuard(guard, payload("agent-bot"))).toBe(true);
+    // The escalation from the report: a stranger's review carrying the marker.
+    expect(evalGuard(guard, payload("stranger"))).toBe(false);
+  });
+
+  it("omits the clause when no bot_login is configured (validate warns instead)", () => {
+    const ir = mkHarness(VERDICT_DOT);
+    expect(wire(ir).perNode.fixer!.guard).not.toContain("review.user.login");
+    expect(validate(ir).some((d) => d.code === "auth.no-bot-login")).toBe(true);
+  });
+});
+
+describe("CI gates are consumed, not just awaited (item 7)", () => {
+  const gated = (gates: string) =>
+    compile(
+      mkHarness(`digraph t {
+        start [type=start]
+        reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", gates="${gates}"]
+        start -> reviewer [on="pull_request.opened"]
+      }`),
+    );
+
+  const reviewerJob = (gates: string) => {
+    const file = gated(gates).files.find((f) => f.path.endsWith("reviewer.yml"))!;
+    const doc = yaml.load(file.contents) as any;
+    return doc.jobs.reviewer;
+  };
+
+  it("gives each wait step an id and feeds its conclusion into the review context", () => {
+    const job = reviewerJob("ci.yml, e2e.yml");
+    const waits = job.steps.filter((s: any) => String(s.uses ?? "").includes("wait-for-checks"));
+    expect(waits.map((s: any) => s.id)).toEqual(["gate-ci-yml", "gate-e2e-yml"]);
+
+    const record = job.steps.find((s: any) => s.name === "Record CI gate results in the context");
+    expect(record.env.GATE_1_RESULT).toBe("${{ steps.gate-ci-yml.outputs.conclusion }}");
+    expect(record.env.GATE_2_RESULT).toBe("${{ steps.gate-e2e-yml.outputs.conclusion }}");
+    expect(record.env.CONTEXT_FILE).toBe("${{ steps.ctx.outputs.context-file }}");
+    // It must land BEFORE the agent runs, or the reviewer never sees it.
+    const ids = job.steps.map((s: any) => s.name);
+    expect(ids.indexOf("Record CI gate results in the context")).toBeLessThan(ids.indexOf("Run agent"));
+  });
+
+  it("tells the reviewer that a non-success gate is blocking", () => {
+    const record = reviewerJob("ci.yml").steps.find(
+      (s: any) => s.name === "Record CI gate results in the context",
+    );
+    expect(record.run).toContain("blocking finding");
+    expect(record.run).toContain("unverified");
+  });
+
+  it("sizes the job timeout to the waits it contains", () => {
+    expect(reviewerJob("ci.yml")["timeout-minutes"]).toBe(30);
+    expect(reviewerJob("ci.yml, e2e.yml")["timeout-minutes"]).toBe(45);
+  });
+
+  it("keeps an explicit timeout attr authoritative", () => {
+    const file = compile(
+      mkHarness(`digraph t {
+        start [type=start]
+        reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", gates="ci.yml", timeout=20]
+        start -> reviewer [on="pull_request.opened"]
+      }`),
+    ).files.find((f) => f.path.endsWith("reviewer.yml"))!;
+    expect((yaml.load(file.contents) as any).jobs.reviewer["timeout-minutes"]).toBe(20);
+  });
+
+  it("emits no gate plumbing when the node declares none", () => {
+    const job = reviewerJob("");
+    expect(job.steps.some((s: any) => s.name === "Record CI gate results in the context")).toBe(false);
+    expect(job["timeout-minutes"]).toBe(15);
   });
 });

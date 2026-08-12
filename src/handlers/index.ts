@@ -63,29 +63,64 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   steps.push(checkoutStep(ctx, isPr ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
 
   // pr-review waits for named CI gates before reviewing
-  const gates = typeof node.attrs.gates === "string" ? node.attrs.gates : undefined;
-  if (isPr && gates) {
-    for (const wf of gates.split(",").map((s) => s.trim()).filter(Boolean)) {
-      steps.push({
-        uses: ctx.actionRef("wait-for-checks"),
-        name: `Wait for ${wf}`,
-        with: { sha: PR_HEAD_SHA, "workflow-name": wf, token: tokenExpr(ctx) },
-      });
-    }
-  }
+  const gatesAttr = typeof node.attrs.gates === "string" ? node.attrs.gates : undefined;
+  const gates = isPr && gatesAttr ? gatesAttr.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const gateIds = gates.map((wf, i) => stepId(`gate-${wf}`, i, gates));
+  gates.forEach((wf, i) => {
+    steps.push({
+      uses: ctx.actionRef("wait-for-checks"),
+      id: gateIds[i],
+      name: `Wait for ${wf}`,
+      with: { sha: PR_HEAD_SHA, "workflow-name": wf, token: tokenExpr(ctx) },
+    });
+  });
 
   steps.push(setupStep());
   const ctxType = context === "pr-diff" ? "pr-diff" : context === "pr-review" ? "pr-review" : "issue";
   steps.push(contextStep(ctx, ctxType, isPr ? PR_NUMBER : ISSUE_NUMBER));
+  // Waiting for a gate is not the same as reading it: wait-for-checks never fails
+  // the step, so a red or timed-out gate used to be indistinguishable from a green
+  // one. Put every conclusion in front of the reviewer and say what a non-success
+  // means, so a broken build cannot be reviewed as if CI had passed.
+  if (gates.length) steps.push(gateResultsStep(gates, gateIds));
   steps.push(runAgentStep(ctx, { withContext: true }));
 
   return {
     jobId: node.id,
     name: node.id,
     permissions,
-    timeoutMinutes: timeoutOf(node, 15),
+    // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
+    // ignored them would kill the review mid-wait and stall the PR with no verdict.
+    timeoutMinutes: timeoutOf(node, 15 + 15 * gates.length),
     steps,
   };
+}
+
+/** A workflow name → a valid, unique GitHub step id. */
+function stepId(raw: string, index: number, all: string[]): string {
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  const base = slug(raw) || `gate-${index + 1}`;
+  const collides = all.filter((o, i) => i !== index && slug(`gate-${o}`) === base).length > 0;
+  return collides ? `${base}-${index + 1}` : base;
+}
+
+/** Append each gate's conclusion to the context file the reviewer is handed. */
+function gateResultsStep(gates: string[], gateIds: string[]): StepSpec {
+  const env: Record<string, string> = { CONTEXT_FILE: "${{ steps.ctx.outputs.context-file }}" };
+  const lines = [`{`, `  echo ""`, `  echo "=== CI GATES ==="`];
+  gates.forEach((wf, i) => {
+    env[`GATE_${i + 1}_NAME`] = wf;
+    env[`GATE_${i + 1}_RESULT`] = `\${{ steps.${gateIds[i]}.outputs.conclusion }}`;
+    lines.push(`  echo "$GATE_${i + 1}_NAME: $GATE_${i + 1}_RESULT"`);
+  });
+  lines.push(
+    `  echo ""`,
+    `  echo "A gate whose result is not 'success' is a blocking finding: say which one"`,
+    `  echo "failed and request changes. 'timeout' or 'skipped' means CI never gave an"`,
+    `  echo "answer — treat it as unverified, not as a pass."`,
+    `} >> "$CONTEXT_FILE"`,
+  );
+  return runStep({ name: "Record CI gate results in the context", env, run: lines.join("\n") });
 }
 
 // ── producer: author a committed change → new PR ──

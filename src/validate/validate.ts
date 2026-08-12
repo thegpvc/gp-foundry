@@ -261,6 +261,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   }
 
+  // A verdict edge compiles to `contains(review.body, '**Verdict:** …')`. That
+  // marker is a string any user can put in a review, so the guard also checks the
+  // reviewing actor — which needs a login to compare against.
+  if (!ir.config.identity?.bot_login && ir.edges.some((e) => /^verdict=/.test(e.when ?? ""))) {
+    diags.push({
+      level: "warning",
+      code: "auth.no-bot-login",
+      message:
+        "identity.bot_login is unset, so verdict-triggered workflows (fixer, human-gate) guard only on the verdict marker — any user who can review the PR can fire them",
+      hint: "set identity.bot_login in foundry.config.yaml to the login that posts the reviews",
+    });
+  }
+
   // At least one entry.
   const hasEntry = ir.nodes.some(
     (n) => n.type === "start" || n.attrs.schedule !== undefined || n.type === "merge-gate",

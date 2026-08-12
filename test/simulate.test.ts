@@ -13,12 +13,27 @@ const wiring = wire(harness);
 const scout: MockAgent = () => [
   { event: "issues", action: "labeled", payload: { label: { name: "agent" }, issue: { number: 1 } } },
 ];
+// The head REF matters as much as the SHA now: agent lanes are guarded on the
+// configured branch prefix, so a PR event without one models a human's branch.
 const builder: MockAgent = (_id, _ev, state) => {
   state.prs.add(10);
-  return [{ event: "pull_request", action: "opened", payload: { pull_request: { number: 10, head: { sha: "abc" } } } }];
+  return [
+    {
+      event: "pull_request",
+      action: "opened",
+      payload: { pull_request: { number: 10, head: { sha: "abc", ref: "agent/1-widget" } } },
+    },
+  ];
 };
 const critic: MockAgent = () => [
-  { event: "pull_request_review", action: "submitted", payload: { review: { state: "approved" }, pull_request: { number: 10 } } },
+  {
+    event: "pull_request_review",
+    action: "submitted",
+    payload: {
+      review: { state: "approved", body: "**Verdict:** APPROVE", user: { login: "dixie-agent" } },
+      pull_request: { number: 10, head: { sha: "abc", ref: "agent/1-widget" } },
+    },
+  },
 ];
 
 describe("plumbing simulator (Tier 2)", () => {
