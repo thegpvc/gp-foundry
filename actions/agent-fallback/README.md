@@ -15,11 +15,19 @@ repository layout is hardcoded. Everything is driven by inputs and a scope file.
    YAML file (`scope-path`, default `.github/agents/scope.yaml`) using a
    dependency-free `awk` scan. If the file or the key is missing, it defaults to
    `.github/workflows/`.
-2. **Strip protected path changes.** Reverts any changes to the immutable paths —
-   both committed (via `git checkout <base> -- <file>` / `git rm`, amended into
-   the tip commit) and uncommitted (working tree + index). This prevents pushes
-   from being rejected when the token lacks permission for those paths (e.g. the
-   GitHub `workflows` permission).
+2. **Strip protected path changes.** Restores every immutable path to its exact
+   base-branch content, whichever way the agent got the edit in: committed on the
+   branch, staged, left in the working tree, or an invented (untracked) file.
+   Files present in base are restored with `git checkout <base> -- <file>`; files
+   absent from base are untracked and deleted. Restorations are folded into the
+   tip commit (and if that empties it — the illegal edit *was* the commit — the
+   commit is dropped). This prevents pushes from being rejected when the token
+   lacks permission for those paths (e.g. the GitHub `workflows` permission).
+
+   Note what this deliberately does not do: it repairs the tip, not history. If
+   an *earlier* commit on the branch touched a path the token cannot push, the
+   push is still rejected — the strip is a safety net for the common case, not a
+   history rewriter.
 3. **Commit uncommitted changes.** If the working tree is dirty, stages
    everything and commits with `commit-message` (or a generated default using
    `agent-name`).

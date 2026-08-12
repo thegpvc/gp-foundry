@@ -93,30 +93,59 @@ runs:
       run: |
         # Revert any changes to immutable paths — the restricted App token
         # typically lacks permission to push them (e.g. `workflows`), so the
-        # push would be rejected. Strip from committed and uncommitted changes.
+        # push would be rejected. The rule is one sentence: under an immutable
+        # path, the tree must match the base branch EXACTLY — no matter whether
+        # the agent committed the edit, staged it, or left it in the worktree.
+        #
+        # Restoring from the base (not from HEAD or the index) is what makes the
+        # three cases collapse into one. `git checkout -- <path>` is deliberately
+        # NOT used anywhere here: it rewrites the worktree from the INDEX, so it
+        # reinstates the very staged edit this step exists to drop.
         BASE_REF="origin/${BASE_BRANCH}"
 
         while IFS= read -r P; do
           [ -z "$P" ] && continue
 
-          # 1. Committed changes (agent may have committed via git).
-          CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" -- "$P" 2>/dev/null || true)
-          if [ -n "$CHANGED" ]; then
-            echo "::warning::Agent committed changes to protected path '$P' — stripping"
-            echo "$CHANGED"
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              git checkout "$BASE_REF" -- "$f" 2>/dev/null || git rm -f "$f" 2>/dev/null || true
-            done <<< "$CHANGED"
-          fi
+          # Everything under $P that differs from base: committed on this branch,
+          # staged/unstaged against HEAD, or a brand-new untracked file.
+          CHANGED=$(
+            {
+              git diff --name-only "${BASE_REF}...HEAD" -- "$P" 2>/dev/null || true
+              git diff --name-only HEAD -- "$P" 2>/dev/null || true
+              git ls-files --others --exclude-standard -- "$P" 2>/dev/null || true
+            } | sort -u
+          )
+          [ -z "$CHANGED" ] && continue
 
-          # 2. Uncommitted changes (working tree / staged).
-          git checkout -- "$P" 2>/dev/null || true
-          git reset -- "$P" 2>/dev/null || true
+          echo "::warning::Agent modified protected path '$P' — stripping"
+          echo "$CHANGED"
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if git cat-file -e "${BASE_REF}:${f}" 2>/dev/null; then
+              # Tracked in base: restore that exact content (worktree + index).
+              git checkout "$BASE_REF" -- "$f" 2>/dev/null || true
+            else
+              # The agent invented this file: untrack it (if tracked) and delete it.
+              git rm -q -f --ignore-unmatch --cached -- "$f" >/dev/null 2>&1 || true
+              rm -f -- "$f"
+            fi
+          done <<< "$CHANGED"
         done <<< "$IMMUTABLE_PATHS"
 
-        # Fold any restorations staged above into the tip commit.
-        git diff --staged --quiet || git commit --amend --no-edit
+        # Fold the restorations into the branch's tip commit — but only when there
+        # IS a commit of our own to amend. With nothing ahead of base, `--amend`
+        # would rewrite the base commit itself.
+        if ! git diff --staged --quiet; then
+          if [ "$(git rev-list "${BASE_REF}..HEAD" --count 2>/dev/null || echo 0)" -gt 0 ]; then
+            # Amending fails when the restoration empties the tip commit — i.e. the
+            # illegal edit WAS the whole commit. Drop that commit instead; anything
+            # else the agent left behind is committed by the next step.
+            git commit --amend --no-edit || git reset --soft HEAD~1
+          else
+            git commit -m "chore: strip edits to immutable paths"
+          fi
+        fi
 
     - name: Commit uncommitted changes
       shell: bash
