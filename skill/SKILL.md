@@ -89,8 +89,13 @@ Listen for:
 - **Approvals** → a `merge-gate` node (automated policy: approval delay, CI green, size
   limit, protected paths) and/or a `human-gate` node bound to a GitHub **Environment**
   (brand sign-off, production deploy). If there is any irreversible/brand/deploy step,
-  a `human-gate` is mandatory — it is a first-class node for exactly this reason.
-- **Invariants** → `scope.yaml`'s `immutable_paths` (CI-enforced, agents can never modify —
+  a `human-gate` is mandatory — it is a first-class node for exactly this reason. Give it an
+  out-edge to the merge gate (`human_gate -> merge_gate`): that is what turns the Environment
+  approval into a check the merge requires on that exact commit, instead of a lane running
+  beside the gate. Also confirm `identity.bot_login` — verdict guards and the merge gate use
+  it to tell the reviewer's approval from a stranger's.
+- **Invariants** → `scope.yaml`'s `immutable_paths` (enforced three ways by the generated
+  output: a PR guard workflow, the pre-push strip, and the merge gate; agents can never modify —
   e.g. `.github/workflows/`) and `forbidden_paths`/`forbidden_operations` (prompt-enforced).
   Push hard here; unstated invariants are how autonomous fleets cause damage.
 

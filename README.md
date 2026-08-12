@@ -192,11 +192,15 @@ unbounded loops at build time. Full vocabulary in
   real tokens and CI minutes. Start with the scheduled lanes at modest cadence, watch
   `gp-foundry status`, and cap intake (labels are your throttle). There are no built-in
   per-day budget caps yet.
-- **Security** — agents write with `AGENT_PAT`; scope it to the one repo. On public repos,
-  issue text is untrusted input to the agents: keep `scope.yaml` immutable paths tight
-  (`.github/` at minimum), keep the merge gate's protected paths on, and treat the
-  human-gate as mandatory for anything irreversible. The reviewer is also an LLM — the
-  gate's policy (CI green, size caps, protected paths) is the non-negotiable backstop.
+- **Security** — agents write with `AGENT_PAT`; scope it to the one repo. Issue and comment
+  text is untrusted input: it is fenced and neutralized before it reaches a prompt, but that
+  is a mitigation, not a proof, so keep `scope.yaml` immutable paths tight (`.github/` at
+  minimum) and the merge gate's protected paths on. Approvals count only from the reviewer
+  bot or someone with write access, and bind to the head SHA. Set `identity.bot_login` — the
+  actor checks on verdict-triggered lanes need a login to compare against. For anything
+  irreversible, point a `human-gate` at the merge gate so its Environment approval is a
+  required check rather than a parallel lane. The reviewer is also an LLM — the gate's policy
+  (CI green, size caps, protected paths) is the non-negotiable backstop.
 - **Limits** — `parallel`/`fan_in` support **clean diamonds only** (one fan-out event, ≥2
   agent lanes, one join); staggered/non-diamond joins are a v2 concern. Merges are serialized
   one per gate sweep. Cross-workflow races (e.g. janitor and fixer pushing at once) resolve by
