@@ -172,3 +172,64 @@ describe("immutable-path strip", () => {
     expect(read("src/app.ts")).toBe("export const version = 2;\n");
   });
 });
+
+describe("allowed-paths (a lane whose remit is narrow)", () => {
+  /** Run the strip with an allowlist as well as the immutable paths. */
+  function runStripAllowed(allowed: string, immutable = ".github/workflows/"): void {
+    const script = join(scratch, "strip.sh");
+    writeFileSync(script, `set -e\n${stripScript()}`);
+    execFileSync("bash", [script], {
+      cwd: repo,
+      encoding: "utf8",
+      env: { ...process.env, BASE_BRANCH: "main", IMMUTABLE_PATHS: immutable, ALLOWED_PATHS: allowed },
+    });
+  }
+
+  it("keeps changes inside the allowlist and reverts the rest", () => {
+    write("memory/topics/lesson.md", "what we learned\n");
+    write("src/app.ts", "export const version = 666;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "retro: memory + an out-of-remit edit"]);
+
+    runStripAllowed("memory/");
+
+    expect(read("memory/topics/lesson.md")).toBe("what we learned\n");
+    expect(read("src/app.ts")).toBe("export const version = 1;\n");
+    expect(git(["diff", "--name-only", "origin/main...HEAD"])).toBe("memory/topics/lesson.md");
+  });
+
+  it("accepts a comma-separated list and exact file entries", () => {
+    write("memory/a.md", "a\n");
+    write("docs/b.md", "b\n");
+    write("src/app.ts", "export const version = 3;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "mixed"]);
+
+    runStripAllowed("memory/, src/app.ts");
+
+    expect(read("memory/a.md")).toBe("a\n");
+    expect(read("src/app.ts")).toBe("export const version = 3;\n");
+    expect(existsSync(join(repo, "docs/b.md"))).toBe(false);
+  });
+
+  it("never lets the allowlist re-open an immutable path", () => {
+    write(".github/workflows/ci.yml", "name: pwned\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: edit the gate itself"]);
+
+    // Even with .github/ explicitly allowed, immutable wins.
+    runStripAllowed(".github/");
+
+    expect(read(".github/workflows/ci.yml")).toBe("name: ci\n");
+  });
+
+  it("is inert when no allowlist is given", () => {
+    write("anywhere/file.md", "fine\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "unconstrained lane"]);
+
+    runStrip();
+
+    expect(read("anywhere/file.md")).toBe("fine\n");
+  });
+});

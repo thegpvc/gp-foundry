@@ -13,7 +13,7 @@ permissions:
 jobs:
   fixer:
     runs-on: ubuntu-latest
-    if: contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES')
+    if: (contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES') && github.event.review.user.login == 'agent-bot') && startsWith(github.event.pull_request.head.ref, 'agent/')
     permissions:
       contents: write
       pull-requests: write
@@ -41,15 +41,25 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           MARKER: <!-- gp-foundry:attempt:fixer -->
           MAX: "3"
+          BOT_LOGIN: agent-bot
         run: |-
-          COUNT=$(gh pr view "$PR" --json comments --jq '[.comments[].body | select(contains("'"$MARKER"'"))] | length')
+          # One request-changes verdict = one attempt. The jq filter reads the bot
+          # login from the environment (never interpolated into the script), and an
+          # empty BOT_LOGIN counts any reviewer's request-changes.
+          # (--paginate emits one count per page, so the counts are summed.)
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '
+            [ .[]
+              | select(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)
+              | select(.state == "CHANGES_REQUESTED" or ((.body // "") | test("Verdict.*REQUEST_CHANGES")))
+            ] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          [ -n "$COUNT" ] || COUNT=0
           echo "attempts so far: $COUNT / $MAX"
-          if [ "$COUNT" -ge "$MAX" ]; then
+          if [ "$COUNT" -gt "$MAX" ]; then
             gh pr edit "$PR" --add-label "needs-human" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human'
-            gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (fixer)\n\nExhausted (%s/%s) — labeling `needs-human` and stopping. A human should take this over.\n\n%s' "$COUNT" "$MAX" "$MARKER")"
+            gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (fixer)\n\nExhausted (%s/%s requested-changes rounds) — labeling `needs-human` and stopping. A human should take this over.\n\n%s' "$COUNT" "$MAX" "$MARKER")"
             echo "exhausted=true" >> "$GITHUB_OUTPUT"
           else
-            gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$((COUNT+1))" "$MAX")" >/dev/null
+            gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null
             echo "exhausted=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Setup agent toolchain

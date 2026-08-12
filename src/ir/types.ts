@@ -230,6 +230,8 @@ export interface EmitContext {
   inEdges: HarnessEdge[];
   /** Resolve a runtime-core action reference (pinned full path or vendored ./ path). */
   actionRef: (name: string) => string;
+  /** Look up another node — a handler that must reason about its neighbours. */
+  nodeById: (id: string) => HarnessNode | undefined;
   /** Directory of harness.dot relative to the repo root (e.g. ".github"); prefixes file paths. */
   specDir: string;
 }

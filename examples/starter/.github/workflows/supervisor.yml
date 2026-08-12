@@ -44,19 +44,13 @@ jobs:
           scope-path: .github/agents/scope.yaml
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github-token: ${{ secrets.AGENT_PAT }}
-      - name: Commit changes
-        shell: bash
-        env:
-          BRANCH: main
-        run: |-
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "chore(supervisor): scheduled update"
-          fi
-          git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)" ]; then
-            git push origin "HEAD:$BRANCH"
-            echo "pushed changes to $BRANCH"
-          else
-            echo "no changes to commit"
-          fi
+      - name: Strip protected paths, commit, push
+        if: ${{ !cancelled() }}
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v1
+        with:
+          branch: main
+          base-branch: main
+          token: ${{ secrets.AGENT_PAT }}
+          agent-name: supervisor
+          scope-path: .github/agents/scope.yaml
+          commit-message: "chore(supervisor): scheduled update"

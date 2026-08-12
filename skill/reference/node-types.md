@@ -18,7 +18,7 @@ the **role** is the behavioral identity (a `roles/<name>.md` file, open set, run
 | `pr-fix` | reads review feedback, pushes fixes to the PR branch; bounded by `max_attempts` | `contents: write` + PR write | pr-review | **yes** |
 | `scheduled-agent` | a maintenance agent on `schedule=` cron + manual dispatch, NO triggering issue/PR — it gathers its own work via `gh` (janitor rebase sweep, supervisor re-drive, retro learning) and its commits push to the base branch | `contents: write` + issues/PR write + `actions: write` | none | **yes** |
 | `merge-gate` | evaluates merge policy (approval delay, CI green, size, protected paths, clean rebase) → merge / skip / label | `contents: write` + PR write | none | no (merges) |
-| `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off) | per environment | none | no |
+| `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off), then publishes that approval as a check-run on the PR head SHA | `checks: write` | none | no |
 | `parallel` | fork bar of a **clean diamond**: exactly one in-edge (carrying the trigger), ≥2 bare out-edges to agent legs. Virtual — the whole diamond compiles into the fan_in's single workflow | none (virtual) | — | no |
 | `fan_in` | join of the diamond: compiles to ONE workflow with each leg as a job plus this node `needs:`-joined after them (native Actions join — no polling, no markers). Role synthesizes the lanes' comments (e.g. THE verdict); optional `on_complete_label=` cascades a label. Lane roles must post ANALYSES, never `**Verdict:**` (validator warns) | `contents: read` + PR/issues write | pr-review / issue | no |
 
@@ -40,8 +40,9 @@ Rules of thumb:
 | `on_complete_label=` | fan_in | label applied on join completion (resolves via config.labels) |
 | `context=` | agent types | `issue` \| `pr-diff` \| `pr-review` \| `codebase` \| `none` |
 | `output=` | `analyst` | `comment` \| `doc:<path-glob>` (docs-only write allowlist) |
-| `gates="ci.yml,..."` | `pr-review` | named check workflows the review depends on |
-| `max_attempts=N` | `pr-fix` | loop bound; pairs with an `attempts>=N` escape edge |
+| `gates="ci.yml,..."` | `pr-review` | named check workflows the review depends on; each conclusion is put in front of the reviewer, and the job timeout grows to cover the waits |
+| `max_attempts=N` | `pr-fix` | loop bound; pairs with an `attempts>=N` escape edge. Counted from the reviewer's submitted request-changes reviews, which cannot be deleted |
+| `paths="memory/"` | `scheduled-agent` | optional allowlist of prefixes this lane may write; anything else is reverted before the push |
 | `policy="policy/merge.yaml"` | `merge-gate` | merge-policy file |
 | `schedule="*/30 * * * *"` | `merge-gate`, sweeps | cron cadence |
 | `environment=NAME` | `human-gate` | GitHub Environment gating approval (**required** on human-gate) |
@@ -72,6 +73,12 @@ conclusions, schedules) — because GitHub is the executor, not a custom engine.
 - **Handoff parity:** a role's `handoffs` front-matter == that node's out-edges (both directions).
 - **human-gate has an environment;** analyst nodes are `contents: read`; `output=doc:<glob>`
   means the only committed paths match `<glob>`.
+- **Point a human-gate at the merge gate (`human_gate -> merge_gate`) if approval must
+  actually block the merge.** The gate publishes `gp-foundry/human-approval (<env>)` on the
+  head SHA and the compiler makes the merge gate require that exact check, so an approval
+  binds to the commit it approved — push again and the merge waits for a new one. A
+  human-gate that leads nowhere still pauses its own lane, but nothing downstream depends
+  on it.
 
 ## Reference example (the `starter` harness)
 

@@ -39,3 +39,4 @@ jobs:
           policy-path: .github/agents/policy/merge.yaml
           base-branch: main
           branch-prefix: agent/
+          bot-login: agent-bot

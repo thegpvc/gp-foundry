@@ -21,6 +21,14 @@ inputs:
       push workflow changes). If the file or the key is absent, defaults to
       `.github/workflows/`.
     default: .github/agents/scope.yaml
+  allowed-paths:
+    description: >-
+      Optional newline- or comma-separated allowlist of path prefixes this lane
+      may write. When set, changes anywhere else are reverted before the push —
+      the inverse of `immutable_paths`, for a lane whose remit is narrow (a
+      scheduled agent that may only write its memory directory, say). Empty means
+      "anywhere the immutable paths don't forbid".
+    default: ""
   commit-message:
     description: Fallback commit message (if the agent left uncommitted changes).
     default: ""
@@ -90,6 +98,7 @@ runs:
       env:
         BASE_BRANCH: ${{ inputs.base-branch }}
         IMMUTABLE_PATHS: ${{ steps.immutable.outputs.paths }}
+        ALLOWED_PATHS: ${{ inputs.allowed-paths }}
       run: |
         # Revert any changes to immutable paths — the restricted App token
         # typically lacks permission to push them (e.g. `workflows`), so the
@@ -103,18 +112,30 @@ runs:
         # reinstates the very staged edit this step exists to drop.
         BASE_REF="origin/${BASE_BRANCH}"
 
+        # Everything that differs from base under a pathspec: committed on this
+        # branch, staged/unstaged against HEAD, or a brand-new untracked file.
+        changed_under() {
+          {
+            git diff --name-only "${BASE_REF}...HEAD" -- "$1" 2>/dev/null || true
+            git diff --name-only HEAD -- "$1" 2>/dev/null || true
+            git ls-files --others --exclude-standard -- "$1" 2>/dev/null || true
+          } | sort -u
+        }
+
+        # Put one file back the way base has it (deleting it if base never had it).
+        restore_from_base() {
+          if git cat-file -e "${BASE_REF}:${1}" 2>/dev/null; then
+            git checkout "$BASE_REF" -- "$1" 2>/dev/null || true
+          else
+            git rm -q -f --ignore-unmatch --cached -- "$1" >/dev/null 2>&1 || true
+            rm -f -- "$1"
+          fi
+        }
+
         while IFS= read -r P; do
           [ -z "$P" ] && continue
 
-          # Everything under $P that differs from base: committed on this branch,
-          # staged/unstaged against HEAD, or a brand-new untracked file.
-          CHANGED=$(
-            {
-              git diff --name-only "${BASE_REF}...HEAD" -- "$P" 2>/dev/null || true
-              git diff --name-only HEAD -- "$P" 2>/dev/null || true
-              git ls-files --others --exclude-standard -- "$P" 2>/dev/null || true
-            } | sort -u
-          )
+          CHANGED=$(changed_under "$P")
           [ -z "$CHANGED" ] && continue
 
           echo "::warning::Agent modified protected path '$P' — stripping"
@@ -122,16 +143,31 @@ runs:
 
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            if git cat-file -e "${BASE_REF}:${f}" 2>/dev/null; then
-              # Tracked in base: restore that exact content (worktree + index).
-              git checkout "$BASE_REF" -- "$f" 2>/dev/null || true
-            else
-              # The agent invented this file: untrack it (if tracked) and delete it.
-              git rm -q -f --ignore-unmatch --cached -- "$f" >/dev/null 2>&1 || true
-              rm -f -- "$f"
-            fi
+            restore_from_base "$f"
           done <<< "$CHANGED"
         done <<< "$IMMUTABLE_PATHS"
+
+        # Optional allowlist: this lane may only write these prefixes, so revert
+        # everything else. Immutable paths above are the floor no lane may cross;
+        # this is the ceiling a narrow lane opts into.
+        if [ -n "$ALLOWED_PATHS" ]; then
+          ALLOWED=$(printf '%s' "$ALLOWED_PATHS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            KEEP=""
+            while IFS= read -r A; do
+              [ -z "$A" ] && continue
+              case "$f" in
+                "$A"|"$A"/*) KEEP=1; break ;;
+                *) case "$A" in */) case "$f" in "$A"*) KEEP=1; break ;; esac ;; esac ;;
+              esac
+            done <<< "$ALLOWED"
+            if [ -z "$KEEP" ]; then
+              echo "::warning::Change to '$f' is outside this lane's allowed paths — reverting"
+              restore_from_base "$f"
+            fi
+          done <<< "$(changed_under '.')"
+        fi
 
         # Fold the restorations into the branch's tip commit — but only when there
         # IS a commit of our own to amend. With nothing ahead of base, `--amend`

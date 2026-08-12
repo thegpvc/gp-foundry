@@ -179,26 +179,47 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
 function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const steps: StepSpec[] = preamble(ctx, { ref: PR_HEAD_REF, fetchDepth: 0 });
-  // Make `max_attempts` REAL: each run stamps a marker comment on the PR; when the
-  // count reaches the limit we label needs-human and stop instead of looping forever.
-  // (The graph's `attempts>=N` escape edge is the declaration; this is the mechanism.)
+  // Make `max_attempts` REAL: count how many times the reviewer has asked for
+  // changes on this PR and stop at the limit instead of looping forever. (The
+  // graph's `attempts>=N` escape edge is the declaration; this is the mechanism.)
+  //
+  // The count comes from SUBMITTED REVIEWS, not from marker comments: comments can
+  // be deleted, and deleting them used to reset the budget — so the declared bound
+  // was not monotonic and the fix↔review loop could be driven past it. A submitted
+  // review cannot be deleted through the API, only dismissed, so this ratchets.
   const maxAttempts = typeof node.attrs.max_attempts === "number" ? node.attrs.max_attempts : 3;
   const marker = `<!-- gp-foundry:attempt:${node.id} -->`;
   const needsHuman = ctx.config.labels?.["needs-human"] ?? "needs-human";
+  const botLogin = ctx.config.identity?.bot_login ?? "";
   steps.push(
     runStep({
       id: "attempts",
       name: `Enforce attempt budget (max ${maxAttempts})`,
-      env: { GH_TOKEN: tokenExpr(ctx), PR: PR_NUMBER, MARKER: marker, MAX: String(maxAttempts) },
+      env: {
+        GH_TOKEN: tokenExpr(ctx),
+        PR: PR_NUMBER,
+        MARKER: marker,
+        MAX: String(maxAttempts),
+        BOT_LOGIN: botLogin,
+      },
       run: [
-        `COUNT=$(gh pr view "$PR" --json comments --jq '[.comments[].body | select(contains("'"$MARKER"'"))] | length')`,
+        `# One request-changes verdict = one attempt. The jq filter reads the bot`,
+        `# login from the environment (never interpolated into the script), and an`,
+        `# empty BOT_LOGIN counts any reviewer's request-changes.`,
+        `# (--paginate emits one count per page, so the counts are summed.)`,
+        `COUNT=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
+        `  [ .[]`,
+        `    | select(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`,
+        `    | select(.state == "CHANGES_REQUESTED" or ((.body // "") | test("Verdict.*REQUEST_CHANGES")))`,
+        `  ] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')`,
+        `[ -n "$COUNT" ] || COUNT=0`,
         `echo "attempts so far: $COUNT / $MAX"`,
-        `if [ "$COUNT" -ge "$MAX" ]; then`,
+        `if [ "$COUNT" -gt "$MAX" ]; then`,
         `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}'`,
-        `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
+        `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s requested-changes rounds) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
         `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
         `else`,
-        `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$((COUNT+1))" "$MAX")" >/dev/null`,
+        `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null`,
         `  echo "exhausted=false" >> "$GITHUB_OUTPUT"`,
         `fi`,
       ].join("\n"),
@@ -240,10 +261,28 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   };
 }
 
+/**
+ * The check-run a human-gate publishes on the PR head after its Environment
+ * approval — and the name the merge gate requires. Both sides derive it from the
+ * node, so the two workflows cannot drift apart.
+ */
+export function humanGateCheckName(node: HarnessNode): string {
+  return `gp-foundry/human-approval (${String(node.attrs.environment ?? "production")})`;
+}
+
 // ── merge-gate: policy decision (no agent) ──
 function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
+  // A human-gate feeding this gate is a PRECONDITION, not a suggestion: require
+  // its approval check on the exact head SHA. Before this, the human-gate job ran
+  // on its own and the merge gate never looked at it — approval blocked a merge
+  // only incidentally, via the pending check-run its waiting job happened to
+  // create, and not at all when the approval arrived by another route.
+  const humanGates = ctx.inEdges
+    .map((e) => ctx.nodeById?.(e.from))
+    .filter((n): n is HarnessNode => !!n && n.type === "human-gate");
+  const requiredChecks = humanGates.map(humanGateCheckName);
   steps.push({
     uses: ctx.actionRef("merge-gate"),
     name: "Evaluate merge gate",
@@ -252,6 +291,8 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
       "policy-path": resolveFile(ctx, node.files.policy),
       "base-branch": ctx.config.repo.base_branch,
       "branch-prefix": ctx.config.repo.branch_prefix,
+      ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
     },
   });
   return {
@@ -270,9 +311,35 @@ function emitHumanGate(ctx: EmitContext): WorkflowJobFragment {
   return {
     jobId: node.id,
     name: node.id,
-    permissions: {},
+    // checks:write publishes the approval below; the merge gate requires it.
+    permissions: { checks: "write" },
     environment: env,
-    steps: [runStep({ name: "Awaiting approval", run: `echo "Approved for ${env}."` })],
+    steps: [
+      runStep({
+        name: "Record the approval on the head commit",
+        // The Environment approval is what gates this job. Its only durable trace
+        // used to be an `echo`, which no other workflow could observe — so the
+        // merge gate had nothing to require. Publishing a check-run on the exact
+        // head SHA makes the approval a fact about THIS commit: push again, and
+        // the new head carries no approval.
+        env: {
+          GH_TOKEN: tokenExpr(ctx),
+          CHECK_NAME: humanGateCheckName(node),
+          HEAD_SHA: PR_HEAD_SHA,
+          ENVIRONMENT: env,
+        },
+        run: [
+          `gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \\`,
+          `  -f name="$CHECK_NAME" \\`,
+          `  -f head_sha="$HEAD_SHA" \\`,
+          `  -f status=completed \\`,
+          `  -f conclusion=success \\`,
+          `  -f 'output[title]=Approved' \\`,
+          `  -f "output[summary]=Environment \\"$ENVIRONMENT\\" was approved by a human for $HEAD_SHA."`,
+          `echo "Approved for $ENVIRONMENT."`,
+        ].join("\n"),
+      }),
+    ],
   };
 }
 
@@ -284,25 +351,25 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
   steps.push(runAgentStep(ctx, { withContext: false }));
-  steps.push(
-    runStep({
-      name: "Commit changes",
-      env: { BRANCH: cfg.repo.base_branch },
-      run: [
-        `if [ -n "$(git status --porcelain)" ]; then`,
-        `  git add -A`,
-        `  git commit -m "chore(${node.id}): scheduled update"`,
-        `fi`,
-        `git fetch origin "$BRANCH" --quiet 2>/dev/null || true`,
-        `if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)" ]; then`,
-        `  git push origin "HEAD:$BRANCH"`,
-        `  echo "pushed changes to $BRANCH"`,
-        `else`,
-        `  echo "no changes to commit"`,
-        `fi`,
-      ].join("\n"),
-    }),
-  );
+  // A scheduled lane commits straight to the base branch — no PR, no reviewer, no
+  // merge gate. That makes it the one path where an agent could edit the gate
+  // definitions themselves, so it runs the SAME immutable-path strip the producer
+  // lane does (plus an optional per-lane pathspec allowlist) before pushing.
+  const allowedPaths = typeof node.attrs.paths === "string" ? node.attrs.paths : "";
+  steps.push({
+    uses: ctx.actionRef("agent-fallback"),
+    name: "Strip protected paths, commit, push",
+    if: "${{ !cancelled() }}",
+    with: {
+      branch: cfg.repo.base_branch,
+      "base-branch": cfg.repo.base_branch,
+      token: tokenExpr(ctx),
+      "agent-name": node.id,
+      "scope-path": resolveFile(ctx, "agents/scope.yaml"),
+      "commit-message": `chore(${node.id}): scheduled update`,
+      ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
+    },
+  });
   return {
     jobId: node.id,
     name: node.id,

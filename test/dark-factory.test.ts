@@ -567,3 +567,137 @@ describe("CI gates are consumed, not just awaited (item 7)", () => {
     expect(job["timeout-minutes"]).toBe(15);
   });
 });
+
+// ── the human gate, the scheduled lanes, and the budget ───────────────────
+
+describe("human-gate is a real precondition (item 2)", () => {
+  const GATED = `digraph t {
+    start [type=start]
+    reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+    publish [type=human-gate, environment=production]
+    merge_gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+    start -> reviewer [on="pull_request.opened"]
+    reviewer -> publish [when="verdict=approve"]
+    publish -> merge_gate
+  }`;
+  const build = (dot = GATED) => {
+    const { files } = compile(mkHarness(dot, { identity: { bot_login: "agent-bot" } } as Partial<FoundryConfig>));
+    const job = (name: string) => {
+      const doc = yaml.load(files.find((f) => f.path.endsWith(`${name}.yml`))!.contents) as any;
+      return doc.jobs[name];
+    };
+    return { job };
+  };
+
+  it("publishes the Environment approval as a check-run on the head SHA", () => {
+    const publish = build().job("publish");
+    expect(publish.environment).toBe("production");
+    expect(publish.permissions.checks).toBe("write");
+    const step = publish.steps[0];
+    expect(step.env.CHECK_NAME).toBe("gp-foundry/human-approval (production)");
+    expect(step.env.HEAD_SHA).toBe("${{ github.event.pull_request.head.sha }}");
+    expect(step.run).toContain("check-runs");
+    expect(step.run).toContain("conclusion=success");
+  });
+
+  it("makes the merge gate require exactly that check", () => {
+    const step = build()
+      .job("merge_gate")
+      .steps.find((s: any) => s.name === "Evaluate merge gate");
+    expect(step.with["required-checks"]).toBe("gp-foundry/human-approval (production)");
+    expect(step.with["bot-login"]).toBe("agent-bot");
+  });
+
+  it("requires nothing extra when no human-gate feeds the merge gate", () => {
+    const step = build(`digraph t {
+      merge_gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+    }`)
+      .job("merge_gate")
+      .steps.find((s: any) => s.name === "Evaluate merge gate");
+    expect(step.with["required-checks"]).toBeUndefined();
+  });
+});
+
+describe("scheduled lanes strip immutable paths before pushing to base (item 4)", () => {
+  const scheduled = (attrs = "") => {
+    const { files } = compile(
+      mkHarness(`digraph t {
+        retro [type=scheduled-agent, role="agents/roles/retro.md", schedule="0 7 * * 1-5"${attrs}]
+      }`),
+    );
+    const doc = yaml.load(files.find((f) => f.path.endsWith("retro.yml"))!.contents) as any;
+    return doc.jobs.retro;
+  };
+
+  it("routes the push through agent-fallback instead of a raw git push", () => {
+    const steps = scheduled().steps;
+    const push = steps.at(-1);
+    expect(push.uses).toContain("agent-fallback");
+    expect(push.with["scope-path"]).toContain("scope.yaml");
+    expect(push.with.branch).toBe("main");
+    // No unguarded `git push` to the base branch anywhere in the job.
+    const raw = steps.filter((s: any) => typeof s.run === "string" && s.run.includes("git push"));
+    expect(raw).toEqual([]);
+  });
+
+  it("passes a per-lane path allowlist when the node declares one", () => {
+    expect(scheduled(", paths=\"memory/\"").steps.at(-1).with["allowed-paths"]).toBe("memory/");
+    expect(scheduled().steps.at(-1).with["allowed-paths"]).toBeUndefined();
+  });
+});
+
+describe("attempt budget is derived from undeletable state (item 10)", () => {
+  const attemptsStep = (cfg: Partial<FoundryConfig> = {}) => {
+    const { files } = compile(
+      mkHarness(
+        `digraph t {
+          reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+          fixer [type=pr-fix, role="agents/roles/fixer.md", max_attempts=3]
+          reviewer -> fixer [when="verdict=request_changes"]
+        }`,
+        cfg,
+      ),
+    );
+    const doc = yaml.load(files.find((f) => f.path.endsWith("fixer.yml"))!.contents) as any;
+    return doc.jobs.fixer.steps.find((s: any) => s.id === "attempts");
+  };
+
+  it("counts request-changes REVIEWS, not deletable marker comments", () => {
+    const step = attemptsStep();
+    expect(step.run).toContain("/reviews");
+    expect(step.run).toContain("CHANGES_REQUESTED");
+    // The old mechanism — counting comment bodies — is what made the bound resettable.
+    expect(step.run).not.toContain("--json comments");
+  });
+
+  it("only counts the reviewer bot's verdicts when a bot_login is configured", () => {
+    const step = attemptsStep({ identity: { bot_login: "agent-bot" } } as Partial<FoundryConfig>);
+    expect(step.env.BOT_LOGIN).toBe("agent-bot");
+    // Read from the environment inside jq, never interpolated into the script.
+    expect(step.run).toContain("env.BOT_LOGIN");
+    expect(step.run).not.toContain("'agent-bot'");
+  });
+});
+
+describe("immutable-paths guard is scaffolded (item 12)", () => {
+  const guard = () => {
+    const { files } = compile(mkHarness(LANE_DOT), {}, { specDir: ".github" });
+    const file = files.find((f) => f.path.endsWith("immutable-guard.yml"))!;
+    return yaml.load(file.contents) as any;
+  };
+
+  it("is emitted for every harness, scoped to agent branches", () => {
+    const doc = guard();
+    const job = doc.jobs["immutable-paths"];
+    expect(doc.on.pull_request.types).toContain("synchronize");
+    expect(job.if).toBe("startsWith(github.event.pull_request.head.ref, 'agent/')");
+    expect(job.permissions ?? doc.permissions).toEqual({ contents: "read" });
+  });
+
+  it("reads the scope file the harness actually ships", () => {
+    const step = guard().jobs["immutable-paths"].steps[1];
+    expect(step.env.SCOPE_PATH).toBe(".github/agents/scope.yaml");
+    expect(step.run).toContain("immutable_paths");
+    expect(step.run).toContain("exit 1");
+  });
+});

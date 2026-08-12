@@ -1,6 +1,10 @@
 # scope.yaml — the invariants from interview Q2. Canonical, CI-enforced.
-# immutable_paths: agents can NEVER modify these; a CI check fails the PR and
-#   agent-fallback strips any such edits before pushing. This is the hard safety boundary.
+# immutable_paths: agents can NEVER modify these. Three things enforce it, and
+#   `gp-foundry build` wires up all three: the generated immutable-guard.yml fails
+#   any agent-branch PR whose diff touches one, agent-fallback strips such edits
+#   before a lane pushes (including the scheduled lanes that commit straight to the
+#   base branch), and the merge gate holds back a PR that reaches it anyway. This
+#   is the hard safety boundary.
 # forbidden_paths / forbidden_operations: prompt-enforced (softer); an improve/gardener lane
 #   may adjust these, but never immutable_paths.
 

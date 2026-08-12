@@ -158,7 +158,9 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     for (const n of ir.nodes) {
       if (AGENT.has(n.type)) { hasAgent = true; needed.add("run-agent"); }
       if (AGENT.has(n.type) && n.type !== "scheduled-agent") needed.add("agent-context");
-      if (n.type === "producer") needed.add("agent-fallback");
+      // scheduled lanes push to the base branch through the same strip-and-push
+      // composite the producer uses.
+      if (n.type === "producer" || n.type === "scheduled-agent") needed.add("agent-fallback");
       if (n.type === "merge-gate") needed.add("merge-gate");
       if (n.type === "pr-review" && n.attrs.gates !== undefined) needed.add("wait-for-checks");
     }
