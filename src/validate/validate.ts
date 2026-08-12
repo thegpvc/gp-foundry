@@ -4,7 +4,7 @@
  *
  * Pure: file existence and role specs are injected so this stays testable.
  */
-import type { Diagnostic, Harness, HarnessNode, RoleSpec } from "../ir/types.js";
+import type { Diagnostic, Harness, HarnessEdge, HarnessNode, RoleSpec } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
 import { detectDiamonds } from "../wiring/diamond.js";
@@ -82,11 +82,11 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
 
   // Role handoffs ↔ out-edges cross-check.
   if (deps.roles) {
-    const outByNode = new Map<string, HarnessNode[]>();
+    const outByNode = new Map<string, { node: HarnessNode; edge: HarnessEdge }[]>();
     for (const n of ir.nodes) outByNode.set(n.id, []);
     for (const e of ir.edges) {
       const to = byId.get(e.to);
-      if (to) outByNode.get(e.from)?.push(to);
+      if (to) outByNode.get(e.from)?.push({ node: to, edge: e });
     }
     const nameOf = (n: HarnessNode) =>
       (deps.roles?.get(n.id)?.role ?? n.id).toLowerCase();
@@ -95,7 +95,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
       const spec = deps.roles.get(n.id);
       if (!spec?.handoffs) continue;
       const outTargets = outByNode.get(n.id) ?? [];
-      const outNames = new Set(outTargets.flatMap((t) => [t.id.toLowerCase(), nameOf(t)]));
+      const outNames = new Set(outTargets.flatMap((t) => [t.node.id.toLowerCase(), nameOf(t.node)]));
       const handoffNames = new Set(spec.handoffs.map((h) => String(h.to).toLowerCase()));
 
       for (const h of spec.handoffs) {
@@ -109,8 +109,12 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           });
         }
       }
-      for (const t of outTargets) {
-        if (t.type === "exit") continue;
+      for (const { node: t, edge } of outTargets) {
+        // A CONDITIONAL edge to an exit (e.g. `fixer -> needs_human
+        // [when="attempts>=3"]`) is a real handoff the role must document — it's
+        // the escape hatch an operator reads the role to understand. A bare,
+        // unconditional edge to an exit is just the lane's terminus; exempt.
+        if (t.type === "exit" && !edge.when) continue;
         if (!handoffNames.has(t.id.toLowerCase()) && !handoffNames.has(nameOf(t))) {
           diags.push({
             level: "warning",
