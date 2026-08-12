@@ -48,12 +48,18 @@ async function run(): Promise<void> {
     // Opt-out exists for a consumer that sanitizes in its own way; there is no
     // reason to use it otherwise — run-agent appends this file verbatim.
     const sanitizeInput = core.getInput("sanitize") !== "false";
+    const trustedAuthors = core
+      .getInput("trusted-authors")
+      .split(",")
+      .map((a) => a.trim())
+      .filter(Boolean);
     const stats: SanitizeStats = { injectionHits: 0, secretHits: 0, truncated: 0 };
     const formatted = formatContext(data, {
       type,
       number,
       triggeringComment,
       sanitize: sanitizeInput,
+      trustedAuthors,
       stats,
     });
     if (!sanitizeInput) {

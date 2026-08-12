@@ -756,3 +756,29 @@ describe("fixes from the review pass", () => {
     expect(push.if).toBeUndefined();
   });
 });
+
+describe("the reviewer bot is named to agent-context as a trusted author", () => {
+  it("passes identity.bot_login so the Fixer's checklist is not framed as hostile", () => {
+    const doc = yaml.load(
+      compile(
+        mkHarness(
+          `digraph t {
+            reviewer [type=pr-review, role="agents/roles/reviewer.md"]
+            fixer [type=pr-fix, role="agents/roles/fixer.md"]
+            reviewer -> fixer [when="verdict=request_changes"]
+          }`,
+          { identity: { bot_login: "agent-bot" } } as Partial<FoundryConfig>,
+        ),
+      ).files.find((f) => f.path.endsWith("fixer.yml"))!.contents,
+    ) as any;
+    const ctx = doc.jobs.fixer.steps.find((s: any) => s.id === "ctx");
+    expect(ctx.with["trusted-authors"]).toBe("agent-bot");
+  });
+
+  it("omits the input when no bot_login is configured", () => {
+    const doc = yaml.load(
+      compile(mkHarness(LANE_DOT)).files.find((f) => f.path.endsWith("reviewer.yml"))!.contents,
+    ) as any;
+    expect(doc.jobs.reviewer.steps.find((s: any) => s.id === "ctx").with["trusted-authors"]).toBeUndefined();
+  });
+});

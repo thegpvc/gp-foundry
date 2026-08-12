@@ -31,6 +31,7 @@ jobs:
           type: issue
           number: ${{ github.event.issue.number }}
           token: ${{ secrets.AGENT_PAT }}
+          trusted-authors: agent-bot
       - name: Run agent
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:

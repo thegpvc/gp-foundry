@@ -35,6 +35,7 @@ jobs:
           type: pr-diff
           number: ${{ github.event.pull_request.number }}
           token: ${{ secrets.AGENT_PAT }}
+          trusted-authors: agent-bot
       - name: Run agent
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:

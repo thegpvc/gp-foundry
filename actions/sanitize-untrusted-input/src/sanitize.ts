@@ -146,11 +146,29 @@ export function buildInjectionPatterns(extraPhrases: string[]): RegExp[] {
     // "ignore/disregard/forget (all) (previous/prior/above) instructions/rules/context"
     /\b(?:ignore|disregard|forget|discard|override|bypass)\b[^.\n]{0,40}?\b(?:all\s+)?(?:previous|prior|above|earlier|preceding|foregoing|the\s+system|your)\b[^.\n]{0,40}?\b(?:instruction|instructions|prompt|prompts|rule|rules|context|direction|directions|guardrail|guardrails)\b/gi,
 
-    // "you are now (a) ..." / "act as ..." / "pretend (to be) ..." / "from now on you are"
-    /\b(?:you\s+are\s+now|from\s+now\s+on[, ]+you\s+are|act\s+as|acting\s+as|pretend(?:\s+to\s+be| that\s+you\s+are)?|roleplay\s+as|simulate\s+being|behave\s+(?:as|like))\b[^.\n]{0,60}/gi,
+    // "you are now (a) ..." / "from now on you are ..." — an address to the model,
+    // which ordinary prose about code does not contain. Redact the phrase and the
+    // role it assigns, but do not swallow the rest of the sentence.
+    /\b(?:you\s+are\s+now|from\s+now\s+on[, ]+you\s+are|you\s+must\s+now\s+(?:act|behave|respond))\b[^.\n]{0,60}/gi,
 
-    // Fake conversation-role / chat markers used to spoof a system turn.
-    /(?:^|\n)\s*(?:#{0,3}\s*)?(?:\[?\s*)?(?:system|assistant|user|developer|tool|function)\s*(?:\]?)\s*[:>\]]/gi,
+    // "act as / pretend to be / roleplay as ..." — the same hijack, but these
+    // words are ALSO ordinary technical English ("this helper should act as a
+    // thin wrapper"). Only the imperative form counts: the phrase must open a
+    // sentence or line, so a mid-sentence description is left alone. Only the
+    // phrase and its object are redacted, never a fixed run of trailing text.
+    /(?:^|\n|(?<=[.!?]\s))\s*(?:please\s+)?(?:act|acting)\s+as\s+(?:an?\s+|the\s+)?[^.\n]{0,40}/gi,
+    /(?:^|\n|(?<=[.!?]\s))\s*(?:please\s+)?(?:pretend(?:\s+to\s+be|\s+that\s+you\s+are)?|roleplay\s+as|simulate\s+being)\b[^.\n]{0,40}/gi,
+
+    // Fake conversation-role / chat markers used to spoof a system turn. A bare
+    // `user:` opening a line is ordinary prose ("user: the reporter says ..."),
+    // so require a spoofing shape: a bracketed role, or a role that is the ENTIRE
+    // line (the turn separator a real transcript would use).
+    /(?:^|\n)\s*(?:#{0,3}\s*)?[[<{]\s*(?:system|assistant|user|human|developer|tool|function)\s*[\]>}]\s*[:>]?/gi,
+    /(?:^|\n)\s*(?:#{0,3}\s*)?(?:system|assistant|developer)\s*[:>]\s*(?=\n|$)/gi,
+
+    // The harness's own framing: a body that writes the banner or fence markers is
+    // trying to close the block it sits in and forge trusted-looking sections.
+    /<<<\s*(?:BEGIN|END)\b[^>\n]{0,60}>>>/gi,
     /<\/?(?:system|assistant|user|human|developer|tool|function|im_start|im_end|s|instructions?)\b[^>]*>/gi,
 
     // Special-token spoofing (ChatML / Llama / generic).

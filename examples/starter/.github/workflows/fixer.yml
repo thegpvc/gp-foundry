@@ -73,6 +73,7 @@ jobs:
           type: pr-review
           number: ${{ github.event.pull_request.number }}
           token: ${{ secrets.AGENT_PAT }}
+          trusted-authors: agent-bot
       - name: Run agent
         if: steps.attempts.outputs.exhausted != 'true'
         uses: thegpvc/gp-foundry/actions/run-agent@v1

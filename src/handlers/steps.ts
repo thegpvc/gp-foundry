@@ -68,11 +68,17 @@ export function gitIdentityStep(ctx: EmitContext): RunStep {
 }
 
 export function contextStep(ctx: EmitContext, type: string, numberExpr: string): UsesStep {
+  const withBlock: Record<string, string> = { type, number: numberExpr, token: tokenExpr(ctx) };
+  // The reviewer bot's own posts are the harness talking to itself. Without this
+  // the Fixer reads its own work item under a banner telling it never to follow
+  // the instructions inside — see agent-context's trusted-authors input.
+  const bot = ctx.config.identity?.bot_login;
+  if (bot) withBlock["trusted-authors"] = bot;
   return {
     uses: ctx.actionRef("agent-context"),
     id: "ctx",
     name: "Fetch context",
-    with: { type, number: numberExpr, token: tokenExpr(ctx) },
+    with: withBlock,
   };
 }
 

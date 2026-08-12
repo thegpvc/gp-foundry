@@ -17,6 +17,14 @@ inputs:
   triggering-comment:
     description: Body of the comment that triggered the workflow
     default: ""
+  trusted-authors:
+    description: >-
+      Comma-separated logins whose posts are the harness's own output (normally
+      the reviewer bot). Their bodies are still scrubbed and fenced, but they are
+      framed as the agent's work item rather than as untrusted input -- the
+      Fixer's checklist IS the Reviewer's review, and banning it from acting on
+      it is incoherent. Leave empty to treat every body as untrusted.
+    default: ""
   sanitize:
     description: >-
       Neutralize prompt-injection in attacker-controlled text (issue/PR bodies,
