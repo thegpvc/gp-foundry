@@ -270,6 +270,24 @@ export function humanGateCheckName(node: HarnessNode): string {
   return `gp-foundry/human-approval (${String(node.attrs.environment ?? "production")})`;
 }
 
+/**
+ * The app slug that must have CREATED the approval check for the merge gate to
+ * believe it. A check-run is only as trustworthy as its author: matching on the
+ * name alone lets anything that can write checks publish its own approval.
+ *
+ * The human-gate publishes with GITHUB_TOKEN, so the check is attributed to
+ * `github-actions`, and GITHUB_TOKEN is bounded by each job's `permissions:` —
+ * no agent lane declares `checks: write`. The App installation token the agents
+ * carry is NOT bounded that way, which is exactly why the gate must not accept a
+ * check that token could have written.
+ */
+export const HUMAN_GATE_CHECK_APP = "github-actions";
+
+/** `<check-name>@<app-slug>` — the form merge-gate's `required-checks` parses. */
+export function humanGateRequiredCheck(node: HarnessNode): string {
+  return `${humanGateCheckName(node)}@${HUMAN_GATE_CHECK_APP}`;
+}
+
 // ── merge-gate: policy decision (no agent) ──
 function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
@@ -282,7 +300,9 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const humanGates = ctx.inEdges
     .map((e) => ctx.nodeById?.(e.from))
     .filter((n): n is HarnessNode => !!n && n.type === "human-gate");
-  const requiredChecks = humanGates.map(humanGateCheckName);
+  // `<name>@<app>` — the check must also have been WRITTEN by the app the
+  // human-gate publishes as, or a name is all an impostor needs.
+  const requiredChecks = humanGates.map(humanGateRequiredCheck);
   steps.push({
     uses: ctx.actionRef("merge-gate"),
     name: "Evaluate merge gate",
@@ -323,19 +343,29 @@ function emitHumanGate(ctx: EmitContext): WorkflowJobFragment {
         // head SHA makes the approval a fact about THIS commit: push again, and
         // the new head carries no approval.
         env: {
-          GH_TOKEN: tokenExpr(ctx),
+          // GITHUB_TOKEN, deliberately — not the harness token. Two reasons, both
+          // load-bearing: the Checks API only accepts a GitHub App (a PAT is
+          // rejected outright, and `pat` is the shipped default), and GITHUB_TOKEN
+          // is the one token a job's `permissions:` block actually constrains, so
+          // only a job that declares `checks: write` — this one — can write the
+          // approval. The merge gate pins the resulting `github-actions` author.
+          GH_TOKEN: "${{ github.token }}",
           CHECK_NAME: humanGateCheckName(node),
           HEAD_SHA: PR_HEAD_SHA,
           ENVIRONMENT: env,
         },
         run: [
-          `gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \\`,
+          `if ! gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \\`,
           `  -f name="$CHECK_NAME" \\`,
           `  -f head_sha="$HEAD_SHA" \\`,
           `  -f status=completed \\`,
           `  -f conclusion=success \\`,
           `  -f 'output[title]=Approved' \\`,
-          `  -f "output[summary]=Environment \\"$ENVIRONMENT\\" was approved by a human for $HEAD_SHA."`,
+          `  -f "output[summary]=Environment \\"$ENVIRONMENT\\" was approved by a human for $HEAD_SHA."; then`,
+          `  echo "::error::Approved for $ENVIRONMENT, but publishing the approval check failed."`,
+          `  echo "::error::The merge gate requires \\"$CHECK_NAME\\" on $HEAD_SHA, so this PR will not merge until it is published."`,
+          `  exit 1`,
+          `fi`,
           `echo "Approved for $ENVIRONMENT."`,
         ].join("\n"),
       }),
@@ -359,7 +389,9 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   steps.push({
     uses: ctx.actionRef("agent-fallback"),
     name: "Strip protected paths, commit, push",
-    if: "${{ !cancelled() }}",
+    // No `!cancelled()` here, unlike the producer lane. There the salvage lands
+    // on an agent branch behind a review; here it lands on the base branch with
+    // no PR and no gate, so a run that failed halfway must publish nothing.
     with: {
       branch: cfg.repo.base_branch,
       "base-branch": cfg.repo.base_branch,

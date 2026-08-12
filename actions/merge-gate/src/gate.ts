@@ -36,6 +36,8 @@ export interface CheckRunFact {
   status?: string | null;
   /** GitHub check-run conclusion, set once status is "completed". */
   conclusion?: string | null;
+  /** Slug of the GitHub App that created the run (e.g. "github-actions"). */
+  appSlug?: string | null;
 }
 
 /**
@@ -111,6 +113,12 @@ export interface MergePolicy {
    * human-gate job (which reports its Environment approval as a check-run on the
    * head SHA) be a real precondition of the merge rather than an incidental
    * pending-check side effect.
+   *
+   * An entry may pin the AUTHOR as well as the name, as `<name>@<app-slug>`. Do
+   * that for any check that stands in for a human decision: a name is public, so
+   * without the author pin anything able to write checks — including the App
+   * token every agent lane carries — can publish its own approval. Plain names
+   * stay unpinned, which is right for third-party CI.
    */
   requiredChecks?: string[];
   /** Whether a clean rebase is required before merge. Default true. */
@@ -236,21 +244,39 @@ function anyGlobMatches(globs: string[] | undefined, path: string): boolean {
   return globs.some((g) => globMatch(g, path));
 }
 
+/** Split a `requiredChecks` entry into its name and optional required author. */
+export function parseRequiredCheck(entry: string): { name: string; appSlug?: string } {
+  const at = entry.lastIndexOf("@");
+  if (at <= 0) return { name: entry };
+  return { name: entry.slice(0, at), appSlug: entry.slice(at + 1) };
+}
+
 /**
- * The first required check that is missing from the head SHA or not successful,
- * or undefined when every one of them is green. Absence blocks: a check-run that
- * was never created (e.g. nobody approved the Environment) is the exact case the
- * CI rollup cannot see.
+ * The first required check that is missing from the head SHA, written by the
+ * wrong app, or not successful — or undefined when every one of them is green.
+ *
+ * Absence blocks: a check-run that was never created (e.g. nobody approved the
+ * Environment) is the exact case the CI rollup cannot see. So does the wrong
+ * author, when the entry pins one: a check-run's name proves nothing about who
+ * wrote it, and the whole point of requiring a human-approval check is that the
+ * agents cannot write it themselves.
  */
 export function firstUnsatisfiedCheck(
   checkRuns: CheckRunFact[] | undefined,
   requiredChecks: string[] | undefined,
-): { name: string; reason: "missing" | "not-successful" } | undefined {
+): { name: string; reason: "missing" | "wrong-author" | "not-successful" } | undefined {
   if (!requiredChecks || requiredChecks.length === 0) return undefined;
   const runs = checkRuns ?? [];
-  for (const name of requiredChecks) {
-    const matches = runs.filter((r) => r.name === name);
-    if (matches.length === 0) return { name, reason: "missing" };
+  for (const entry of requiredChecks) {
+    const { name, appSlug } = parseRequiredCheck(entry);
+    const byName = runs.filter((r) => r.name === name);
+    if (byName.length === 0) return { name, reason: "missing" };
+    const matches = appSlug
+      ? byName.filter((r) => (r.appSlug ?? "").toLowerCase() === appSlug.toLowerCase())
+      : byName;
+    // A check published under the right name by the wrong app is an impostor, not
+    // a missing check — say so, because the two need different responses.
+    if (matches.length === 0) return { name, reason: "wrong-author" };
     // A check reported more than once (re-runs): the newest wins, and callers
     // hand these in newest-last, so require the LAST one to be green.
     const latest = matches[matches.length - 1]!;
@@ -500,7 +526,9 @@ export function evaluateMergeGate(
       reason:
         unsatisfied.reason === "missing"
           ? `required check \`${unsatisfied.name}\` has not reported on the head commit`
-          : `required check \`${unsatisfied.name}\` is not successful`,
+          : unsatisfied.reason === "wrong-author"
+            ? `required check \`${unsatisfied.name}\` was published by the wrong app — ignoring it`
+            : `required check \`${unsatisfied.name}\` is not successful`,
       detail: { requiredCheck: unsatisfied.name },
     };
   }

@@ -9,13 +9,15 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
+import { IMMUTABLE_PATHS_AWK, normalizeAwk } from "../src/shared/immutable-paths.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
 const DOT = `digraph t {
@@ -99,6 +101,30 @@ function commit(message: string): string {
   return git(["rev-parse", "HEAD"]);
 }
 
+describe("the two enforcement points read the same list", () => {
+  /** The awk program embedded in a shell block, as the lines inside `awk '...'`. */
+  function awkOf(shell: string): string {
+    const start = shell.indexOf("awk '");
+    const end = shell.indexOf("' \"$SCOPE_PATH\")", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return normalizeAwk(shell.slice(start + "awk '".length, end));
+  }
+
+  it("the guard's scan is byte-identical to the agent-fallback composite's", () => {
+    const composite = yaml.load(
+      readFileSync(fileURLToPath(new URL("../actions/agent-fallback/action.yml", import.meta.url)), "utf8"),
+    ) as { runs: { steps: { id?: string; run?: string }[] } };
+    const resolveStep = composite.runs.steps.find((s) => s.id === "immutable");
+    expect(resolveStep?.run).toBeTruthy();
+
+    // Both sides must agree on which paths are protected; they cannot share a
+    // file, because `vendor` copies only action.yml + dist/ into a consumer repo.
+    expect(awkOf(guardScript())).toBe(awkOf(resolveStep!.run!));
+    expect(awkOf(guardScript())).toBe(normalizeAwk(IMMUTABLE_PATHS_AWK.join("\n")));
+  });
+});
+
 describe("immutable-paths guard", () => {
   it("passes a PR that stays out of the protected paths", () => {
     const base = git(["rev-parse", "HEAD"]);
@@ -145,6 +171,73 @@ describe("immutable-paths guard", () => {
     const head = commit("agent: remove the reviewer");
 
     expect(runGuard(base, head).code).toBe(1);
+  });
+
+  it("fails a rename OUT of a protected path", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    git(["mv", ".github/workflows/reviewer.yml", "disabled-reviewer.yml"]);
+    const head = commit("agent: rename the reviewer out of the way");
+
+    const { code, out } = runGuard(base, head);
+    expect(code).toBe(1);
+    expect(out).toContain(".github/workflows/reviewer.yml");
+  });
+
+  it("honors a glob entry, the form the policy docs use", () => {
+    write(
+      ".github/agents/scope.yaml",
+      ["immutable_paths:", "  - infra/terraform/**", ""].join("\n"),
+    );
+    const base = commit("chore: glob scope entry");
+    write("infra/terraform/main.tf", "# agent edit\n");
+    const head = commit("agent: edit terraform");
+
+    expect(runGuard(base, head).code).toBe(1);
+  });
+
+  it("does not flag a same-named path outside the protected prefix", () => {
+    write(".github/agents/scope.yaml", ["immutable_paths:", "  - src/app.ts", ""].join("\n"));
+    const base = commit("chore: single-file scope entry");
+    write("vendor/src/app.ts", "// unrelated vendored copy\n");
+    const head = commit("agent: touch a vendored lookalike");
+
+    const { code, out } = runGuard(base, head);
+    expect(code).toBe(0);
+    expect(out).toContain("No immutable paths touched.");
+  });
+
+  it("ignores edits the BASE branch made after the PR forked", () => {
+    // The guard must compare against the merge base. A human landing a workflow
+    // change on main must not start failing every open agent PR.
+    const forkPoint = git(["rev-parse", "HEAD"]);
+    git(["checkout", "-qb", "agent/1-feature"]);
+    write("src/app.ts", "export const version = 2;\n");
+    const head = commit("agent: unrelated feature work");
+
+    git(["checkout", "-q", "main"]);
+    write(".github/workflows/reviewer.yml", "name: reviewer\n# human edit on main\n");
+    const movedBase = commit("chore: human edits the harness on main");
+    expect(movedBase).not.toBe(forkPoint);
+
+    const { code, out } = runGuard(movedBase, head);
+    expect(code).toBe(0);
+    expect(out).toContain("No immutable paths touched.");
+  });
+
+  it("refuses to run against an immutable_paths list it cannot parse", () => {
+    // Flow style is valid YAML the line-oriented scan cannot read. Falling back
+    // to the default would guard a different set of paths than the file names.
+    write(
+      ".github/agents/scope.yaml",
+      ['immutable_paths: [".github/workflows/", "infra/terraform/"]', ""].join("\n"),
+    );
+    const base = commit("chore: flow-style scope entry");
+    write("infra/terraform/main.tf", "# agent edit\n");
+    const head = commit("agent: edit terraform");
+
+    const { code, out } = runGuard(base, head);
+    expect(code).toBe(1);
+    expect(out).toContain("none could be read");
   });
 
   it("falls back to .github/workflows/ when the scope file has no list", () => {

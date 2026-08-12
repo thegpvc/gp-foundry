@@ -129,11 +129,15 @@ class Parser {
     if (token.value === "true") return true;
     if (token.value === "false") return false;
 
-    // A function call — `name(arg, arg)`.
+    // A function call — `name()`, `name(arg)`, `name(arg, arg)`. The zero-arg
+    // form is the one the step-level guards use (`always()`, `!cancelled()`).
     if (this.peek()?.value === "(") {
       this.pos++;
-      const args: unknown[] = [this.parseExpr()];
-      while (this.eat(",")) args.push(this.parseExpr());
+      const args: unknown[] = [];
+      if (this.peek()?.value !== ")") {
+        args.push(this.parseExpr());
+        while (this.eat(",")) args.push(this.parseExpr());
+      }
       this.expect(")");
       return applyFunction(token.value, args);
     }

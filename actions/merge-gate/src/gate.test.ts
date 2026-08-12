@@ -9,6 +9,8 @@ import {
   filterCandidateNumbers,
   isApprovalBody,
   isCountableVerdict,
+  parseRequiredCheck,
+  type CheckRunFact,
   filterCountableVerdicts,
   latestValidApproval,
   type PullRequestFacts,
@@ -608,5 +610,52 @@ describe("verdict trust (who is allowed to approve)", () => {
     ];
     const kept = filterCountableVerdicts(events, { botLogin: "bot" });
     expect(latestValidApproval(kept, "head")).toBeNull();
+  });
+});
+
+describe("required checks are pinned to their author (a name proves nothing)", () => {
+  const run = (o: Partial<CheckRunFact> = {}): CheckRunFact => ({
+    name: "human-approval",
+    status: "completed",
+    conclusion: "success",
+    appSlug: "github-actions",
+    ...o,
+  });
+  const gate = (checkRuns: CheckRunFact[], required: string[]) =>
+    evaluateMergeGate(readyPr({ checkRuns }), { ...policy, requiredChecks: required }, NOW);
+
+  it("parses the name@app form", () => {
+    expect(parseRequiredCheck("human-approval@github-actions")).toEqual({
+      name: "human-approval",
+      appSlug: "github-actions",
+    });
+    expect(parseRequiredCheck("ci/build")).toEqual({ name: "ci/build" });
+    // A leading @ is part of the name, not a pin (scoped npm-style check names).
+    expect(parseRequiredCheck("@scope/check")).toEqual({ name: "@scope/check" });
+  });
+
+  it("merges when the pinned app published the check", () => {
+    expect(gate([run()], ["human-approval@github-actions"]).action).toBe("merge");
+  });
+
+  it("REJECTS a green check of the right name from another app", () => {
+    // The escalation: an agent lane holding the harness App token publishes its
+    // own "human approval" on its own head SHA.
+    const d = gate([run({ appSlug: "gp-foundry-agent" })], ["human-approval@github-actions"]);
+    expect(d.action).toBe("skip");
+    expect(d.code).toBe("required-check-missing");
+    expect(d.reason).toContain("wrong app");
+  });
+
+  it("REJECTS a check with no recorded author when an author is pinned", () => {
+    expect(gate([run({ appSlug: null })], ["human-approval@github-actions"]).action).toBe("skip");
+  });
+
+  it("still accepts any author when the entry is an unpinned name", () => {
+    expect(gate([run({ appSlug: "circleci" })], ["human-approval"]).action).toBe("merge");
+  });
+
+  it("matches the app slug case-insensitively", () => {
+    expect(gate([run({ appSlug: "GitHub-Actions" })], ["human-approval@github-actions"]).action).toBe("merge");
   });
 });

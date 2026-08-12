@@ -138,6 +138,9 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
     name: c.name ?? "",
     status: c.status,
     conclusion: c.conclusion,
+    // Who wrote it matters as much as what it says: a `requiredChecks` entry can
+    // pin the author, and the name alone is public knowledge.
+    appSlug: c.app?.slug ?? null,
   }));
 
   let cleanRebase: boolean | undefined;

@@ -18,7 +18,7 @@ the **role** is the behavioral identity (a `roles/<name>.md` file, open set, run
 | `pr-fix` | reads review feedback, pushes fixes to the PR branch; bounded by `max_attempts` | `contents: write` + PR write | pr-review | **yes** |
 | `scheduled-agent` | a maintenance agent on `schedule=` cron + manual dispatch, NO triggering issue/PR — it gathers its own work via `gh` (janitor rebase sweep, supervisor re-drive, retro learning) and its commits push to the base branch | `contents: write` + issues/PR write + `actions: write` | none | **yes** |
 | `merge-gate` | evaluates merge policy (approval delay, CI green, size, protected paths, clean rebase) → merge / skip / label | `contents: write` + PR write | none | no (merges) |
-| `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off), then publishes that approval as a check-run on the PR head SHA | `checks: write` | none | no |
+| `human-gate` | pauses for a human via a GitHub **Environment** approval (brand/deploy sign-off), then publishes that approval as a check-run on the PR head SHA, written with `GITHUB_TOKEN` so the merge gate can pin its author | `checks: write` | none | no |
 | `parallel` | fork bar of a **clean diamond**: exactly one in-edge (carrying the trigger), ≥2 bare out-edges to agent legs. Virtual — the whole diamond compiles into the fan_in's single workflow | none (virtual) | — | no |
 | `fan_in` | join of the diamond: compiles to ONE workflow with each leg as a job plus this node `needs:`-joined after them (native Actions join — no polling, no markers). Role synthesizes the lanes' comments (e.g. THE verdict); optional `on_complete_label=` cascades a label. Lane roles must post ANALYSES, never `**Verdict:**` (validator warns) | `contents: read` + PR/issues write | pr-review / issue | no |
 
@@ -75,10 +75,11 @@ conclusions, schedules) — because GitHub is the executor, not a custom engine.
   means the only committed paths match `<glob>`.
 - **Point a human-gate at the merge gate (`human_gate -> merge_gate`) if approval must
   actually block the merge.** The gate publishes `gp-foundry/human-approval (<env>)` on the
-  head SHA and the compiler makes the merge gate require that exact check, so an approval
-  binds to the commit it approved — push again and the merge waits for a new one. A
-  human-gate that leads nowhere still pauses its own lane, but nothing downstream depends
-  on it.
+  head SHA and the compiler makes the merge gate require that exact check **pinned to the
+  app that wrote it** (`…@github-actions`), so an approval binds to the commit it approved
+  and cannot be forged by a lane holding the harness token — push again and the merge waits
+  for a new one. A human-gate that leads nowhere still pauses its own lane, but nothing
+  downstream depends on it.
 
 ## Reference example (the `starter` harness)
 

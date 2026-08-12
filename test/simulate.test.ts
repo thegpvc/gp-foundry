@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { loadHarness } from "../src/config/load.js";
 import { wire } from "../src/wiring/wire.js";
 import { runScenario, type MockAgent, type SimEvent } from "../src/sim/simulate.js";
+import { evalGuard } from "../src/sim/gh-expr.js";
 
 const dot = fileURLToPath(new URL("./fixtures/dixie/harness.dot", import.meta.url));
 const config = fileURLToPath(new URL("./fixtures/dixie/foundry.config.yaml", import.meta.url));
@@ -72,5 +73,22 @@ describe("plumbing simulator (Tier 2)", () => {
     const seed: SimEvent[] = [{ event: "issues", action: "opened", payload: { issue: { number: 1 } } }];
     const { steps } = runScenario(harness, wiring, seed, { scout, builder, critic }, { maxSteps: 50 });
     expect(steps).toBeLessThan(50);
+  });
+});
+
+describe("gh-expr grammar", () => {
+  it("evaluates the zero-argument functions used in step guards", () => {
+    expect(evalGuard("always()", {})).toBe(true);
+    expect(evalGuard("!cancelled()", {})).toBe(true);
+    expect(evalGuard("cancelled()", {})).toBe(false);
+    expect(evalGuard("success() && !cancelled()", {})).toBe(true);
+  });
+
+  it("keeps grouping tighter than ||, which a naive split would lose", () => {
+    const ctx = { github: { event: { pull_request: { head: { ref: "dpup/hotfix" } } }, event_name: "pull_request" } };
+    // `(a || b) && startsWith(...)` must fail on a human branch even though `b` holds.
+    expect(
+      evalGuard("(github.event_name == 'issues' || github.event_name == 'pull_request') && startsWith(github.event.pull_request.head.ref, 'agent/')", ctx),
+    ).toBe(false);
   });
 });

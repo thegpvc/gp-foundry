@@ -26,40 +26,60 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |-
-          # The immutable_paths list, read without a YAML parser (same scan as
-          # the agent-fallback composite).
+          # The immutable_paths list, read without a YAML parser. This scan is
+          # shared with the agent-fallback composite (src/shared/immutable-paths.ts);
+          # a test fails if the two copies drift.
           PATHS=""
+          HAS_KEY=""
           if [ -f "$SCOPE_PATH" ]; then
+            grep -q '^immutable_paths[[:space:]]*:' "$SCOPE_PATH" && HAS_KEY=1
             PATHS=$(awk '
               /^immutable_paths[[:space:]]*:/ { grab=1; next }
               grab {
+                # A new top-level key (no leading whitespace, ends with ":") ends the list.
                 if ($0 ~ /^[^[:space:]#][^:]*:/) { grab=0; next }
+                # List item: "  - some/path"
                 if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
                   line=$0
-                  sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-                  sub(/[[:space:]]*#.*$/, "", line)
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-                  gsub(/^["'\'']|["'\'']$/, "", line)
+                  sub(/^[[:space:]]*-[[:space:]]*/, "", line)   # drop the "- " marker
+                  sub(/[[:space:]]*#.*$/, "", line)             # drop trailing comment
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)  # trim
+                  gsub(/^["'\'']|["'\'']$/, "", line)            # drop surrounding quotes
                   if (line != "") print line
                 }
               }
             ' "$SCOPE_PATH")
           fi
           if [ -z "$PATHS" ]; then
+            # An absent key falls back to the workflows directory. A key that IS
+            # present but yields nothing means the scan could not read it (e.g. a
+            # flow-style list) — silently guarding a different set of paths than
+            # the file names is how a green check comes to mean nothing.
+            if [ -n "$HAS_KEY" ]; then
+              echo "::error::$SCOPE_PATH declares immutable_paths but none could be read."
+              echo "Write it as a block list, one '- path/' entry per line; this guard"
+              echo "refuses to run against a list it cannot parse."
+              exit 1
+            fi
             PATHS=".github/workflows/"
           fi
 
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          # Three-dot: compare against the MERGE BASE, so edits that landed on the
+          # base branch after this PR forked are not blamed on the PR. --no-renames
+          # keeps a rename visible as a delete of the protected path, which is
+          # exactly the move this guard must catch.
           VIOLATIONS=""
           while IFS= read -r P; do
             [ -z "$P" ] && continue
-            HITS=$(printf '%s\n' "$CHANGED" | grep -F -- "$P" || true)
+            # A git pathspec, not a substring: "$P" anchors at the repo root and
+            # understands the glob forms scope.yaml is written in.
+            HITS=$(git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" -- "$P" || true)
             [ -n "$HITS" ] && VIOLATIONS="$VIOLATIONS$HITS"$'\n'
           done <<< "$PATHS"
 
           if [ -n "$(printf '%s' "$VIOLATIONS" | tr -d '[:space:]')" ]; then
             echo "::error::This branch changes paths scope.yaml marks immutable:"
-            printf '%s\n' "$VIOLATIONS" | sed '/^$/d' | sed 's/^/  - /'
+            printf '%s\n' "$VIOLATIONS" | sed '/^$/d' | sort -u | sed 's/^/  - /'
             echo "Agents must never modify these. If the change is intentional, a human"
             echo "should make it on their own branch."
             exit 1

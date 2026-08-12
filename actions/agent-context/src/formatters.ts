@@ -1,10 +1,13 @@
+// The PURE pipeline, deliberately not the sibling action's entrypoint: importing
+// `index.ts` would bundle its auto-run into this action and execute it on every
+// agent-context step.
 import {
   maskSecrets,
   neutralizeInjection,
   sanitize,
   stripControlChars,
   DEFAULT_CONFIG,
-} from "../../sanitize-untrusted-input/src/index.js";
+} from "../../sanitize-untrusted-input/src/sanitize.js";
 
 // Cap diff output at ~100KB to stay well within an LLM's context window budget
 // while still providing meaningful code review context.

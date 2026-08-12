@@ -21,6 +21,8 @@ trusted_author_associations: [OWNER, MEMBER, COLLABORATOR]
 allow_comment_approvals: false
 # Checks that must be PRESENT and green on the head SHA (not just green if they ran).
 # A human-gate node's approval check goes here — `gp-foundry build` wires it in.
+# An entry may pin the author as "<name>@<app-slug>": a check-run's name is public,
+# so anything that can write checks could otherwise publish its own "approval".
 required_checks: []
 # A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
 # to the verdict line — a bare substring would misread approvals that mention the

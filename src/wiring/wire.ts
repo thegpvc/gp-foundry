@@ -213,7 +213,15 @@ export function wire(ir: Harness): WiringPlan {
       const events = (entry.on ?? "").split(",").map((s) => s.trim()).filter(Boolean);
       for (const ev of events) mergeEvent(triggers, ev, firstLeg);
       const nw: NodeWiring = { nodeId: node.id, triggers, dispatches: [] };
-      const g = entry.when ? guardFor(entry.when, firstLeg, ir.config) : undefined;
+      // The diamond's guard goes through the same branch-prefix treatment as a
+      // single node's. A review panel is still an agent lane: without this it
+      // would run on every human PR, which is the hole the guard exists to close.
+      const effEvents = new Set(events.map((ev) => effectiveEvent(ev, firstLeg)));
+      const g = applyBranchPrefix(
+        entry.when ? guardFor(entry.when, firstLeg, ir.config) : undefined,
+        effEvents,
+        ir.config,
+      );
       if (g) nw.guard = g;
       // Unit scope follows the entry event; convention `<node-id>-<num>`, never cancel
       // a mid-synthesis join.

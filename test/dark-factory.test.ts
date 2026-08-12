@@ -600,12 +600,23 @@ describe("human-gate is a real precondition (item 2)", () => {
     expect(step.run).toContain("conclusion=success");
   });
 
-  it("makes the merge gate require exactly that check", () => {
+  it("makes the merge gate require exactly that check, pinned to its author", () => {
     const step = build()
       .job("merge_gate")
       .steps.find((s: any) => s.name === "Evaluate merge gate");
-    expect(step.with["required-checks"]).toBe("gp-foundry/human-approval (production)");
+    // The `@github-actions` pin is load-bearing: without it the gate would accept
+    // a same-named check from anything that can write checks, including the App
+    // token every agent lane carries.
+    expect(step.with["required-checks"]).toBe("gp-foundry/human-approval (production)@github-actions");
     expect(step.with["bot-login"]).toBe("agent-bot");
+  });
+
+  it("publishes the approval with GITHUB_TOKEN, not the harness token", () => {
+    // The Checks API is App-only (a PAT is rejected, and `pat` is the shipped
+    // default), and GITHUB_TOKEN is the only token a job's `permissions:` block
+    // constrains -- which is what stops another lane forging the approval.
+    const step = build().job("publish").steps[0];
+    expect(step.env.GH_TOKEN).toBe("${{ github.token }}");
   });
 
   it("requires nothing extra when no human-gate feeds the merge gate", () => {
@@ -699,5 +710,49 @@ describe("immutable-paths guard is scaffolded (item 12)", () => {
     expect(step.env.SCOPE_PATH).toBe(".github/agents/scope.yaml");
     expect(step.run).toContain("immutable_paths");
     expect(step.run).toContain("exit 1");
+  });
+});
+
+describe("fixes from the review pass", () => {
+  it("a PR-triggered diamond guards its legs and its join on the branch prefix", () => {
+    // A review panel is still an agent lane. The diamond branch of wire() used to
+    // return before the branch-prefix guard was applied, so every leg ran on
+    // human PRs -- the exact hole the guard exists to close.
+    const ir = mkHarness(`digraph t {
+      start [type=start]
+      panel [type=parallel]
+      sec [type=pr-review, role="agents/roles/reviewer.md"]
+      perf [type=pr-review, role="agents/roles/reviewer.md"]
+      join [type=fan_in, role="agents/roles/reviewer.md"]
+      start -> panel [on="pull_request.opened, pull_request.synchronize"]
+      panel -> sec
+      panel -> perf
+      sec -> join
+      perf -> join
+    }`);
+    const guard = wire(ir).perNode.join!.guard!;
+    expect(guard).toBe("startsWith(github.event.pull_request.head.ref, 'agent/')");
+
+    const doc = yaml.load(
+      compile(ir).files.find((f) => f.path.endsWith("join.yml"))!.contents,
+    ) as any;
+    // The legs carry the entry guard; the join is gated by needs:.
+    expect(doc.jobs.sec.if).toContain("startsWith(github.event.pull_request.head.ref");
+    expect(doc.jobs.perf.if).toContain("startsWith(github.event.pull_request.head.ref");
+  });
+
+  it("a scheduled lane publishes nothing when its agent step failed", () => {
+    // This lane commits straight to the base branch with no PR and no gate, so
+    // salvage-on-failure (which is right for the producer) is wrong here.
+    const doc = yaml.load(
+      compile(
+        mkHarness(`digraph t {
+          retro [type=scheduled-agent, role="agents/roles/retro.md", schedule="0 7 * * 1-5"]
+        }`),
+      ).files.find((f) => f.path.endsWith("retro.yml"))!.contents,
+    ) as any;
+    const push = doc.jobs.retro.steps.at(-1);
+    expect(push.uses).toContain("agent-fallback");
+    expect(push.if).toBeUndefined();
   });
 });

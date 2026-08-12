@@ -45,7 +45,6 @@ jobs:
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github-token: ${{ secrets.AGENT_PAT }}
       - name: Strip protected paths, commit, push
-        if: ${{ !cancelled() }}
         uses: thegpvc/gp-foundry/actions/agent-fallback@v1
         with:
           branch: main

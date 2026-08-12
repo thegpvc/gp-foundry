@@ -25,10 +25,18 @@ disqualifying first:
 4. **Approval delay** — at least `approvalDelayMinutes` must have elapsed.
 5. **CI passing** — the check-run rollup for the head SHA must be `passing`
    (unless `requireCi: false`).
-6. **Required checks** — every name in `requiredChecks` must have reported on
+6. **Required checks** — every entry in `requiredChecks` must have reported on
    the head SHA with conclusion `success`. A check that never ran blocks the
    merge; the CI rollup above cannot do that, since it only judges the checks
    that happen to exist.
+
+   An entry may pin the **author** as well as the name, as `<name>@<app-slug>`.
+   Do that for any check that stands in for a human decision: a check-run's name
+   is public, so without the pin anything able to write checks — including the
+   App installation token every agent lane carries, which a job's `permissions:`
+   block does *not* constrain — can publish its own approval. `gp-foundry build`
+   emits the human-gate's check pinned to `@github-actions`, the app GITHUB_TOKEN
+   writes as. Leave third-party CI checks unpinned.
 7. **Hand-written additions** — additions of non-`excludeGlobs` files must be
    `<= maxAdditions`, else apply `labels.needsHuman`.
 8. **Protected paths** — no changed file may match `protectedPaths`, else apply
@@ -106,7 +114,8 @@ blockingLabels:
 requireCi: true
 requireCleanRebase: true
 requiredChecks:                          # must be PRESENT and green on the head SHA
-  - "gp-foundry/human-approval (production)"
+  - "gp-foundry/human-approval (production)@github-actions"   # @app pins the author
+  - "ci/build"                                               # unpinned: any author
 labels:
   needsHuman: "needs-human"
   rebaseNeeded: "rebase-needed"
