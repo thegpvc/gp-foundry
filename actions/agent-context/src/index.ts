@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fetchContext } from "./fetchers.js";
-import { formatContext, type ContextType } from "./formatters.js";
+import { formatContext, type ContextType, type SanitizeStats } from "./formatters.js";
 
 const VALID_TYPES: ContextType[] = ["issue", "pr-diff", "pr-review", "pr-full"];
 
@@ -44,7 +44,31 @@ async function run(): Promise<void> {
       type,
       includeDiff,
     });
-    const formatted = formatContext(data, { type, number, triggeringComment });
+    // Untrusted prose is fenced and neutralized before it can reach the prompt.
+    // Opt-out exists for a consumer that sanitizes in its own way; there is no
+    // reason to use it otherwise — run-agent appends this file verbatim.
+    const sanitizeInput = core.getInput("sanitize") !== "false";
+    const stats: SanitizeStats = { injectionHits: 0, secretHits: 0, truncated: 0 };
+    const formatted = formatContext(data, {
+      type,
+      number,
+      triggeringComment,
+      sanitize: sanitizeInput,
+      stats,
+    });
+    if (!sanitizeInput) {
+      core.warning(
+        "agent-context: sanitize=false — untrusted issue/PR text reaches the agent prompt verbatim.",
+      );
+    }
+    if (stats.injectionHits > 0) {
+      core.warning(
+        `agent-context: neutralized ${stats.injectionHits} suspected prompt-injection marker(s) in this context.`,
+      );
+    }
+    if (stats.secretHits > 0) {
+      core.warning(`agent-context: masked ${stats.secretHits} secret-looking string(s).`);
+    }
 
     const runnerTemp = process.env.RUNNER_TEMP || tmpdir();
     const outPath = join(runnerTemp, "agent-context.txt");

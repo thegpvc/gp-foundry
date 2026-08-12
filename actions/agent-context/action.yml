@@ -17,6 +17,16 @@ inputs:
   triggering-comment:
     description: Body of the comment that triggered the workflow
     default: ""
+  sanitize:
+    description: >-
+      Neutralize prompt-injection in attacker-controlled text (issue/PR bodies,
+      comments, review bodies, titles) before it is written to the context file:
+      strips control/bidi sequences, caps length, neutralizes role-override
+      markers, masks secret-looking strings, and wraps each body in a
+      collision-proof fence inside an UNTRUSTED banner. On by default — the
+      agent reading this file holds a write token and a shell. Set "false" only
+      if the consumer sanitizes some other way.
+    default: "true"
   base-branch:
     description: >-
       Optional base branch to note as the comparison base. The PR diff is always

@@ -17,6 +17,7 @@ This is a Node20 JavaScript action authored in TypeScript
 | `include-diff`       | no       | `"true"` | Include the full unified diff for PR types. Any value other than `"false"` is treated as true. |
 | `triggering-comment` | no       | `""`     | Body of the comment that triggered the workflow; appended as a final section when non-empty. |
 | `base-branch`        | no       | `""`     | Optional base branch noted in the log for the comparison. The PR diff is always taken relative to the PR's own base ref; this input is surfaced for logging and downstream steps, not to re-target the diff. |
+| `sanitize`           | no       | `"true"` | Neutralize prompt-injection in untrusted text before it lands in the context file. See below. |
 
 ## Outputs
 
@@ -34,6 +35,28 @@ This is a Node20 JavaScript action authored in TypeScript
 Empty sections are omitted. The diff is capped at ~100KB (100,000 bytes); larger
 diffs are truncated with a `[Diff truncated at 100KB. Use Read tool to examine
 full files.]` marker.
+
+## Untrusted text
+
+Everything this action fetches was written by whoever opened the issue or
+commented on the PR, and `run-agent` appends the result to the prompt of an agent
+holding a write token and a shell. So each untrusted body — issue and PR bodies,
+comments, review bodies, inline review comments, and `triggering-comment` — is
+passed through the [`sanitize-untrusted-input`](../sanitize-untrusted-input)
+pipeline before it is written: control/bidi characters stripped, length capped,
+instruction-hijack markers replaced with `[redacted: injection-attempt]`,
+credential-shaped strings masked, and the body wrapped in its own
+collision-proof fence inside an `UNTRUSTED USER INPUT` banner. Per-body fencing
+(rather than one fence around everything) keeps the sections an agent reasons
+over distinguishable.
+
+Titles are scrubbed in place instead of bannered — a banner per title would
+drown the structure it labels — and the diff is left verbatim, with a header
+noting that text inside a diff is data under review, never instructions.
+
+Neutralized markers and masked secrets are reported as workflow warnings, so an
+injection attempt shows up in the run log. Set `sanitize: "false"` only if the
+consumer sanitizes some other way.
 
 ## Example
 
