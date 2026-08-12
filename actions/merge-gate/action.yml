@@ -30,6 +30,23 @@ inputs:
       Overrides the policy file's branchPrefix when set.
     required: false
     default: ""
+  bot-login:
+    description: >
+      Login of the reviewer bot whose verdicts this gate trusts. Overrides the
+      policy file's bot_login. Verdicts from anyone else count only when their
+      author_association is in the policy's trusted_author_associations
+      (default: OWNER, MEMBER, COLLABORATOR).
+    required: false
+    default: ""
+  required-checks:
+    description: >
+      Comma- or newline-separated check-run names that must be PRESENT and
+      successful on the head SHA before merging. Unlike the CI rollup, a check
+      that never reported blocks the merge — this is how an Environment approval
+      job becomes a real precondition. Overrides the policy file's
+      required_checks.
+    required: false
+    default: ""
   clean-rebase:
     description: >
       Optional override for the clean-rebase check: "true" or "false". When

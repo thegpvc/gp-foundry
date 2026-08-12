@@ -29,6 +29,15 @@ export interface PrFile {
   deletions?: number;
 }
 
+/** A check-run observed on the head SHA, as summarized by the caller. */
+export interface CheckRunFact {
+  name: string;
+  /** GitHub check-run status: "queued" | "in_progress" | "completed". */
+  status?: string | null;
+  /** GitHub check-run conclusion, set once status is "completed". */
+  conclusion?: string | null;
+}
+
 /**
  * The PR facts the gate reasons over. This is deliberately a plain data
  * snapshot: the wrapper collects it from the GitHub API and hands it in.
@@ -36,6 +45,14 @@ export interface PrFile {
 export interface PullRequestFacts {
   number: number;
   title?: string;
+  /**
+   * The head commit the facts were gathered against. Passed to `pulls.merge` so
+   * GitHub rejects the call if the head moved while the gate was scoring (the
+   * janitor's rebase sweep runs on the same cadence as the merge poller).
+   */
+  headSha?: string;
+  /** Check-runs on the head SHA, for the `requiredChecks` gate. */
+  checkRuns?: CheckRunFact[];
   /** Head branch name, e.g. "agent/foo". */
   headRefName: string;
   /** Base branch name, e.g. "main" (used in operator-facing messages). */
@@ -87,6 +104,15 @@ export interface MergePolicy {
   blockingLabels?: string[];
   /** Whether a passing CI rollup is required. Default true. */
   requireCi?: boolean;
+  /**
+   * Check-runs that must be PRESENT and successful on the head SHA before a
+   * merge. The CI rollup only judges the checks that happen to exist, so a check
+   * that never ran cannot block it; these must exist. This is what lets a
+   * human-gate job (which reports its Environment approval as a check-run on the
+   * head SHA) be a real precondition of the merge rather than an incidental
+   * pending-check side effect.
+   */
+  requiredChecks?: string[];
   /** Whether a clean rebase is required before merge. Default true. */
   requireCleanRebase?: boolean;
   /**
@@ -115,6 +141,7 @@ export type MergeReasonCode =
   | "not-approved"
   | "approval-delay"
   | "ci-not-passing"
+  | "required-check-missing"
   | "too-large"
   | "protected-path"
   | "rebase-needed";
@@ -132,6 +159,8 @@ export interface MergeDecision {
     handAdditions?: number;
     minutesSinceApproval?: number;
     protectedPath?: string;
+    /** For `required-check-missing`: the check that is absent or not yet green. */
+    requiredCheck?: string;
   };
 }
 
@@ -207,6 +236,31 @@ function anyGlobMatches(globs: string[] | undefined, path: string): boolean {
   return globs.some((g) => globMatch(g, path));
 }
 
+/**
+ * The first required check that is missing from the head SHA or not successful,
+ * or undefined when every one of them is green. Absence blocks: a check-run that
+ * was never created (e.g. nobody approved the Environment) is the exact case the
+ * CI rollup cannot see.
+ */
+export function firstUnsatisfiedCheck(
+  checkRuns: CheckRunFact[] | undefined,
+  requiredChecks: string[] | undefined,
+): { name: string; reason: "missing" | "not-successful" } | undefined {
+  if (!requiredChecks || requiredChecks.length === 0) return undefined;
+  const runs = checkRuns ?? [];
+  for (const name of requiredChecks) {
+    const matches = runs.filter((r) => r.name === name);
+    if (matches.length === 0) return { name, reason: "missing" };
+    // A check reported more than once (re-runs): the newest wins, and callers
+    // hand these in newest-last, so require the LAST one to be green.
+    const latest = matches[matches.length - 1]!;
+    if (latest.status !== "completed" || latest.conclusion !== "success") {
+      return { name, reason: "not-successful" };
+    }
+  }
+  return undefined;
+}
+
 /** Sum additions for files not excluded by the policy's exclude globs. */
 export function handWrittenAdditions(files: PrFile[], excludeGlobs?: string[]): number {
   return files.reduce((sum, f) => {
@@ -266,6 +320,64 @@ export interface VerdictEvent {
   kind: "approve" | "reject";
   /** The commit the review was submitted against (undefined for comments). */
   sha?: string | null;
+  /** Login of the author who submitted the review / wrote the comment. */
+  author?: string | null;
+  /** GitHub `author_association` (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, …). */
+  authorAssociation?: string | null;
+  /** Which channel carried the verdict — a formal review, or a plain issue comment. */
+  source?: "review" | "comment";
+}
+
+/**
+ * Who is allowed to hand this gate a verdict. Without it, "approval" is just a
+ * string anyone who can comment on the PR could type — and with CI green the
+ * poller would merge it to the base branch.
+ */
+export interface VerdictTrustPolicy {
+  /** The reviewer bot's login. Its verdicts always count. */
+  botLogin?: string;
+  /**
+   * `author_association` values trusted to approve besides the bot. Defaults to
+   * people with write access to the repo.
+   */
+  trustedAuthorAssociations?: string[];
+  /**
+   * Whether a plain issue comment can carry an approval at all. Off by default:
+   * comment approvals cannot be bound to a head SHA, only to a timestamp.
+   */
+  allowCommentApprovals?: boolean;
+}
+
+/** Repo-write associations — the default set trusted to approve. */
+export const DEFAULT_TRUSTED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+/**
+ * Is this event allowed to count?
+ *
+ * Approvals are the privileged direction, so they need a trusted author (the bot
+ * itself, or someone with write access) on an allowed channel. Rejections are
+ * fail-safe — they can only ever hold a merge back — so any formal review can
+ * carry one, whoever wrote it. The comment channel is on or off as a whole:
+ * when comment approvals are disabled, comment rejections are ignored too, so a
+ * drive-by comment cannot stall the factory either.
+ */
+export function isCountableVerdict(e: VerdictEvent, trust: VerdictTrustPolicy = {}): boolean {
+  const source = e.source ?? "review";
+  if (source === "comment" && !trust.allowCommentApprovals) return false;
+  if (e.kind === "reject") return true;
+  if (trust.botLogin && e.author && e.author.toLowerCase() === trust.botLogin.toLowerCase()) return true;
+  const trusted = (trust.trustedAuthorAssociations ?? DEFAULT_TRUSTED_ASSOCIATIONS).map((a) =>
+    a.toUpperCase(),
+  );
+  return !!e.authorAssociation && trusted.includes(e.authorAssociation.toUpperCase());
+}
+
+/** Drop the verdicts this gate must not act on, preserving order. */
+export function filterCountableVerdicts(
+  events: VerdictEvent[],
+  trust: VerdictTrustPolicy = {},
+): VerdictEvent[] {
+  return events.filter((e) => isCountableVerdict(e, trust));
 }
 
 /**
@@ -301,8 +413,9 @@ export function latestValidApproval(
  * Evaluate the merge gate for a single PR against a policy.
  *
  * Ordering mirrors the original Shipper (cheapest / most-disqualifying checks
- * first): blocking labels → branch → approval → approval delay → CI → size →
- * protected paths → rebase → merge. Returns the FIRST failing gate. Callers
+ * first): blocking labels → branch → approval → approval delay → CI → required
+ * checks → size → protected paths → rebase → merge. Returns the FIRST failing
+ * gate. Callers
  * that want the merge to actually happen should treat `action === "merge"` as
  * the go-ahead and everything else as a no-merge (with `label` carrying a label
  * to apply and `skip` being a pure no-op).
@@ -375,6 +488,20 @@ export function evaluateMergeGate(
       action: "skip",
       code: "ci-not-passing",
       reason: `CI status is \`${pr.ciStatus}\` (need \`passing\`)`,
+    };
+  }
+
+  // 5b) Required checks present AND green on the head SHA.
+  const unsatisfied = firstUnsatisfiedCheck(pr.checkRuns, policy.requiredChecks);
+  if (unsatisfied) {
+    return {
+      action: "skip",
+      code: "required-check-missing",
+      reason:
+        unsatisfied.reason === "missing"
+          ? `required check \`${unsatisfied.name}\` has not reported on the head commit`
+          : `required check \`${unsatisfied.name}\` is not successful`,
+      detail: { requiredCheck: unsatisfied.name },
     };
   }
 

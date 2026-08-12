@@ -8,8 +8,12 @@ import {
   normalizePolicyKeys,
   filterCandidateNumbers,
   isApprovalBody,
+  isCountableVerdict,
+  filterCountableVerdicts,
+  latestValidApproval,
   type PullRequestFacts,
   type MergePolicy,
+  type VerdictEvent,
 } from "./gate.js";
 
 describe("normalizePolicyKeys (snake_case policy support)", () => {
@@ -477,5 +481,132 @@ describe("parseTimestamp", () => {
   });
   it("returns NaN for garbage", () => {
     expect(Number.isNaN(parseTimestamp("nope"))).toBe(true);
+  });
+});
+
+// ── the approval is a real gate ────────────────────────────────────────────
+
+describe("required checks (a human gate must be able to BLOCK)", () => {
+  const withChecks = (checkRuns: { name: string; status?: string; conclusion?: string }[]) =>
+    evaluateMergeGate(
+      readyPr({ checkRuns }),
+      { ...policy, requiredChecks: ["human-approval"] },
+      NOW,
+    );
+
+  it("blocks when the required check never reported", () => {
+    const d = withChecks([{ name: "ci", status: "completed", conclusion: "success" }]);
+    expect(d.action).toBe("skip");
+    expect(d.code).toBe("required-check-missing");
+    expect(d.detail?.requiredCheck).toBe("human-approval");
+  });
+
+  it("blocks while the required check is still pending", () => {
+    const d = withChecks([{ name: "human-approval", status: "in_progress" }]);
+    expect(d.code).toBe("required-check-missing");
+  });
+
+  it("blocks when the required check failed", () => {
+    const d = withChecks([{ name: "human-approval", status: "completed", conclusion: "failure" }]);
+    expect(d.code).toBe("required-check-missing");
+  });
+
+  it("merges once the required check is green", () => {
+    const d = withChecks([{ name: "human-approval", status: "completed", conclusion: "success" }]);
+    expect(d.action).toBe("merge");
+  });
+
+  it("takes the newest report when a check re-ran", () => {
+    expect(
+      withChecks([
+        { name: "human-approval", status: "completed", conclusion: "failure" },
+        { name: "human-approval", status: "completed", conclusion: "success" },
+      ]).action,
+    ).toBe("merge");
+  });
+
+  it("is inert when no requiredChecks are configured", () => {
+    expect(evaluateMergeGate(readyPr({ checkRuns: [] }), policy, NOW).action).toBe("merge");
+  });
+
+  it("is checked after CI and before the size gate", () => {
+    const d = evaluateMergeGate(
+      readyPr({ ciStatus: "failing", checkRuns: [] }),
+      { ...policy, requiredChecks: ["human-approval"] },
+      NOW,
+    );
+    expect(d.code).toBe("ci-not-passing");
+    const e = evaluateMergeGate(
+      readyPr({ checkRuns: [], files: [{ path: "x", additions: 9999 }] }),
+      { ...policy, requiredChecks: ["human-approval"] },
+      NOW,
+    );
+    expect(e.code).toBe("required-check-missing");
+  });
+});
+
+describe("verdict trust (who is allowed to approve)", () => {
+  const approve = (e: Partial<VerdictEvent> = {}): VerdictEvent => ({
+    at: "2026-01-01T00:00:00Z",
+    kind: "approve",
+    sha: "head",
+    source: "review",
+    ...e,
+  });
+
+  it("counts the bot's own review verdict", () => {
+    expect(isCountableVerdict(approve({ author: "my-agent[bot]" }), { botLogin: "my-agent[bot]" })).toBe(true);
+  });
+
+  it("counts a review from someone with write access", () => {
+    expect(isCountableVerdict(approve({ author: "maintainer", authorAssociation: "MEMBER" }), {})).toBe(true);
+  });
+
+  it("REJECTS an approval from a drive-by contributor", () => {
+    expect(isCountableVerdict(approve({ author: "stranger", authorAssociation: "NONE" }), { botLogin: "bot" })).toBe(false);
+    expect(isCountableVerdict(approve({ author: "stranger", authorAssociation: "CONTRIBUTOR" }), {})).toBe(false);
+  });
+
+  it("REJECTS a comment approval unless the channel is enabled", () => {
+    const c = approve({ author: "maintainer", authorAssociation: "OWNER", source: "comment", sha: null });
+    expect(isCountableVerdict(c, {})).toBe(false);
+    expect(isCountableVerdict(c, { allowCommentApprovals: true })).toBe(true);
+  });
+
+  it("still requires trust on the comment channel when enabled", () => {
+    const c = approve({ author: "stranger", authorAssociation: "NONE", source: "comment", sha: null });
+    expect(isCountableVerdict(c, { allowCommentApprovals: true })).toBe(false);
+  });
+
+  it("counts rejections from anyone (they can only hold a merge back)", () => {
+    const r: VerdictEvent = { at: "x", kind: "reject", author: "stranger", authorAssociation: "NONE", source: "review" };
+    expect(isCountableVerdict(r, { botLogin: "bot" })).toBe(true);
+  });
+
+  it("honors a custom trusted-association set", () => {
+    const e = approve({ author: "x", authorAssociation: "COLLABORATOR" });
+    expect(isCountableVerdict(e, { trustedAuthorAssociations: ["OWNER"] })).toBe(false);
+  });
+
+  it("filterCountableVerdicts keeps order and drops the untrusted ones", () => {
+    const events: VerdictEvent[] = [
+      approve({ at: "1", author: "bot" }),
+      approve({ at: "2", author: "stranger", authorAssociation: "NONE" }),
+      { at: "3", kind: "reject", author: "stranger", authorAssociation: "NONE", source: "review" },
+    ];
+    const kept = filterCountableVerdicts(events, { botLogin: "bot" });
+    expect(kept.map((e) => e.at)).toEqual(["1", "3"]);
+  });
+
+  it("an attacker's approve comment cannot override the bot's REQUEST_CHANGES", () => {
+    // The exact escalation from the report: reviewer rejects, attacker comments
+    // the verdict string, poller merges. With the trust filter the attacker's
+    // event never reaches the latest-verdict-wins rule.
+    const events: VerdictEvent[] = [
+      { at: "2026-01-01T00:00:00Z", kind: "reject", sha: "head", author: "bot", source: "review" },
+      { at: "2026-01-01T01:00:00Z", kind: "approve", author: "stranger", authorAssociation: "NONE", source: "comment" },
+    ];
+    const kept = filterCountableVerdicts(events, { botLogin: "bot" });
+    expect(latestValidApproval(kept, "head")).toBeNull();
   });
 });

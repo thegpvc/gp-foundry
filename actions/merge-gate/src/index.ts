@@ -19,17 +19,20 @@ import yaml from "js-yaml";
 import {
   evaluateMergeGate,
   filterCandidateNumbers,
+  filterCountableVerdicts,
   latestValidApproval,
   normalizePolicyKeys,
+  type CheckRunFact,
   type MergePolicy,
   type PullRequestFacts,
   type PrFile,
   type CiStatus,
   type MergeDecision,
   type VerdictEvent,
+  type VerdictTrustPolicy,
 } from "./gate.js";
 
-interface PolicyFile extends MergePolicy {
+interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
   /** Body marker that INVALIDATES earlier approvals (default: "REQUEST_CHANGES"). */
   rejectionBodyRegex?: string;
@@ -81,7 +84,7 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   // Collect verdict-bearing events (reviews + marker comments) in time order, then
   // apply the integrity rule: latest verdict wins, approval must match the head SHA
   // (or, for comments, postdate the head commit). See gate.latestValidApproval.
-  const events: VerdictEvent[] = [];
+  const rawEvents: VerdictEvent[] = [];
   const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
   // Approval is tested FIRST: per the reviewer contract the verdict is the body's
   // final "**Verdict:** …" line, and an approval may legitimately quote or discuss
@@ -89,19 +92,30 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   // marker is an approval, full stop.
   for (const r of reviews) {
     if (!r.submitted_at) continue;
+    const who = { author: r.user?.login, authorAssociation: r.author_association, source: "review" as const };
     if (isApprovalReview(r, bodyRe)) {
-      events.push({ at: r.submitted_at, kind: "approve", sha: r.commit_id });
+      rawEvents.push({ at: r.submitted_at, kind: "approve", sha: r.commit_id, ...who });
     } else if (r.state === "CHANGES_REQUESTED" || (r.state === "COMMENTED" && r.body && rejectRe.test(r.body))) {
-      events.push({ at: r.submitted_at, kind: "reject", sha: r.commit_id });
+      rawEvents.push({ at: r.submitted_at, kind: "reject", sha: r.commit_id, ...who });
     }
   }
-  if (bodyRe) {
+  // Plain issue comments are an approval channel only when a consumer opts in:
+  // a comment verdict cannot be bound to a head SHA, and every user who can
+  // comment on the PR can write one.
+  if (bodyRe && policy.allowCommentApprovals) {
     const comments = await octokit.paginate(octokit.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
     for (const c of comments) {
       if (!c.body || !c.created_at) continue;
-      if (bodyRe.test(c.body)) events.push({ at: c.created_at, kind: "approve" });
-      else if (rejectRe.test(c.body)) events.push({ at: c.created_at, kind: "reject" });
+      const who = { author: c.user?.login, authorAssociation: c.author_association, source: "comment" as const };
+      if (bodyRe.test(c.body)) rawEvents.push({ at: c.created_at, kind: "approve", ...who });
+      else if (rejectRe.test(c.body)) rawEvents.push({ at: c.created_at, kind: "reject", ...who });
     }
+  }
+  // Only verdicts from authors this repo trusts reach the integrity rule below.
+  const events = filterCountableVerdicts(rawEvents, policy);
+  const ignored = rawEvents.length - events.length;
+  if (ignored > 0) {
+    core.info(`PR #${prNumber}: ignored ${ignored} verdict(s) from untrusted authors/channels`);
   }
   let headCommittedAt: string | null = null;
   try {
@@ -116,8 +130,15 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
 
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
-  const checkRuns = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
-  const ciStatus = rollupCi(checkRuns, ignore);
+  const checkRunsRaw = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
+  const ciStatus = rollupCi(checkRunsRaw, ignore);
+  // Same fetch feeds the requiredChecks gate: those must be present AND green,
+  // which the CI rollup cannot express (it only judges checks that exist).
+  const checkRuns: CheckRunFact[] = checkRunsRaw.map((c) => ({
+    name: c.name ?? "",
+    status: c.status,
+    conclusion: c.conclusion,
+  }));
 
   let cleanRebase: boolean | undefined;
   if (pr.mergeable === true && pr.mergeable_state && pr.mergeable_state !== "dirty") cleanRebase = true;
@@ -126,7 +147,7 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   if (overrideRebase === "true") cleanRebase = true;
   else if (overrideRebase === "false") cleanRebase = false;
 
-  return { number: prNumber, title: pr.title, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, approvedAt, files, cleanRebase };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase };
 }
 
 /** Open PRs on branch-prefix branches targeting base, oldest first. */
@@ -155,10 +176,21 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
   }
   if (decision.action === "merge") {
     try {
-      await octokit.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: policy.mergeMethod ?? "rebase" });
+      await octokit.rest.pulls.merge({
+        owner,
+        repo,
+        pull_number: prNumber,
+        merge_method: policy.mergeMethod ?? "rebase",
+        // Merge exactly what was scored. Without this, a head that moved between
+        // scoring and merging — the janitor's rebase sweep runs on the same
+        // cadence as this poller — would be merged unreviewed. GitHub 409s when
+        // the SHA no longer matches, which lands in the recovery path below.
+        ...(facts.headSha ? { sha: facts.headSha } : {}),
+      });
     } catch (e) {
       // A merge can still fail at merge time (e.g. a conflict that appeared after
-      // another PR landed). Don't crash the poller — label it so a Fixer rebases it.
+      // another PR landed, or the head moved). Don't crash the poller — label it
+      // so a Fixer rebases it and the next run re-scores the new head.
       core.warning(`Merge of #${prNumber} rejected: ${(e as Error).message}`);
       const rebaseLabel = policy.rebaseLabel ?? "needs-rebase";
       try {
@@ -166,7 +198,7 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
       } catch (le) {
         core.warning(`Could not label #${prNumber} \`${rebaseLabel}\`: ${(le as Error).message}`);
       }
-      await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — a conflict appeared after another PR landed. Labeled \`${rebaseLabel}\` so the janitor sweep can rebase this onto \`${facts.baseRefName ?? "the base branch"}\` and try again.`);
+      await comment(octokit, owner, repo, prNumber, `## 🔀 Auto-merge\n\nEverything passed the gate, but GitHub rejected the merge — the head moved, or a conflict appeared after another PR landed. Nothing was merged: the gate only merges the exact commit it scored (\`${(facts.headSha ?? "").slice(0, 8)}\`). Labeled \`${rebaseLabel}\` so the janitor sweep can rebase this onto \`${facts.baseRefName ?? "the base branch"}\`; the next poll re-scores the new head.`);
       return false;
     }
     if (policy.deleteBranchOnMerge ?? true) {
@@ -195,6 +227,23 @@ async function run(): Promise<void> {
 
     const policy = loadPolicy(policyPath);
     if (branchPrefixInput) policy.branchPrefix = branchPrefixInput; // input overrides policy file
+    // The compiler passes these from foundry.config.yaml / the graph, so a
+    // consumer's identity and human-gate wiring don't have to be restated in the
+    // policy file. Inputs win over the policy file, same as branch-prefix.
+    const botLoginInput = core.getInput("bot-login").trim();
+    if (botLoginInput) policy.botLogin = botLoginInput;
+    const requiredChecksInput = core.getInput("required-checks").trim();
+    if (requiredChecksInput) {
+      policy.requiredChecks = requiredChecksInput
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    if (!policy.botLogin && !policy.trustedAuthorAssociations) {
+      core.warning(
+        "merge-gate: no bot-login and no trusted_author_associations configured — approvals are accepted from anyone with write access (OWNER/MEMBER/COLLABORATOR) only.",
+      );
+    }
     const octokit = github.getOctokit(token);
     const { owner, repo } = github.context.repo;
 

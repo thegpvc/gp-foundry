@@ -10,6 +10,18 @@ branch_prefix: "agent/"
 # Approval — the Reviewer posts its verdict in a review BODY; count a body matching
 # this regex as approval (a bot can't formally APPROVE its own PR).
 approval_body_regex: "Verdict.*APPROVE"
+# WHO may approve. An approval is an instruction to push to the base branch, so the
+# gate only counts verdicts it can attribute: the reviewer bot itself (bot_login —
+# the compiler passes identity.bot_login for you), or a review from someone with
+# write access. Reviews are bound to the head SHA: approve, push, and the approval
+# stops counting. Plain issue comments are NOT an approval channel unless you turn
+# them on below — anyone who can comment could type the verdict string, and a comment
+# carries no SHA to bind to.
+trusted_author_associations: [OWNER, MEMBER, COLLABORATOR]
+allow_comment_approvals: false
+# Checks that must be PRESENT and green on the head SHA (not just green if they ran).
+# A human-gate node's approval check goes here — `gp-foundry build` wires it in.
+required_checks: []
 # A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
 # to the verdict line — a bare substring would misread approvals that mention the
 # earlier requested changes in prose.
