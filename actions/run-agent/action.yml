@@ -78,8 +78,8 @@ inputs:
       Optional newline-separated NAME=VALUE pairs exported into the agent's
       environment before the CLI runs, so roles can reach extra secrets (e.g. a
       Sentry token). Values are passed in by the caller because composites have
-      no secrets context; the compiler fills these from config.agent.secrets as
-      NAME=${{ secrets.NAME }}. Values are never echoed.
+      no secrets context; the compiler fills these from config.agent.secrets, one
+      NAME=<value> pair per line. Values are never echoed.
     required: false
     default: ""
 
