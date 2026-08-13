@@ -10,6 +10,7 @@ import {
   isApprovalBody,
   isCountableVerdict,
   parseRequiredCheck,
+  describeCheckRunsFailure,
   type CheckRunFact,
   filterCountableVerdicts,
   latestValidApproval,
@@ -657,5 +658,29 @@ describe("required checks are pinned to their author (a name proves nothing)", (
 
   it("matches the app slug case-insensitively", () => {
     expect(gate([run({ appSlug: "GitHub-Actions" })], ["human-approval@github-actions"]).action).toBe("merge");
+  });
+});
+
+describe("check-runs permission failure names the missing scope", () => {
+  it("turns GitHub's flat 403 into the actual cause", () => {
+    const msg = describeCheckRunsFailure(
+      { status: 403, message: "Resource not accessible by personal access token" },
+      "the AGENT_PAT secret",
+    );
+    expect(msg).toContain("Checks: read");
+    expect(msg).toContain("the AGENT_PAT secret");
+    expect(msg).toContain("require_ci: false");
+    // Keep GitHub's own words too -- the operator may be searching for them.
+    expect(msg).toContain("Resource not accessible by personal access token");
+  });
+
+  it("covers 404, which is what a token without visibility gets", () => {
+    expect(describeCheckRunsFailure({ status: 404, message: "Not Found" }, "the token")).toContain("Checks: read");
+  });
+
+  it("does not blame permissions for an unrelated failure", () => {
+    const msg = describeCheckRunsFailure({ status: 502, message: "Bad gateway" }, "the token");
+    expect(msg).toContain("Bad gateway");
+    expect(msg).not.toContain("Checks: read");
   });
 });

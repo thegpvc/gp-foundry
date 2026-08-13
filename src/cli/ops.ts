@@ -13,10 +13,12 @@ import type { Command } from "commander";
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import yaml from "js-yaml";
 import pc from "picocolors";
 import { compile, hasErrors } from "../index.js";
 import { loadConfig, loadHarness } from "../config/load.js";
 import { emitJson, pkgFile, resolvePaths } from "./common.js";
+import type { Harness } from "../ir/types.js";
 import { relative } from "node:path";
 
 // ── small helpers ─────────────────────────────────────────────────────────────
@@ -77,6 +79,31 @@ function printChecks(checks: Check[]): void {
 }
 
 // ── vendor ────────────────────────────────────────────────────────────────────
+
+/**
+ * Does this harness have a merge gate that will read the check-runs rollup?
+ *
+ * `require_ci` defaults to TRUE in the merge-gate action, so a policy file that
+ * omits it still needs the Checks permission — the check has to assume yes unless
+ * the policy explicitly opts out.
+ */
+export function needsChecksPermission(harness: Harness, root: string): boolean {
+  const gates = harness.nodes.filter((n) => n.type === "merge-gate");
+  if (gates.length === 0) return false;
+  return gates.some((gate) => {
+    if (!gate.files.policy) return true; // no policy file → action defaults apply
+    const specDir = dirname(harness.sourcePath ?? "");
+    const path = join(root, specDir, gate.files.policy);
+    if (!existsSync(path)) return true;
+    try {
+      const policy = yaml.load(readFileSync(path, "utf8")) as Record<string, unknown> | null;
+      const requireCi = policy?.require_ci ?? policy?.requireCi;
+      return requireCi !== false;
+    } catch {
+      return true; // unreadable policy: assume the default rather than stay quiet
+    }
+  });
+}
 
 export function vendorInto(root: string): string[] {
   const written: string[] = [];
@@ -203,6 +230,19 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
       ? { name: "secrets", status: "fail", detail: `missing: ${missingSecrets.join(", ")}`, hint: `gh secret set ${missingSecrets[0]}` }
       : { name: "secrets", status: "ok", detail: needSecrets.join(", ") },
   );
+
+  // 4b. The PAT scope nobody remembers. A fine-grained token's permissions are not
+  // introspectable through the API, and the failure is invisible where people look:
+  // the merge gate is a cron job, so a 403 on check-runs shows up only in the
+  // Actions tab while every approved PR sits there unmerged. Say it out loud.
+  if (authCfg?.mode === "pat" && needsChecksPermission(harness, root)) {
+    checks.push({
+      name: "pat scope",
+      status: "skip",
+      detail: "auth.mode=pat with require_ci — the merge gate reads check-runs, which needs Checks: read",
+      hint: `a PAT's scopes cannot be read back, so confirm by hand: ${authCfg.token_secret ?? "AGENT_PAT"} needs Checks + Commit statuses (read) on top of Contents/Pull requests/Issues/Actions (read-write)`,
+    });
+  }
 
   // 5. workflows committed? (uncommitted generated files never run on GitHub)
   const porcelain = gh(["--version"]); // gh exists; use git directly for this one

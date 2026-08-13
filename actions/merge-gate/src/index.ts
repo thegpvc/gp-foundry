@@ -17,6 +17,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import yaml from "js-yaml";
 import {
+  describeCheckRunsFailure,
   evaluateMergeGate,
   filterCandidateNumbers,
   filterCountableVerdicts,
@@ -130,7 +131,14 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
 
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
-  const checkRunsRaw = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
+  type CheckRunRaw = { name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null };
+  let checkRunsRaw: CheckRunRaw[];
+  try {
+    checkRunsRaw = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
+  } catch (e) {
+    // Fail closed, but say which permission is missing — see describeCheckRunsFailure.
+    throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }, "the AGENT_PAT secret"));
+  }
   const ciStatus = rollupCi(checkRunsRaw, ignore);
   // Same fetch feeds the requiredChecks gate: those must be present AND green,
   // which the CI rollup cannot express (it only judges checks that exist).
