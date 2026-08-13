@@ -385,30 +385,68 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const cfg = ctx.config;
   const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 }); // app-token, checkout, git identity
+  // How this lane persists its output, via the `commit=` node attr:
+  //   direct (default) — commit straight to the base branch (no PR, no gate). The
+  //                      original maintenance model; kept for back-compat.
+  //   pr               — commit to a fresh agent branch and open a PR, so the output
+  //                      goes through the reviewer + human gate + merge gate like any
+  //                      change. Use when the base branch is protected against direct push.
+  //   none             — no commit or push at all: a read-only lane whose only effects
+  //                      are gh/API side effects (labels, comments, issues, external APIs).
+  const commit = typeof node.attrs.commit === "string" ? node.attrs.commit : "direct";
+  const allowedPaths = typeof node.attrs.paths === "string" ? node.attrs.paths : "";
+  if (commit === "pr") {
+    // A fresh branch per run so concurrent runs never collide.
+    steps.push(
+      runStep({
+        id: "branch",
+        name: "Create branch",
+        env: { PREFIX: cfg.repo.branch_prefix, NODE: node.id, RUN_ID: "${{ github.run_id }}" },
+        run: ['BRANCH="$PREFIX$NODE-$RUN_ID"', 'git checkout -b "$BRANCH"', 'echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"'].join("\n"),
+      }),
+    );
+  }
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
   steps.push(runAgentStep(ctx, { withContext: false }));
-  // A scheduled lane commits straight to the base branch — no PR, no reviewer, no
-  // merge gate. That makes it the one path where an agent could edit the gate
-  // definitions themselves, so it runs the SAME immutable-path strip the producer
-  // lane does (plus an optional per-lane pathspec allowlist) before pushing.
-  const allowedPaths = typeof node.attrs.paths === "string" ? node.attrs.paths : "";
-  steps.push({
-    uses: ctx.actionRef("agent-fallback"),
-    name: "Strip protected paths, commit, push",
-    // No `!cancelled()` here, unlike the producer lane. There the salvage lands
-    // on an agent branch behind a review; here it lands on the base branch with
-    // no PR and no gate, so a run that failed halfway must publish nothing.
-    with: {
-      branch: cfg.repo.base_branch,
-      "base-branch": cfg.repo.base_branch,
-      token: tokenExpr(ctx),
-      "agent-name": node.id,
-      "scope-path": resolveFile(ctx, "agents/scope.yaml"),
-      "commit-message": `chore(${node.id}): scheduled update`,
-      ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
-    },
-  });
+  if (commit === "pr") {
+    // Output lands on the agent branch and opens a PR — reviewed and gated, never a
+    // direct base-branch write. `!cancelled()` salvages partial work behind the review.
+    steps.push({
+      uses: ctx.actionRef("agent-fallback"),
+      name: "Commit, push branch, open PR",
+      if: "${{ !cancelled() }}",
+      with: {
+        branch: "${{ steps.branch.outputs.branch }}",
+        "base-branch": cfg.repo.base_branch,
+        token: tokenExpr(ctx),
+        "agent-name": node.id,
+        "scope-path": resolveFile(ctx, "agents/scope.yaml"),
+        "pr-title": `${node.id}: scheduled update`,
+        "pr-body": `Scheduled output from the \`${node.id}\` lane — review and merge like any agent PR.`,
+        ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
+      },
+    });
+  } else if (commit === "direct") {
+    // Original model: commit straight to the base branch. It's the one path where an
+    // agent could edit the gate definitions themselves, so it runs the SAME immutable-path
+    // strip the producer lane does (plus an optional per-lane allowlist) first. No
+    // `!cancelled()`: a half-failed run must publish nothing to the base branch.
+    steps.push({
+      uses: ctx.actionRef("agent-fallback"),
+      name: "Strip protected paths, commit, push",
+      with: {
+        branch: cfg.repo.base_branch,
+        "base-branch": cfg.repo.base_branch,
+        token: tokenExpr(ctx),
+        "agent-name": node.id,
+        "scope-path": resolveFile(ctx, "agents/scope.yaml"),
+        "commit-message": `chore(${node.id}): scheduled update`,
+        ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
+      },
+    });
+  }
+  // commit === "none": no epilogue at all — nothing committed or pushed.
   return {
     jobId: node.id,
     name: node.id,

@@ -43,6 +43,7 @@ Rules of thumb:
 | `gates="ci.yml,..."` | `pr-review` | named check workflows the review depends on; each conclusion is put in front of the reviewer, and the job timeout grows to cover the waits |
 | `max_attempts=N` | `pr-fix` | loop bound; pairs with an `attempts>=N` escape edge. Counted from the reviewer's submitted request-changes reviews, which cannot be deleted |
 | `paths="memory/"` | `scheduled-agent` | optional allowlist of prefixes this lane may write; anything else is reverted before the push |
+| `commit="none\|pr\|direct"` | `scheduled-agent` | how the lane persists output: `direct` (default) commits to base; `pr` opens a reviewed PR; `none` no commit/push (read-only lane) |
 | `secrets="A,B"` | agent types | extra Actions secrets exposed to THIS lane's env (unioned with global `agent.secrets`); least-privilege scoping, e.g. a Sentry token only on the sweeper |
 | `policy="policy/merge.yaml"` | `merge-gate` | merge-policy file |
 | `schedule="*/30 * * * *"` | `merge-gate`, sweeps | cron cadence |
