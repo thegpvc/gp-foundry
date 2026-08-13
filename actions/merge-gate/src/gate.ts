@@ -247,24 +247,29 @@ function anyGlobMatches(globs: string[] | undefined, path: string): boolean {
 /**
  * Turn a permission failure on the check-runs endpoint into an answer.
  *
- * `GET /commits/{sha}/check-runs` needs the **Checks** permission, which is
- * separate from Actions and easy to leave off a fine-grained PAT. GitHub answers
- * with a flat "Resource not accessible by personal access token", which says
- * nothing about which of the token's several scopes is short — and the gate is a
- * cron job, so the 403 lands in the Actions tab where nobody is looking while
- * every approved PR sits unmerged. Name the missing scope instead.
+ * `GET /commits/{sha}/check-runs` needs the **Checks** permission, and that is a
+ * GitHub App permission only: a fine-grained PAT cannot be granted it — GitHub's
+ * permission list has no Checks entry to tick. So the gate reads check-runs with
+ * GITHUB_TOKEN (an App installation token) via the `checks-token` input, while
+ * the merge itself keeps using the harness token. A 403 here means that wiring is
+ * missing — almost always a consumer whose generated workflow predates it.
+ *
+ * Worth the specificity: GitHub answers with a flat "Resource not accessible by
+ * personal access token", the gate is a cron job, so the failure lands in the
+ * Actions tab where nobody looks while every approved PR sits unmerged.
  */
-export function describeCheckRunsFailure(err: { status?: number; message?: string }, tokenKind: string): string {
+export function describeCheckRunsFailure(err: { status?: number; message?: string }): string {
   const base = err.message ?? "unknown error";
   if (err.status !== 403 && err.status !== 404) {
     return `could not read check-runs for the head commit: ${base}`;
   }
   return [
     `could not read check-runs for the head commit (HTTP ${err.status}): ${base}.`,
-    `The merge gate reads the check-runs rollup whenever \`require_ci\` is on, which needs the`,
-    `**Checks: read** permission — a separate scope from Actions, and the one most often`,
-    `missing from ${tokenKind}. Add Checks: read (and Commit statuses: read) to it, or set`,
-    `\`require_ci: false\` in the merge policy if this repo has no CI to wait for.`,
+    `Reading check-runs needs the Checks permission, which only a GitHub App token has —`,
+    `a fine-grained PAT cannot be granted it. The merge-gate job should pass GITHUB_TOKEN as`,
+    `\`checks-token\` and declare \`checks: read\`; if this workflow does neither, it was`,
+    "generated before that fix — run `gp-foundry build` and commit the result. Alternatively",
+    "set `require_ci: false` in the merge policy if this repo has no CI to wait for.",
   ].join(" ");
 }
 

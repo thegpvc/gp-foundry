@@ -17,6 +17,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      checks: read
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -36,6 +37,7 @@ jobs:
         uses: thegpvc/gp-foundry/actions/merge-gate@v1
         with:
           token: ${{ secrets.AGENT_PAT }}
+          checks-token: ${{ github.token }}
           policy-path: .github/agents/policy/merge.yaml
           base-branch: main
           branch-prefix: agent/

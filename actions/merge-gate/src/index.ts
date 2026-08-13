@@ -73,7 +73,7 @@ function rollupCi(
   return "unknown";
 }
 
-async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumber: number, policy: PolicyFile): Promise<PullRequestFacts> {
+async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumber: number, policy: PolicyFile, checksOctokit: Octokit = octokit): Promise<PullRequestFacts> {
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
   const bodyRe = policy.approvalBodyRegex ? new RegExp(policy.approvalBodyRegex) : undefined;
@@ -134,10 +134,16 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   type CheckRunRaw = { name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null };
   let checkRunsRaw: CheckRunRaw[];
   try {
-    checkRunsRaw = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
+    // Deliberately a SEPARATE token from the one that merges. Reading check-runs
+    // needs the Checks permission, which only a GitHub App has — fine-grained
+    // PATs cannot grant it at all (GitHub's permission list has no Checks entry).
+    // GITHUB_TOKEN is an App installation token, so the caller passes it here for
+    // this read while the merge itself keeps using the PAT, which is what makes
+    // the merge attributable and lets its events cascade.
+    checkRunsRaw = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
   } catch (e) {
-    // Fail closed, but say which permission is missing — see describeCheckRunsFailure.
-    throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }, "the AGENT_PAT secret"));
+    // Fail closed, but say what to wire up — see describeCheckRunsFailure.
+    throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }));
   }
   const ciStatus = rollupCi(checkRunsRaw, ignore);
   // Same fetch feeds the requiredChecks gate: those must be present AND green,
@@ -256,13 +262,24 @@ async function run(): Promise<void> {
       );
     }
     const octokit = github.getOctokit(token);
+    // Reading check-runs is the one call the harness token cannot make when it is
+    // a fine-grained PAT (no Checks permission exists for those), so it gets its
+    // own token. Everything else — merging, labeling, commenting — stays on the
+    // harness token so writes are attributed and their events cascade.
+    const checksTokenInput = core.getInput("checks-token").trim();
+    const checksOctokit = checksTokenInput ? github.getOctokit(checksTokenInput) : octokit;
+    if (!checksTokenInput) {
+      core.warning(
+        "merge-gate: no checks-token supplied; reading check-runs with the harness token. That only works for a GitHub App token — a fine-grained PAT will 403. Run `gp-foundry build` to wire GITHUB_TOKEN through.",
+      );
+    }
     const { owner, repo } = github.context.repo;
 
     // Single-PR mode.
     if (prNumberInput) {
       const prNumber = parseInt(prNumberInput, 10);
       if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
-      const facts = await gatherFacts(octokit, owner, repo, prNumber, policy);
+      const facts = await gatherFacts(octokit, owner, repo, prNumber, policy, checksOctokit);
       const decision = evaluateMergeGate(facts, policy);
       const merged = await actOnDecision(octokit, owner, repo, prNumber, facts, decision, policy, dryRun);
       core.setOutput("action", decision.action);
@@ -278,7 +295,7 @@ async function run(): Promise<void> {
     core.info(`${candidates.length} candidate PR(s): ${candidates.join(", ") || "(none)"}`);
     let mergedPr = "";
     for (const n of candidates) {
-      const facts = await gatherFacts(octokit, owner, repo, n, policy);
+      const facts = await gatherFacts(octokit, owner, repo, n, policy, checksOctokit);
       const decision = evaluateMergeGate(facts, policy);
       const merged = await actOnDecision(octokit, owner, repo, n, facts, decision, policy, dryRun);
       if (merged) { mergedPr = String(n); break; } // one merge per run

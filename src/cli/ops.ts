@@ -231,17 +231,25 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
       : { name: "secrets", status: "ok", detail: needSecrets.join(", ") },
   );
 
-  // 4b. The PAT scope nobody remembers. A fine-grained token's permissions are not
-  // introspectable through the API, and the failure is invisible where people look:
-  // the merge gate is a cron job, so a 403 on check-runs shows up only in the
-  // Actions tab while every approved PR sits there unmerged. Say it out loud.
-  if (authCfg?.mode === "pat" && needsChecksPermission(harness, root)) {
-    checks.push({
-      name: "pat scope",
-      status: "skip",
-      detail: "auth.mode=pat with require_ci — the merge gate reads check-runs, which needs Checks: read",
-      hint: `a PAT's scopes cannot be read back, so confirm by hand: ${authCfg.token_secret ?? "AGENT_PAT"} needs Checks + Commit statuses (read) on top of Contents/Pull requests/Issues/Actions (read-write)`,
-    });
+  // 4b. The gate reads check-runs with GITHUB_TOKEN because a fine-grained PAT
+  // cannot hold the Checks permission at all. A workflow generated before that
+  // wiring existed still passes the PAT and 403s on every candidate — silently,
+  // since the gate is a cron job. Catch that here rather than in the Actions tab.
+  if (needsChecksPermission(harness, root)) {
+    const gateFiles = files.filter((f) => /\/workflows\/.*\.yml$/.test(f.path) && f.contents.includes("actions/merge-gate"));
+    const onDisk = gateFiles
+      .map((f) => join(root, f.path))
+      .filter((p) => existsSync(p))
+      .map((p) => readFileSync(p, "utf8"));
+    const unwired = onDisk.filter((c) => !c.includes("checks-token"));
+    if (onDisk.length && unwired.length) {
+      checks.push({
+        name: "merge gate ci read",
+        status: "fail",
+        detail: `${unwired.length} merge-gate workflow(s) read check-runs with the harness token`,
+        hint: "a fine-grained PAT cannot be granted the Checks permission, so that read 403s and nothing merges — run `gp-foundry build` to pass GITHUB_TOKEN instead, then commit",
+      });
+    }
   }
 
   // 5. workflows committed? (uncommitted generated files never run on GitHub)

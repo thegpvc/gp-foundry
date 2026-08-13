@@ -30,6 +30,16 @@ inputs:
       Overrides the policy file's branchPrefix when set.
     required: false
     default: ""
+  checks-token:
+    description: >
+      Token used ONLY to read the check-runs rollup for the head SHA. That read
+      needs the Checks permission, which is a GitHub App permission — a
+      fine-grained PAT cannot be granted it, so passing the harness PAT here 403s
+      and the gate merges nothing. Pass ${{ github.token }} (an App installation
+      token) and give the job `permissions: checks: read`. Defaults to `token`,
+      which is correct only when that token is a GitHub App installation token.
+    required: false
+    default: ""
   bot-login:
     description: >
       Login of the reviewer bot whose verdicts this gate trusts. Overrides the

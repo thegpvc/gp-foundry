@@ -308,6 +308,12 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
     name: "Evaluate merge gate",
     with: {
       token: tokenExpr(ctx),
+      // Reading check-runs needs the Checks permission, which is a GitHub App
+      // permission with no fine-grained-PAT equivalent — GitHub's permission list
+      // has no Checks entry to grant. GITHUB_TOKEN is an App installation token,
+      // so it does that one read (see the job's `checks: read`) while the merge
+      // keeps the harness token, which is what makes it attributable and cascade.
+      "checks-token": "${{ github.token }}",
       "policy-path": resolveFile(ctx, node.files.policy),
       "base-branch": ctx.config.repo.base_branch,
       "branch-prefix": ctx.config.repo.branch_prefix,
@@ -318,7 +324,8 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   return {
     jobId: node.id,
     name: node.id,
-    permissions: { contents: "write", "pull-requests": "write", issues: "write" },
+    // `checks: read` is what makes GITHUB_TOKEN able to read the CI rollup above.
+    permissions: { contents: "write", "pull-requests": "write", issues: "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
   };

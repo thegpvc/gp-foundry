@@ -62,10 +62,7 @@ Tell the user to run:
 
 ```bash
 gh secret set CLAUDE_CODE_OAUTH_TOKEN   # the coding agent's auth token
-gh secret set AGENT_PAT                 # fine-grained PAT, this repo:
-                                        #   Contents, Pull requests, Issues, Actions — read/write
-                                        #   Checks, Commit statuses — read  (the merge gate reads
-                                        #   check-runs; without Checks it 403s and merges nothing)
+gh secret set AGENT_PAT                 # fine-grained PAT: Contents + Pull requests + Issues + Actions, RW, this repo
 ```
 
 (`AGENT_PAT` exists because the built-in `GITHUB_TOKEN` cannot trigger downstream

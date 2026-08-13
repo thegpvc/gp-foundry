@@ -8,10 +8,10 @@ auth: # how the harness authenticates to GitHub for writes
   # Pick ONE mode:
   #   pat          — a fine-grained PAT in a repo secret: events cascade, one secret,
   #                  no App to install. Easiest; the default. Scope the PAT to this
-  #                  repo with Contents + Pull requests + Issues + Actions read/write,
-  #                  AND Checks + Commit statuses read. Checks is easy to miss and is
-  #                  not optional: with require_ci the merge gate reads the check-runs
-  #                  rollup, and without it every candidate PR 403s and nothing merges.
+  #                  repo with Contents + Pull requests + Issues + Actions read/write.
+  #                  (It needs nothing for CI: reading check-runs takes the Checks
+  #                  permission, which fine-grained PATs cannot be granted at all, so
+  #                  the merge gate reads that with the built-in GITHUB_TOKEN.)
   #   app          — GitHub App token: clean bot identity, cascades. Best for orgs.
   #                  (set app_id_secret / app_key_secret instead of token_secret)
   #   github-token — the built-in GITHUB_TOKEN: zero setup BUT its commits/PRs never
