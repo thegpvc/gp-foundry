@@ -45,3 +45,44 @@ describe("agent.secrets → run-agent extra-env", () => {
     expect(runAgentWith()?.["extra-env"]).toBeUndefined();
   });
 });
+
+/** Compile a custom DOT and return one job's run-agent `with` block. */
+function jobRunAgentWith(dot: string, jobId: string, globalSecrets?: string[]): Record<string, string> | undefined {
+  const g = parseDot(dot);
+  const config = loadConfig(undefined) as FoundryConfig;
+  if (globalSecrets) config.agent.secrets = globalSecrets;
+  const ir: Harness = { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: ".github/harness.dot" };
+  const wf: any = yaml.load(compile(ir).files.find((f) => f.path.endsWith(`${jobId}.yml`))!.contents);
+  const steps = wf.jobs[jobId].steps as Array<{ name?: string; with?: Record<string, string> }>;
+  return steps.find((s) => s.name === "Run agent")?.with;
+}
+
+const SCOPED_DOT = `digraph t {
+  start   [type=start]
+  scout   [type=issue-agent, role="agents/roles/scout.md", context=issue]
+  builder [type=producer,    role="agents/roles/builder.md", secrets="SENTRY_PAT"]
+  start -> scout   [on="issues.opened"]
+  scout -> builder [when="label=build"]
+}`;
+
+describe("per-node secrets= scoping", () => {
+  it("delivers a node's secrets= only to that node", () => {
+    expect(jobRunAgentWith(SCOPED_DOT, "builder")?.["extra-env"]).toBe("SENTRY_PAT=${{ secrets.SENTRY_PAT }}");
+  });
+
+  it("does NOT leak a node's secrets= to sibling nodes", () => {
+    expect(jobRunAgentWith(SCOPED_DOT, "scout")?.["extra-env"]).toBeUndefined();
+  });
+
+  it("unions global agent.secrets with a node's secrets=", () => {
+    expect(jobRunAgentWith(SCOPED_DOT, "builder", ["GLOBAL_TOKEN"])?.["extra-env"]).toBe(
+      "GLOBAL_TOKEN=${{ secrets.GLOBAL_TOKEN }}\nSENTRY_PAT=${{ secrets.SENTRY_PAT }}",
+    );
+  });
+
+  it("dedupes a secret named both globally and on the node", () => {
+    expect(jobRunAgentWith(SCOPED_DOT, "builder", ["SENTRY_PAT"])?.["extra-env"]).toBe(
+      "SENTRY_PAT=${{ secrets.SENTRY_PAT }}",
+    );
+  });
+});

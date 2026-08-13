@@ -96,11 +96,19 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
   if (opts.withContext) withBlock["context-file"] = "${{ steps.ctx.outputs.context-file }}";
   // Optional repo-wide conventions string from config (inserted before the scope).
   if (cfg.agent.conventions) withBlock["conventions"] = cfg.agent.conventions;
-  // Optional extra secrets exposed to every agent's environment (config.agent.secrets).
-  // The composite has no secrets context, so the VALUES are resolved here and passed in
-  // as NAME=${{ secrets.NAME }} lines; run-agent exports them before invoking the CLI.
-  if (cfg.agent.secrets?.length) {
-    withBlock["extra-env"] = cfg.agent.secrets.map((name) => `${name}=${secretRef(name)}`).join("\n");
+  // Extra secrets exposed in the agent's environment: the global config.agent.secrets
+  // (every lane) unioned with this node's `secrets="A,B"` attr (this lane only). Per-node
+  // scoping is least-privilege — e.g. a Sentry token only on the sweeper, not on the
+  // web-capable advisory lanes where it would just widen the exfiltration surface. The
+  // composite has no secrets context, so VALUES are resolved here as NAME=${{ secrets.NAME }}
+  // and run-agent exports them before the CLI.
+  const nodeSecrets =
+    typeof node.attrs.secrets === "string"
+      ? node.attrs.secrets.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+  const secrets = [...new Set([...(cfg.agent.secrets ?? []), ...nodeSecrets])];
+  if (secrets.length) {
+    withBlock["extra-env"] = secrets.map((name) => `${name}=${secretRef(name)}`).join("\n");
   }
   const override = node.files.prompt;
   if (override) withBlock["prompt-override-file"] = resolveFile(ctx, override);
