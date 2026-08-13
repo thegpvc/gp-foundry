@@ -73,6 +73,15 @@ inputs:
       (passthrough for flags like --max-turns, --add-dir, etc.).
     required: false
     default: ""
+  extra-env:
+    description: >-
+      Optional newline-separated NAME=VALUE pairs exported into the agent's
+      environment before the CLI runs, so roles can reach extra secrets (e.g. a
+      Sentry token). Values are passed in by the caller because composites have
+      no secrets context; the compiler fills these from config.agent.secrets as
+      NAME=${{ secrets.NAME }}. Values are never echoed.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -163,12 +172,29 @@ runs:
         MODEL: ${{ inputs.model }}
         ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
         EXTRA_ARGS: ${{ inputs.extra-args }}
+        EXTRA_ENV: ${{ inputs.extra-env }}
       run: |
         set -uo pipefail
 
         if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
           echo "::error::claude-code-oauth-token is empty"
           exit 1
+        fi
+
+        # Export any caller-provided extra env (NAME=VALUE per line) so roles can reach
+        # extra secrets (config.agent.secrets). Values are never echoed; GitHub also masks
+        # registered secret values in logs. Split on the FIRST '=' so values may contain '='.
+        if [ -n "${EXTRA_ENV:-}" ]; then
+          while IFS= read -r _line; do
+            [ -z "$_line" ] && continue
+            _name="${_line%%=*}"
+            _value="${_line#*=}"
+            case "$_name" in
+              [A-Za-z_][A-Za-z0-9_]*) export "$_name=$_value" ;;
+              *) echo "::warning::run-agent: skipping malformed extra-env entry" ;;
+            esac
+          done <<< "$EXTRA_ENV"
+          unset _line _name _value
         fi
 
         # Tool policy lives in the role front-matter. If allowed-tools was not

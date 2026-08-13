@@ -78,6 +78,11 @@
           "type": "string",
           "description": "Name of the Actions secret holding the agent OAuth token."
         },
+        "secrets": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Names of additional Actions secrets exposed in EVERY agent's environment (e.g. [\"SENTRY_PAT\"]). The compiler passes each into the run-agent step as extra-env `NAME=${{ secrets.NAME }}`, and roles read them as $NAME. This broadens each secret's blast radius to every agent lane (which ingest untrusted issue/PR text), so grant least-privilege tokens."
+        },
         "conventions": {
           "type": "string",
           "description": "Optional free-text repo conventions surfaced to every agent (e.g. commit style, stack notes)."
