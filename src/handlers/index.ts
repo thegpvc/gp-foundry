@@ -43,7 +43,12 @@ export function parsePermissionsAttr(node: HarnessNode): Perms {
     throw new Error(`node '${node.id}': permissions= must be a non-empty string like "id-token: write"`);
   }
   const out: Perms = {};
-  for (const entry of raw.split(",")) {
+  // Whitespace-only entries (a trailing comma) are tolerated, matching secrets=.
+  const entries = raw.split(",").filter((e) => e.trim());
+  if (!entries.length) {
+    throw new Error(`node '${node.id}': permissions= has no entries — expected e.g. "id-token: write"`);
+  }
+  for (const entry of entries) {
     const m = /^\s*([a-z](?:[a-z-]*[a-z])?)\s*:\s*(read|write|none)\s*$/.exec(entry);
     if (!m) {
       throw new Error(
@@ -57,7 +62,16 @@ export function parsePermissionsAttr(node: HarnessNode): Perms {
 
 /** Merge the node's `permissions=` attr over the handler's defaults. */
 function withNodePermissions(node: HarnessNode, fragment: WorkflowJobFragment): WorkflowJobFragment {
-  const extra = parsePermissionsAttr(node);
+  let extra: Perms;
+  try {
+    extra = parsePermissionsAttr(node);
+  } catch {
+    // A malformed attr is validate()'s to report (node.bad-permissions, an error
+    // diagnostic the CLI refuses to write on). Assemble must stay non-throwing so
+    // that diagnostic actually reaches the user; emit the fragment unchanged —
+    // fail-closed, no extra scopes granted.
+    return fragment;
+  }
   if (!Object.keys(extra).length) return fragment;
   return { ...fragment, permissions: { ...fragment.permissions, ...extra } };
 }

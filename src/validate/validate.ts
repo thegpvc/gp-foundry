@@ -58,6 +58,18 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           hint: `write scopes as '<scope>: read|write|none', comma-separated — e.g. permissions="id-token: write"`,
         });
       }
+      // A scope granted on a node that emits no job would vanish silently, and the
+      // user would discover it as a cryptic runtime failure (e.g. OIDC federation
+      // erroring in a lane that never got id-token). Say so at build time instead.
+      if (n.type === "start" || n.type === "exit" || n.type === "parallel") {
+        diags.push({
+          level: "warning",
+          code: "node.permissions-ignored",
+          message: `permissions= on '${n.id}' (type ${n.type}) is ignored — this node emits no workflow job`,
+          where: { node: n.id, line: n.line },
+          hint: "move permissions= to the lane (job-emitting node) that needs the scope",
+        });
+      }
     }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({
