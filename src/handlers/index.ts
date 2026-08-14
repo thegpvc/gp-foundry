@@ -55,7 +55,8 @@ export function parsePermissionsAttr(node: HarnessNode): Perms {
         `node '${node.id}': bad permissions= entry '${entry.trim()}' — expected '<scope>: read|write|none', e.g. "id-token: write"`,
       );
     }
-    out[m[1]] = m[2] as Permission;
+    // Both groups are mandatory in the pattern, so a successful match has them.
+    out[m[1]!] = m[2] as Permission;
   }
   return out;
 }
