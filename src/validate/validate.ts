@@ -7,6 +7,7 @@
 import type { Diagnostic, Harness, HarnessEdge, HarnessNode, RoleSpec } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
+import { parsePermissionsAttr } from "../handlers/index.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 
 export interface ValidateDeps {
@@ -44,6 +45,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         message: `agent node '${n.id}' (type ${n.type}) needs a role="..." job description`,
         where: { node: n.id, line: n.line },
       });
+    }
+    if (n.attrs.permissions !== undefined) {
+      try {
+        parsePermissionsAttr(n);
+      } catch (e) {
+        diags.push({
+          level: "error",
+          code: "node.bad-permissions",
+          message: (e as Error).message,
+          where: { node: n.id, line: n.line },
+          hint: `write scopes as '<scope>: read|write|none', comma-separated — e.g. permissions="id-token: write"`,
+        });
+      }
     }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({

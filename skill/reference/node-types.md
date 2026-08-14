@@ -45,6 +45,7 @@ Rules of thumb:
 | `paths="memory/"` | `scheduled-agent` | optional allowlist of prefixes this lane may write; anything else is reverted before the push |
 | `commit="none\|pr\|direct"` | `scheduled-agent` | how the lane persists output: `direct` (default) commits to base; `pr` opens a reviewed PR; `none` no commit/push (read-only lane) |
 | `secrets="A,B"` | agent types | extra Actions secrets exposed to THIS lane's env (unioned with global `agent.secrets`); least-privilege scoping, e.g. a Sentry token only on the sweeper |
+| `permissions="id-token: write"` | any job-emitting type | extra GitHub token scopes merged into the job's `permissions:` block (the attr wins on conflict); comma-separated `<scope>: read\|write\|none`. The generic opt-in for GitHub-native capabilities — e.g. `id-token: write` lets a consumer-owned setup step mint an OIDC token and federate into a cloud provider, with all provider specifics in consumer-owned composites |
 | `policy="policy/merge.yaml"` | `merge-gate` | merge-policy file |
 | `schedule="*/30 * * * *"` | `merge-gate`, sweeps | cron cadence |
 | `environment=NAME` | `human-gate` | GitHub Environment gating approval (**required** on human-gate) |

@@ -26,6 +26,42 @@ import {
 
 type Perms = Record<string, Permission>;
 
+/**
+ * Per-node `permissions="id-token: write, packages: read"` — extra GitHub token
+ * scopes merged into the job's `permissions:` block (the attr wins on conflict).
+ * Deliberately generic: the compiler learns nothing about WHY a lane wants a
+ * scope. The motivating case is `id-token: write`, which lets a consumer-owned
+ * setup step mint a GitHub OIDC token and federate into a cloud provider — the
+ * provider specifics live in consumer-owned composites, never in gp-foundry.
+ * The shape is strict (kebab-case scope, read|write|none) so an attr value can
+ * never smuggle arbitrary YAML into the workflow.
+ */
+export function parsePermissionsAttr(node: HarnessNode): Perms {
+  const raw = node.attrs.permissions;
+  if (raw === undefined) return {};
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new Error(`node '${node.id}': permissions= must be a non-empty string like "id-token: write"`);
+  }
+  const out: Perms = {};
+  for (const entry of raw.split(",")) {
+    const m = /^\s*([a-z](?:[a-z-]*[a-z])?)\s*:\s*(read|write|none)\s*$/.exec(entry);
+    if (!m) {
+      throw new Error(
+        `node '${node.id}': bad permissions= entry '${entry.trim()}' — expected '<scope>: read|write|none', e.g. "id-token: write"`,
+      );
+    }
+    out[m[1]] = m[2] as Permission;
+  }
+  return out;
+}
+
+/** Merge the node's `permissions=` attr over the handler's defaults. */
+function withNodePermissions(node: HarnessNode, fragment: WorkflowJobFragment): WorkflowJobFragment {
+  const extra = parsePermissionsAttr(node);
+  if (!Object.keys(extra).length) return fragment;
+  return { ...fragment, permissions: { ...fragment.permissions, ...extra } };
+}
+
 const ISSUE_NUMBER = "${{ github.event.issue.number }}";
 const PR_NUMBER = "${{ github.event.pull_request.number }}";
 const PR_HEAD_SHA = "${{ github.event.pull_request.head.sha }}";
@@ -482,7 +518,7 @@ export function emitFanIn(ctx: EmitContext, legIds: string[], prScoped: boolean)
       }),
     );
   }
-  return {
+  return withNodePermissions(node, {
     jobId: node.id,
     name: node.id,
     needs: legIds,
@@ -491,7 +527,7 @@ export function emitFanIn(ctx: EmitContext, legIds: string[], prScoped: boolean)
       : { contents: "read", issues: "write" },
     timeoutMinutes: timeoutOf(node, 15),
     steps,
-  };
+  });
 }
 
 export type EmitFn = (ctx: EmitContext) => WorkflowJobFragment | null;
@@ -513,5 +549,6 @@ export const HANDLERS: Partial<Record<NodeType, EmitFn>> = {
 export function emitNode(node: HarnessNode, ir: Harness, ctx: EmitContext): WorkflowJobFragment | null {
   const fn = HANDLERS[node.type];
   if (!fn) return null;
-  return fn(ctx);
+  const fragment = fn(ctx);
+  return fragment && withNodePermissions(node, fragment);
 }
