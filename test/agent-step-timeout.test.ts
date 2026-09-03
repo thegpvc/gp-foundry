@@ -20,10 +20,15 @@ function jobOf(dot: string, jobId: string): any {
 }
 
 const DOT = `digraph t {
-  start   [type=start]
-  builder [type=producer, role="agents/roles/builder.md"]
-  sweeper [type=scheduled-agent, role="agents/roles/sweeper.md", schedule="0 8 * * *", commit=pr]
-  start -> builder [on="issues.opened"]
+  start    [type=start]
+  builder  [type=producer, role="agents/roles/builder.md"]
+  reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+  fixer    [type=pr-fix, role="agents/roles/fixer.md"]
+  sweeper  [type=scheduled-agent, role="agents/roles/sweeper.md", schedule="0 8 * * *", commit=pr]
+  start    -> builder  [on="issues.opened"]
+  builder  -> reviewer [on="pull_request.opened"]
+  reviewer -> fixer    [when="verdict=request_changes"]
+  fixer    -> reviewer [on="push"]
 }`;
 
 describe("agent step timeout (#12545)", () => {
@@ -54,5 +59,12 @@ describe("agent step timeout (#12545)", () => {
     const runAgent = job.steps.find((s: any) => s.name === "Run agent");
     expect(job["timeout-minutes"]).toBe(15);
     expect(runAgent["timeout-minutes"]).toBe(10);
+  });
+
+  it("budgets the Fixer's Run agent step too — it also has a push epilogue", () => {
+    const job = jobOf(DOT, "fixer");
+    const runAgent = job.steps.find((s: any) => s.name === "Run agent");
+    expect(job["timeout-minutes"]).toBe(30);
+    expect(runAgent["timeout-minutes"]).toBe(25);
   });
 });

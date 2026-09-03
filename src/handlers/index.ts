@@ -290,7 +290,13 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   const notExhausted = "steps.attempts.outputs.exhausted != 'true'";
   steps.push({ ...setupStep(), if: notExhausted });
   steps.push({ ...contextStep(ctx, "pr-review", PR_NUMBER), if: notExhausted }); // the Fixer needs the review feedback
-  steps.push({ ...runAgentStep(ctx, { withContext: true }), if: notExhausted });
+  // Step timeout below the job's keeps the commit/push epilogue reachable when a
+  // slow Fixer would otherwise trip the job timeout and be cancelled (#12545).
+  steps.push({
+    ...runAgentStep(ctx, { withContext: true }),
+    if: notExhausted,
+    timeoutMinutes: agentStepTimeout(timeoutOf(node, 30)),
+  });
   steps.push(
     runStep({
       name: "Commit and push fixes",
@@ -319,7 +325,6 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
     name: node.id,
     permissions: { contents: "write", "pull-requests": "write" },
     timeoutMinutes: timeoutOf(node, 30),
-    // (agent step budgeted below this via agentStepTimeout above)
     steps,
   };
 }
