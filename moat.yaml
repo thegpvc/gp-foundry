@@ -1,4 +1,5 @@
 name: gp-foundry
+agents: [claude, codex]
 interactive: true
 runtime: docker
 
@@ -21,6 +22,5 @@ dependencies:
   - python
 
 grants:
-  - claude
   - github
   - ssh:github.com
