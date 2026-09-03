@@ -23,6 +23,8 @@ import {
   filterCountableVerdicts,
   latestValidApproval,
   normalizePolicyKeys,
+  parseDependabotBump,
+  DEPENDABOT_LOGIN,
   type CheckRunFact,
   type MergePolicy,
   type PullRequestFacts,
@@ -164,13 +166,17 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   if (overrideRebase === "true") cleanRebase = true;
   else if (overrideRebase === "false") cleanRebase = false;
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase };
+  const authorLogin = pr.user?.login;
+  const dependabotUpdateType = authorLogin === DEPENDABOT_LOGIN ? parseDependabotBump(pr.title) : undefined;
+
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType };
 }
 
-/** Open PRs on branch-prefix branches targeting base, oldest first. */
+/** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
 async function listCandidates(octokit: Octokit, owner: string, repo: string, policy: PolicyFile, base: string): Promise<number[]> {
   const prs = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base, sort: "created", direction: "asc", per_page: 100 });
-  return filterCandidateNumbers(prs.map((p) => ({ number: p.number, headRefName: p.head.ref })), policy.branchPrefix);
+  const includeDependabot = (policy.dependabot?.autoMerge?.length ?? 0) > 0;
+  return filterCandidateNumbers(prs.map((p) => ({ number: p.number, headRefName: p.head.ref })), policy.branchPrefix, includeDependabot);
 }
 
 async function comment(octokit: Octokit, owner: string, repo: string, prNumber: number, body: string): Promise<void> {

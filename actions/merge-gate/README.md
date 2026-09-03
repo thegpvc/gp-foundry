@@ -119,6 +119,17 @@ requiredChecks:                          # must be PRESENT and green on the head
 labels:
   needsHuman: "needs-human"
   rebaseNeeded: "rebase-needed"
+  awaitingApproval: "awaiting-approval"  # optional: label a ready-but-unapproved PR
+                                         # instead of skipping it silently. Must NOT
+                                         # be in blockingLabels; removed on approval.
+
+# Dependabot lane (optional). PRs authored by `dependabot[bot]` (verified by
+# author, not branch name) are scored separately: no human approval, but only
+# the listed semver levels auto-merge, and only with green CI and no protected
+# paths. Major / unparseable / failing / protected-path updates get needsHuman.
+# Omit the block to leave dependabot PRs untouched.
+dependabot:
+  autoMerge: ["patch", "minor"]
 
 # who may approve (see "Who can approve"):
 botLogin: "my-agent[bot]"

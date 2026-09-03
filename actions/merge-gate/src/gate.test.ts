@@ -14,6 +14,8 @@ import {
   type CheckRunFact,
   filterCountableVerdicts,
   latestValidApproval,
+  parseDependabotBump,
+  DEPENDABOT_LOGIN,
   type PullRequestFacts,
   type MergePolicy,
   type VerdictEvent,
@@ -723,5 +725,126 @@ describe("check-runs permission failure explains the wiring, not a nonexistent s
     const msg = describeCheckRunsFailure({ status: 502, message: "Bad gateway" });
     expect(msg).toContain("Bad gateway");
     expect(msg).not.toContain("checks-token");
+  });
+});
+
+describe("parseDependabotBump", () => {
+  it("classifies patch / minor / major", () => {
+    expect(parseDependabotBump("Bump lodash from 4.17.20 to 4.17.21")).toBe("patch");
+    expect(parseDependabotBump("Bump lodash from 4.17.20 to 4.18.0")).toBe("minor");
+    expect(parseDependabotBump("Bump react-router from 6.22.3 to 7.5.2 in /react")).toBe("major");
+    expect(parseDependabotBump("Bump axios from 0.28.0 to 1.8.2 in /icebreaker")).toBe("major");
+  });
+  it("tolerates a v prefix and prerelease/build suffixes", () => {
+    expect(parseDependabotBump("Bump pkg from v1.2.3 to v1.2.4")).toBe("patch");
+    expect(parseDependabotBump("Bump pkg from 1.2.3-beta.1 to 1.3.0")).toBe("minor");
+  });
+  it("is unknown for group updates, non-semver, or missing titles", () => {
+    expect(parseDependabotBump("Bump the babel group with 5 updates")).toBe("unknown");
+    expect(parseDependabotBump("Bump pkg from latest to newest")).toBe("unknown");
+    expect(parseDependabotBump(undefined)).toBe("unknown");
+  });
+});
+
+describe("dependabot lane (#deps)", () => {
+  const dependabotPolicy: MergePolicy = {
+    ...policy,
+    dependabot: { autoMerge: ["patch", "minor"] },
+  };
+  /** A dependabot PR: verified author, lockfile-only, CI green, no approval. */
+  function dependabotPr(overrides: Partial<PullRequestFacts> = {}): PullRequestFacts {
+    return {
+      number: 900,
+      title: "Bump lodash from 4.17.20 to 4.17.21",
+      headRefName: "dependabot/npm_and_yarn/lodash-4.17.21",
+      authorLogin: DEPENDABOT_LOGIN,
+      dependabotUpdateType: "patch",
+      labels: [],
+      ciStatus: "passing",
+      approvedAt: null, // no human approval — the lane doesn't need one
+      files: [{ path: "yarn.lock", additions: 40, deletions: 12 }],
+      cleanRebase: true,
+      ...overrides,
+    };
+  }
+
+  it("auto-merges a patch bump with green CI and no human approval", () => {
+    const d = evaluateMergeGate(dependabotPr(), dependabotPolicy, NOW);
+    expect(d.action).toBe("merge");
+    expect(d.code).toBe("dependabot-ready");
+  });
+
+  it("auto-merges a minor bump", () => {
+    const d = evaluateMergeGate(dependabotPr({ dependabotUpdateType: "minor" }), dependabotPolicy, NOW);
+    expect(d.action).toBe("merge");
+  });
+
+  it("routes a major bump to a human", () => {
+    const d = evaluateMergeGate(dependabotPr({ dependabotUpdateType: "major" }), dependabotPolicy, NOW);
+    expect(d.action).toBe("label");
+    expect(d.code).toBe("dependabot-review");
+    expect(d.label).toBe("needs-human");
+  });
+
+  it("routes an unknown/group update to a human", () => {
+    const d = evaluateMergeGate(dependabotPr({ dependabotUpdateType: "unknown" }), dependabotPolicy, NOW);
+    expect(d.code).toBe("dependabot-review");
+    expect(d.label).toBe("needs-human");
+  });
+
+  it("routes failing CI to a human, but waits on pending CI", () => {
+    const failing = evaluateMergeGate(dependabotPr({ ciStatus: "failing" }), dependabotPolicy, NOW);
+    expect(failing.action).toBe("label");
+    expect(failing.code).toBe("ci-not-passing");
+    const pending = evaluateMergeGate(dependabotPr({ ciStatus: "pending" }), dependabotPolicy, NOW);
+    expect(pending.action).toBe("skip");
+    expect(pending.code).toBe("ci-not-passing");
+  });
+
+  it("routes a protected-path touch to a human", () => {
+    const d = evaluateMergeGate(
+      dependabotPr({ files: [{ path: ".github/workflows/ci.yml", additions: 2, deletions: 0 }] }),
+      dependabotPolicy,
+      NOW,
+    );
+    expect(d.code).toBe("protected-path");
+    expect(d.label).toBe("needs-human");
+  });
+
+  it("does NOT trust the branch name — a non-dependabot author on a dependabot/ branch falls to the agent lane", () => {
+    const d = evaluateMergeGate(
+      dependabotPr({ authorLogin: "mallory", dependabotUpdateType: undefined }),
+      dependabotPolicy,
+      NOW,
+    );
+    expect(d.code).toBe("wrong-branch"); // agent lane rejects the dependabot/ prefix
+  });
+
+  it("is a silent skip when the dependabot lane is not configured", () => {
+    const d = evaluateMergeGate(dependabotPr(), policy, NOW); // policy has no dependabot block
+    expect(d.action).toBe("skip");
+    expect(d.code).toBe("dependabot-disabled");
+  });
+
+  it("still honors blocking labels ahead of the lane", () => {
+    const d = evaluateMergeGate(dependabotPr({ labels: ["needs-human"] }), dependabotPolicy, NOW);
+    expect(d.code).toBe("blocking-label");
+  });
+
+  it("only auto-merges the configured levels (patch-only policy holds a minor)", () => {
+    const patchOnly: MergePolicy = { ...policy, dependabot: { autoMerge: ["patch"] } };
+    expect(evaluateMergeGate(dependabotPr(), patchOnly, NOW).action).toBe("merge");
+    const minor = evaluateMergeGate(dependabotPr({ dependabotUpdateType: "minor" }), patchOnly, NOW);
+    expect(minor.code).toBe("dependabot-review");
+  });
+
+  it("includes dependabot/ branches as candidates only when the lane is on", () => {
+    const prs = [
+      { number: 1, headRefName: "agent/foo" },
+      { number: 2, headRefName: "dependabot/npm_and_yarn/lodash" },
+      { number: 3, headRefName: "feature/bar" },
+    ];
+    expect(filterCandidateNumbers(prs, "agent/", true)).toEqual([1, 2]);
+    expect(filterCandidateNumbers(prs, "agent/", false)).toEqual([1]);
   });
 });

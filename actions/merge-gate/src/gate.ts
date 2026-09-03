@@ -57,6 +57,17 @@ export interface PullRequestFacts {
   checkRuns?: CheckRunFact[];
   /** Head branch name, e.g. "agent/foo". */
   headRefName: string;
+  /**
+   * The PR author's login. The dependabot lane keys off this being exactly
+   * `dependabot[bot]` — the branch name (`dependabot/…`) is not trusted, since
+   * anyone can push a branch by that name.
+   */
+  authorLogin?: string;
+  /**
+   * For a dependabot PR, the semver level of the bump parsed from the title
+   * (see parseDependabotBump). `undefined` for non-dependabot PRs.
+   */
+  dependabotUpdateType?: DependabotBump;
   /** Base branch name, e.g. "main" (used in operator-facing messages). */
   baseRefName?: string;
   /** Labels currently on the PR (names only). */
@@ -141,6 +152,39 @@ export interface MergePolicy {
      */
     awaitingApproval?: string;
   };
+  /**
+   * Dependabot lane. When configured, PRs authored by `dependabot[bot]` are
+   * evaluated on a separate track from agent PRs: no human approval is required,
+   * but the bump must be a semver level in `autoMerge`, CI must pass, and no
+   * protected path may be touched. Anything else is routed to a human via the
+   * needsHuman label. Omit the block to leave dependabot PRs untouched.
+   */
+  dependabot?: {
+    /** Semver levels to auto-merge without a human, e.g. ["patch", "minor"]. */
+    autoMerge?: DependabotBump[];
+  };
+}
+
+/** Semver level of a dependabot bump; "unknown" when the title can't be parsed. */
+export type DependabotBump = "patch" | "minor" | "major" | "unknown";
+
+/** The exact author login a genuine dependabot PR carries. */
+export const DEPENDABOT_LOGIN = "dependabot[bot]";
+
+/**
+ * Classify a dependabot PR title ("Bump X from 1.2.3 to 1.3.0") by semver level.
+ * Group/monorepo updates and non-semver versions yield "unknown", which the lane
+ * treats as needs-a-human — the safe default.
+ */
+export function parseDependabotBump(title?: string): DependabotBump {
+  if (!title) return "unknown";
+  const m = /\bfrom\s+v?(\d+)\.(\d+)\.(\d+)[^\s]*\s+to\s+v?(\d+)\.(\d+)\.(\d+)/i.exec(title);
+  if (!m) return "unknown";
+  const from = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const to = [Number(m[4]), Number(m[5]), Number(m[6])];
+  if (to[0] !== from[0]) return "major";
+  if (to[1] !== from[1]) return "minor";
+  return "patch";
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -160,7 +204,11 @@ export type MergeReasonCode =
   | "required-check-missing"
   | "too-large"
   | "protected-path"
-  | "rebase-needed";
+  | "rebase-needed"
+  // dependabot lane
+  | "dependabot-ready"
+  | "dependabot-review"
+  | "dependabot-disabled";
 
 export interface MergeDecision {
   action: MergeAction;
@@ -177,6 +225,8 @@ export interface MergeDecision {
     protectedPath?: string;
     /** For `required-check-missing`: the check that is absent or not yet green. */
     requiredCheck?: string;
+    /** For the dependabot lane: the parsed semver level of the bump. */
+    updateType?: DependabotBump;
   };
 }
 
@@ -366,8 +416,20 @@ export function normalizePolicyKeys(v: unknown): unknown {
 export function filterCandidateNumbers(
   prs: { number: number; headRefName: string }[],
   branchPrefix?: string,
+  includeDependabot = false,
 ): number[] {
-  return prs.filter((p) => !branchPrefix || p.headRefName.startsWith(branchPrefix)).map((p) => p.number);
+  return prs
+    .filter(
+      (p) =>
+        !branchPrefix ||
+        p.headRefName.startsWith(branchPrefix) ||
+        // Cheap candidate widening only — the dependabot lane still verifies the
+        // real author before acting, so a spoofed `dependabot/` branch that isn't
+        // actually from dependabot[bot] falls through to the agent lane and is
+        // rejected as a wrong-branch PR.
+        (includeDependabot && p.headRefName.startsWith("dependabot/")),
+    )
+    .map((p) => p.number);
 }
 
 /** Does a review/comment body match the approval regex (e.g. "Verdict.*APPROVE")? */
@@ -475,6 +537,106 @@ export function latestValidApproval(
 /**
  * Evaluate the merge gate for a single PR against a policy.
  *
+ * The dependabot lane. Reached only for PRs whose author is exactly
+ * dependabot[bot] (verified upstream). No human approval — the trust comes from
+ * the update being a safe semver level with green CI and no protected paths.
+ * Order: config present → update type → size → protected paths → CI → rebase →
+ * merge. Anything not auto-mergeable is routed to a human via needsHuman;
+ * a still-pending CI waits (plain skip) rather than escalating.
+ */
+function evaluateDependabotLane(
+  pr: PullRequestFacts,
+  policy: MergePolicy,
+  needsHumanLabel: string | undefined,
+  rebaseNeededLabel: string | undefined,
+): MergeDecision {
+  const autoMerge = policy.dependabot?.autoMerge ?? [];
+  const requireCi = policy.requireCi ?? true;
+  const requireCleanRebase = policy.requireCleanRebase ?? true;
+  const maxAdditions = policy.maxAdditions ?? Number.POSITIVE_INFINITY;
+  const bump = pr.dependabotUpdateType ?? "unknown";
+
+  // Feature off unless a consumer opted in.
+  if (autoMerge.length === 0) {
+    return {
+      action: "skip",
+      code: "dependabot-disabled",
+      reason: `dependabot auto-merge is not configured`,
+    };
+  }
+
+  // Only the configured semver levels auto-merge. Major and unparseable
+  // (group/monorepo/non-semver) updates go to a human — the risky ones.
+  if (bump === "major" || bump === "unknown" || !autoMerge.includes(bump)) {
+    return {
+      action: needsHumanLabel ? "label" : "skip",
+      code: "dependabot-review",
+      reason: `dependabot \`${bump}\` update needs a human (auto-merge covers ${autoMerge.join(" / ") || "nothing"})`,
+      label: needsHumanLabel,
+      detail: { updateType: bump },
+    };
+  }
+
+  // A dependency bump is manifest + lockfile only; real source or protected-path
+  // changes are off-pattern for dependabot, so hand them to a human.
+  const handAdditions = handWrittenAdditions(pr.files, policy.excludeGlobs);
+  if (handAdditions > maxAdditions) {
+    return {
+      action: needsHumanLabel ? "label" : "skip",
+      code: "too-large",
+      reason: `dependabot diff too large (+${handAdditions} hand-written additions, limit +${maxAdditions})`,
+      label: needsHumanLabel,
+      detail: { handAdditions },
+    };
+  }
+  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+  if (protectedPath) {
+    return {
+      action: needsHumanLabel ? "label" : "skip",
+      code: "protected-path",
+      reason: `dependabot PR touches protected path \`${protectedPath}\``,
+      label: needsHumanLabel,
+      detail: { protectedPath },
+    };
+  }
+
+  // CI: a definite failure is a human's problem; a pending/unknown rollup just
+  // waits for the next poll rather than escalating a transient state.
+  if (requireCi && pr.ciStatus !== "passing") {
+    if (pr.ciStatus === "failing") {
+      return {
+        action: needsHumanLabel ? "label" : "skip",
+        code: "ci-not-passing",
+        reason: `dependabot PR CI is \`failing\``,
+        label: needsHumanLabel,
+      };
+    }
+    return {
+      action: "skip",
+      code: "ci-not-passing",
+      reason: `dependabot PR CI is \`${pr.ciStatus}\` (waiting)`,
+    };
+  }
+
+  // Clean rebase (reuses the janitor rebase-label path).
+  if (requireCleanRebase && pr.cleanRebase !== true) {
+    return {
+      action: rebaseNeededLabel ? "label" : "skip",
+      code: "rebase-needed",
+      reason: pr.cleanRebase === false ? `rebase conflicts with base branch` : `rebase status not yet verified`,
+      label: rebaseNeededLabel,
+    };
+  }
+
+  return {
+    action: "merge",
+    code: "dependabot-ready",
+    reason: `dependabot \`${bump}\` update, CI passing, no protected paths — auto-merging (no human review required)`,
+    detail: { handAdditions, updateType: bump },
+  };
+}
+
+/**
  * Ordering mirrors the original Shipper (cheapest / most-disqualifying checks
  * first): blocking labels → branch → approval → approval delay → CI → required
  * checks → size → protected paths → rebase → merge. Returns the FIRST failing
@@ -499,7 +661,7 @@ export function evaluateMergeGate(
   const rebaseNeededLabel = policy.labels?.rebaseNeeded;
   const awaitingApprovalLabel = policy.labels?.awaitingApproval;
 
-  // 1) Blocking labels (needs-human / rebase-needed / …)
+  // 1) Blocking labels (needs-human / rebase-needed / …) — shared by both lanes.
   const offendingLabel = blockingLabels.find((l) => pr.labels.includes(l));
   if (offendingLabel) {
     return {
@@ -507,6 +669,12 @@ export function evaluateMergeGate(
       code: "blocking-label",
       reason: `PR #${pr.number} carries blocking label \`${offendingLabel}\``,
     };
+  }
+
+  // Lane split: a genuine dependabot PR is scored on its own track (no human
+  // approval, but only safe semver bumps). Author, not branch name, is the gate.
+  if (pr.authorLogin === DEPENDABOT_LOGIN) {
+    return evaluateDependabotLane(pr, policy, needsHumanLabel, rebaseNeededLabel);
   }
 
   // 2) Branch prefix
