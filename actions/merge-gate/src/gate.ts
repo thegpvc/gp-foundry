@@ -132,6 +132,14 @@ export interface MergePolicy {
     needsHuman?: string;
     /** Applied when the rebase is not clean. */
     rebaseNeeded?: string;
+    /**
+     * Applied when the PR clears every automated check but is only waiting on a
+     * human approval — the "ready, someone please look" state that was otherwise
+     * a silent skip (#12559). MUST NOT appear in blockingLabels, or the PR it
+     * marks could never merge; the gate removes it again once the PR is approved
+     * or another reason applies.
+     */
+    awaitingApproval?: string;
   };
 }
 
@@ -489,6 +497,7 @@ export function evaluateMergeGate(
   const maxAdditions = policy.maxAdditions ?? Number.POSITIVE_INFINITY;
   const needsHumanLabel = policy.labels?.needsHuman;
   const rebaseNeededLabel = policy.labels?.rebaseNeeded;
+  const awaitingApprovalLabel = policy.labels?.awaitingApproval;
 
   // 1) Blocking labels (needs-human / rebase-needed / …)
   const offendingLabel = blockingLabels.find((l) => pr.labels.includes(l));
@@ -509,11 +518,14 @@ export function evaluateMergeGate(
     };
   }
 
-  // 3) Bot-approval present
+  // 3) Bot-approval present. A ready-but-unapproved PR becomes a visible
+  //    `awaiting-approval` label when one is configured (else a silent skip, as
+  //    before) so it can be found and approved instead of sitting unseen (#12559).
   if (pr.approvedAt === undefined || pr.approvedAt === null || pr.approvedAt === "") {
     return {
-      action: "skip",
+      action: awaitingApprovalLabel ? "label" : "skip",
       code: "not-approved",
+      label: awaitingApprovalLabel,
       reason: `PR #${pr.number} has no qualifying approval`,
     };
   }
@@ -522,8 +534,9 @@ export function evaluateMergeGate(
   const approvedMs = parseTimestamp(pr.approvedAt);
   if (Number.isNaN(approvedMs)) {
     return {
-      action: "skip",
+      action: awaitingApprovalLabel ? "label" : "skip",
       code: "not-approved",
+      label: awaitingApprovalLabel,
       reason: `PR #${pr.number} has an unparseable approval timestamp`,
     };
   }

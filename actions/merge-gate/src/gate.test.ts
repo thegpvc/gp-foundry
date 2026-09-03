@@ -175,6 +175,44 @@ describe("bot-approval present", () => {
     expect(d.code).toBe("not-approved");
     expect(d.reason).toContain("unparseable");
   });
+
+  it("skips (no label) when no awaitingApproval label is configured", () => {
+    // policy has no labels.awaitingApproval — back-compat: a silent skip.
+    const d = evaluateMergeGate(readyPr({ approvedAt: null }), policy, NOW);
+    expect(d.action).toBe("skip");
+    expect(d.label).toBeUndefined();
+  });
+});
+
+describe("awaiting-approval label (#12559)", () => {
+  const labeledPolicy: MergePolicy = {
+    ...policy,
+    labels: { ...policy.labels, awaitingApproval: "awaiting-approval" },
+  };
+
+  it("labels a ready-but-unapproved PR instead of skipping silently", () => {
+    const d = evaluateMergeGate(readyPr({ approvedAt: null }), labeledPolicy, NOW);
+    expect(d.action).toBe("label");
+    expect(d.code).toBe("not-approved");
+    expect(d.label).toBe("awaiting-approval");
+  });
+
+  it("labels on an unparseable approval timestamp too", () => {
+    const d = evaluateMergeGate(readyPr({ approvedAt: "not-a-date" }), labeledPolicy, NOW);
+    expect(d.action).toBe("label");
+    expect(d.label).toBe("awaiting-approval");
+  });
+
+  it("does NOT label once the PR is approved — it proceeds to merge", () => {
+    const d = evaluateMergeGate(readyPr(), labeledPolicy, NOW);
+    expect(d.action).toBe("merge");
+    expect(d.label).toBeUndefined();
+  });
+
+  it("a blocking reason still wins over the awaiting-approval label", () => {
+    const d = evaluateMergeGate(readyPr({ approvedAt: null, labels: ["needs-human"] }), labeledPolicy, NOW);
+    expect(d.code).toBe("blocking-label");
+  });
 });
 
 describe("approval delay", () => {

@@ -87,6 +87,16 @@ function timeoutOf(node: HarnessNode, dflt: number): number {
   return typeof t === "number" ? t : dflt;
 }
 
+// The agent step gets a timeout below the job's own, so an over-running agent
+// fails its STEP — leaving the job un-cancelled — instead of tripping the job
+// timeout, which cancels the job and skips the `!cancelled()` salvage that
+// pushes the work already done (#12545). The margin is the time the fallback
+// (commit / push / open-PR) needs after the agent stops.
+const AGENT_STEP_FALLBACK_MARGIN = 5;
+function agentStepTimeout(jobTimeout: number): number {
+  return Math.max(1, jobTimeout - AGENT_STEP_FALLBACK_MARGIN);
+}
+
 function preamble(ctx: EmitContext, checkout?: Parameters<typeof checkoutStep>[1]): StepSpec[] {
   const steps: StepSpec[] = [];
   const app = appTokenStep(ctx);
@@ -196,9 +206,10 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
       ].join("\n"),
     }),
   );
+  const jobTimeout = timeoutOf(node, 30);
   steps.push(setupStep());
   steps.push(contextStep(ctx, "issue", ISSUE_NUMBER));
-  steps.push(runAgentStep(ctx, { withContext: true }));
+  steps.push({ ...runAgentStep(ctx, { withContext: true }), timeoutMinutes: agentStepTimeout(jobTimeout) });
   steps.push({
     uses: ctx.actionRef("agent-fallback"),
     name: "Fallback: commit / push / PR",
@@ -221,7 +232,7 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
     jobId: node.id,
     name: node.id,
     permissions: { contents: "write", "pull-requests": "write", issues: "write" },
-    timeoutMinutes: timeoutOf(node, 30),
+    timeoutMinutes: jobTimeout,
     steps,
   };
 }
@@ -308,6 +319,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
     name: node.id,
     permissions: { contents: "write", "pull-requests": "write" },
     timeoutMinutes: timeoutOf(node, 30),
+    // (agent step budgeted below this via agentStepTimeout above)
     steps,
   };
 }
@@ -459,7 +471,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   }
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
-  steps.push(runAgentStep(ctx, { withContext: false }));
+  steps.push({ ...runAgentStep(ctx, { withContext: false }), timeoutMinutes: agentStepTimeout(timeoutOf(node, 15)) });
   if (commit === "pr") {
     // Output lands on the agent branch and opens a PR — reviewed and gated, never a
     // direct base-branch write. `!cancelled()` salvages partial work behind the review.

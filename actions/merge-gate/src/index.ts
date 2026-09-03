@@ -184,7 +184,34 @@ async function comment(octokit: Octokit, owner: string, repo: string, prNumber: 
 async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNumber: number, facts: PullRequestFacts, decision: MergeDecision, policy: PolicyFile, dryRun: boolean): Promise<boolean> {
   core.info(`PR #${prNumber}: ${decision.action} (${decision.code}) — ${decision.reason}`);
   if (dryRun) return false;
+
+  // Reconcile the awaiting-approval label: it is a non-blocking "ready, please
+  // approve" marker, so it must come off the moment that stops being true (the
+  // PR got approved and moved on, or another reason now applies). Runs before the
+  // action below, so a PR that just got approved is de-labeled and then merged.
+  const awaitingLabel = policy.labels?.awaitingApproval;
+  if (
+    awaitingLabel &&
+    facts.labels.includes(awaitingLabel) &&
+    !(decision.action === "label" && decision.label === awaitingLabel)
+  ) {
+    try {
+      await octokit.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: awaitingLabel });
+      core.info(`Removed stale \`${awaitingLabel}\` from PR #${prNumber}`);
+    } catch (e) {
+      core.debug(`Could not remove \`${awaitingLabel}\` from #${prNumber}: ${(e as Error).message}`);
+    }
+  }
+
   if (decision.action === "label" && decision.label) {
+    // Idempotent: apply and explain only on the FIRST run that reaches this
+    // label. Blocking labels (needs-human / needs-rebase) short-circuit on the
+    // next poll so they never re-comment anyway; a NON-blocking label like
+    // awaiting-approval would otherwise re-comment every cadence — so guard here.
+    if (facts.labels.includes(decision.label)) {
+      core.info(`PR #${prNumber} already labeled \`${decision.label}\``);
+      return false;
+    }
     await octokit.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [decision.label] });
     core.info(`Labeled PR #${prNumber} \`${decision.label}\``);
     // Explain why it was held back (skipped plain-skips stay quiet; a label is a real block).

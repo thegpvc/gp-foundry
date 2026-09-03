@@ -55,7 +55,20 @@ runs:
 
     - name: Install Claude Code
       shell: bash
-      run: npm install -g @anthropic-ai/claude-code
+      run: |
+        set -euo pipefail
+        npm install -g @anthropic-ai/claude-code
+        # npm can exit 0 having silently dropped the platform-native binary — the
+        # optionalDependencies flake (npm/cli#4828), or a runner with ignore-scripts
+        # set so the postinstall that fetches it never runs. The lane then dies at
+        # "Run agent" with no comment (#12567). Verify, and on failure reinstall
+        # with lifecycle scripts forced before failing the job loudly rather than
+        # stranding the trigger.
+        if ! claude --version >/dev/null 2>&1; then
+          echo "::warning::claude binary missing after install — reinstalling with scripts forced (#12567)"
+          npm install -g @anthropic-ai/claude-code --ignore-scripts=false --foreground-scripts
+          claude --version
+        fi
 
     - name: Install protoc
       if: inputs.install-protoc == 'true'

@@ -38,6 +38,7 @@ function stepToObject(s: StepSpec): Record<string, unknown> {
   if (s.name) o.name = s.name;
   if (s.id) o.id = s.id;
   if (s.if) o.if = s.if;
+  if (s.timeoutMinutes) o["timeout-minutes"] = s.timeoutMinutes;
   if (isUsesStep(s)) {
     o.uses = s.uses;
     if (s.with && Object.keys(s.with).length) o.with = s.with;

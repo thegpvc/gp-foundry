@@ -189,6 +189,8 @@ export interface UsesStep {
   id?: string;
   name?: string;
   if?: string;
+  /** step-level timeout; fails the step (not cancels the job) so guarded epilogues still run. */
+  timeoutMinutes?: number;
   with?: Record<string, AttrValue>;
 }
 
@@ -197,6 +199,8 @@ export interface RunStep {
   id?: string;
   name?: string;
   if?: string;
+  /** step-level timeout; fails the step (not cancels the job) so guarded epilogues still run. */
+  timeoutMinutes?: number;
   shell?: string;
   env?: Record<string, string>;
 }
