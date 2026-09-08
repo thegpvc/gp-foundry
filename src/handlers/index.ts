@@ -90,9 +90,16 @@ function timeoutOf(node: HarnessNode, dflt: number): number {
 // The agent step gets a timeout below the job's own, so an over-running agent
 // fails its STEP — leaving the job un-cancelled — instead of tripping the job
 // timeout, which cancels the job and skips the `!cancelled()` salvage that
-// pushes the work already done (#12545). The margin is the time the fallback
-// (commit / push / open-PR) needs after the agent stops.
-const AGENT_STEP_FALLBACK_MARGIN = 5;
+// pushes the work already done (#12545). The margin must clear TWO things the step
+// cap does not: the `Setup agent toolchain` step that runs BEFORE the agent (a
+// cold-cache toolchain install is ~7 min) and the commit/push/open-PR salvage
+// AFTER it. If the margin is smaller than a cold setup, the agent step can never
+// reach its own cap before the JOB cap fires — the job is cancelled mid-agent and
+// the salvage is skipped (#12611: sentry_sweeper cancelled at 1/3 on a cold run).
+// 10 min covers a ~7-min cold setup with ~3 min of salvage headroom. The lane
+// defaults below were each raised by this same +5 so that, after the wider margin,
+// every derived step cap is unchanged from the old 5-min-margin behavior.
+const AGENT_STEP_FALLBACK_MARGIN = 10;
 function agentStepTimeout(jobTimeout: number): number {
   return Math.max(1, jobTimeout - AGENT_STEP_FALLBACK_MARGIN);
 }
@@ -206,7 +213,7 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
       ].join("\n"),
     }),
   );
-  const jobTimeout = timeoutOf(node, 30);
+  const jobTimeout = timeoutOf(node, 35);
   steps.push(setupStep());
   steps.push(contextStep(ctx, "issue", ISSUE_NUMBER));
   steps.push({ ...runAgentStep(ctx, { withContext: true }), timeoutMinutes: agentStepTimeout(jobTimeout) });
@@ -295,7 +302,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   steps.push({
     ...runAgentStep(ctx, { withContext: true }),
     if: notExhausted,
-    timeoutMinutes: agentStepTimeout(timeoutOf(node, 30)),
+    timeoutMinutes: agentStepTimeout(timeoutOf(node, 35)),
   });
   steps.push(
     runStep({
@@ -324,7 +331,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
     jobId: node.id,
     name: node.id,
     permissions: { contents: "write", "pull-requests": "write" },
-    timeoutMinutes: timeoutOf(node, 30),
+    timeoutMinutes: timeoutOf(node, 35),
     steps,
   };
 }
@@ -476,7 +483,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   }
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
-  steps.push({ ...runAgentStep(ctx, { withContext: false }), timeoutMinutes: agentStepTimeout(timeoutOf(node, 15)) });
+  steps.push({ ...runAgentStep(ctx, { withContext: false }), timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
   if (commit === "pr") {
     // Output lands on the agent branch and opens a PR — reviewed and gated, never a
     // direct base-branch write. `!cancelled()` salvages partial work behind the review.
@@ -521,7 +528,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
     // `actions: write` lets maintenance roles inspect and re-run workflow runs
     // (the supervisor's `gh run list` / `gh run rerun` re-drive path).
     permissions: { contents: "write", issues: "write", "pull-requests": "write", actions: "write" },
-    timeoutMinutes: timeoutOf(node, 15),
+    timeoutMinutes: timeoutOf(node, 20),
     steps,
   };
 }
