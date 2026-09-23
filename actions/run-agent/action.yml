@@ -73,6 +73,21 @@ inputs:
       (passthrough for flags like --max-turns, --add-dir, etc.).
     required: false
     default: ""
+  max-attempts:
+    description: >-
+      How many times to run the CLI when it exits non-zero for a reason that is
+      not the agent's fault — an overloaded or 5xx API response, a dropped
+      connection. A genuine agent error is never retried, and neither is a
+      usage/session limit, which clears on a wall-clock schedule rather than in
+      seconds. Set to 1 to disable retrying.
+    required: false
+    default: "3"
+  retry-base-delay-seconds:
+    description: >-
+      Seconds to wait before the second attempt. Each further attempt doubles
+      it, so the default gives 15s and then 30s.
+    required: false
+    default: "15"
   extra-env:
     description: >-
       Optional newline-separated NAME=VALUE pairs exported into the agent's
@@ -173,6 +188,8 @@ runs:
         ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
         EXTRA_ARGS: ${{ inputs.extra-args }}
         EXTRA_ENV: ${{ inputs.extra-env }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+        RETRY_BASE_DELAY_SECONDS: ${{ inputs.retry-base-delay-seconds }}
       run: |
         set -uo pipefail
 
@@ -215,24 +232,108 @@ runs:
         fi
 
         STDERR_LOG="$(mktemp)"
+        STDOUT_LOG="$(mktemp)"
+        EXIT_FILE="$(mktemp)"
+
+        # classify_failure names why an attempt died, read from the tail of what
+        # the CLI produced. The CLI prints its terminal error last, so a bounded
+        # window keeps an agent that merely *mentioned* rate limiting mid-run
+        # from being mistaken for one that hit it.
+        classify_failure() {
+          combined="$(tail -n 20 "$1" 2>/dev/null; tail -n 20 "$2" 2>/dev/null)"
+
+          # A usage wall clears at a wall-clock reset that is routinely tens of
+          # minutes out — far past any step budget — so retrying here only burns
+          # the runner. Terminal, but it gets its own message: this is a capacity
+          # problem, and reading it as a broken agent sends people to the wrong
+          # place. Observed shape: "You've hit your session limit · resets 9:20am (UTC)".
+          if printf '%s' "$combined" | grep -qiE "hit your (session|usage) limit|usage limit reached|quota exceeded"; then
+            printf 'quota'
+            return
+          fi
+
+          # Server-side and connection failures clear in seconds. Observed shape:
+          # "API Error: 529 Overloaded. This is a server-side issue, usually temporary".
+          if printf '%s' "$combined" | grep -qiE "api error: 5[0-9]{2}|overloaded|internal server error|bad gateway|service unavailable|gateway timeout|connection (reset|refused|closed)|econnreset|etimedout|socket hang up|network error"; then
+            printf 'transient'
+            return
+          fi
+
+          printf 'fatal'
+        }
 
         # Capture the agent's exit code instead of swallowing it: a dead agent must
         # be RED, not a green no-op — that's what lets a human (or the supervisor
         # sweep) notice and re-drive the work. Fallback steps in the generated
         # workflow run `if: !cancelled()`, so partial work is still salvaged.
         # stderr goes to a file (not streamed) so it surfaces as one grouped warning.
+        #
+        # Retrying assumes a role can be re-run, which the harness already relies
+        # on everywhere else: the scheduled lanes re-run on their cron, agent_refire
+        # re-fires label lanes, and the supervisor re-drives stranded work. Roles
+        # are written to read current state (labels, existing PRs, prior comments)
+        # before acting for exactly that reason. A consumer that has a lane where
+        # that does not hold can set max-attempts: 1.
         AGENT_EXIT=0
-        # shellcheck disable=SC2086
-        claude -p "$(cat "$PROMPT_FILE")" \
-          --model "$MODEL" \
-          --allowedTools "$ALLOWED_TOOLS" \
-          $EXTRA_ARGS \
-          2> "$STDERR_LOG" || AGENT_EXIT=$?
+        ATTEMPT=1
+        DELAY="${RETRY_BASE_DELAY_SECONDS:-15}"
 
-        if [ -s "$STDERR_LOG" ]; then
-          echo "::warning::Claude produced stderr output:"
-          cat "$STDERR_LOG"
-        fi
+        while : ; do
+          : > "$STDERR_LOG"
+          : > "$STDOUT_LOG"
+
+          if [ "$ATTEMPT" -gt 1 ]; then
+            echo "::notice::run-agent: attempt ${ATTEMPT}/${MAX_ATTEMPTS}"
+          fi
+
+          # stdout is teed rather than redirected so a long run stays watchable
+          # in the live log; the exit code travels out of the subshell in a file
+          # because the pipeline would otherwise report tee's. `set +e` inside
+          # the subshell is load-bearing: the step runs under `bash -e`, which
+          # would otherwise abort the subshell at the failing CLI and never
+          # reach the echo that records the code.
+          # shellcheck disable=SC2086
+          ( set +e
+            claude -p "$(cat "$PROMPT_FILE")" \
+              --model "$MODEL" \
+              --allowedTools "$ALLOWED_TOOLS" \
+              $EXTRA_ARGS \
+              2> "$STDERR_LOG"
+            echo $? > "$EXIT_FILE" ) | tee "$STDOUT_LOG"
+          AGENT_EXIT="$(cat "$EXIT_FILE" 2>/dev/null || echo 1)"
+          [ -n "$AGENT_EXIT" ] || AGENT_EXIT=1
+
+          if [ -s "$STDERR_LOG" ]; then
+            echo "::warning::Claude produced stderr output:"
+            cat "$STDERR_LOG"
+          fi
+
+          if [ "$AGENT_EXIT" -eq 0 ]; then
+            break
+          fi
+
+          FAILURE_CLASS="$(classify_failure "$STDOUT_LOG" "$STDERR_LOG")"
+
+          if [ "$FAILURE_CLASS" = "quota" ]; then
+            echo "::error::agent hit a usage or session limit — a capacity wall, not a code failure. It clears on a wall-clock reset well past this step's budget, so the attempt is not retried; re-drive the lane after the reset."
+            break
+          fi
+
+          if [ "$FAILURE_CLASS" != "transient" ]; then
+            break
+          fi
+
+          if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::error::agent hit a transient API failure on all ${MAX_ATTEMPTS} attempts — giving up"
+            break
+          fi
+
+          echo "::warning::run-agent: transient API failure (exit ${AGENT_EXIT}); retrying in ${DELAY}s"
+          sleep "$DELAY"
+          ATTEMPT=$((ATTEMPT + 1))
+          DELAY=$((DELAY * 2))
+        done
+
         if [ "$AGENT_EXIT" -ne 0 ]; then
           echo "::error::agent exited with code $AGENT_EXIT — failing the step so the run is visibly red"
           exit "$AGENT_EXIT"

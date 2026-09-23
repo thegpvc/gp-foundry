@@ -2,9 +2,13 @@
 
 The keystone action of a gp-foundry harness. It assembles a single prompt file
 from ordered fragments, then runs the [Claude Code](https://github.com/anthropics/claude-code)
-CLI headlessly (`claude -p`). It is deliberately **fire-and-forget**: it never
-fails the step, so the agent's side effects (file edits, commits, comments) are
-what downstream steps act on — not the CLI exit code.
+CLI headlessly (`claude -p`).
+
+A dead agent is **red**, not a green no-op: the CLI's exit code is propagated so
+a human — or the supervisor's stranded-work sweep — notices and re-drives it.
+The agent's side effects are still the product, and the generated workflows run
+their fallback steps under `if: !cancelled()`, so partial work is salvaged
+regardless.
 
 ## Prompt assembly order
 
@@ -34,7 +38,12 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
 | `model`                   | yes      | —                             | Value for `claude --model`. |
 | `allowed-tools`           | yes      | —                             | Value for `claude --allowedTools` (comma-separated). |
 | `claude-code-oauth-token` | yes      | —                             | OAuth token; passed explicitly (composites have no `secrets`). |
+| `github-token`            | no       | `""`                          | Token for the agent's own `gh`/git calls (`GH_TOKEN`/`GITHUB_TOKEN`). |
+| `comms-file`              | no       | `.github/agents/communication.md` | Team communication guide, included verbatim if it exists. |
 | `extra-args`              | no       | `""`                          | Extra args appended verbatim to the `claude` invocation. |
+| `extra-env`               | no       | `""`                          | Newline-separated `NAME=VALUE` pairs exported before the CLI runs. |
+| `max-attempts`            | no       | `3`                           | Attempts when the CLI fails *transiently*. `1` disables retrying. |
+| `retry-base-delay-seconds`| no       | `15`                          | Delay before attempt 2; doubles each attempt. |
 
 ## Behaviour
 
@@ -42,11 +51,35 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
   `claude -p "$(cat <promptfile>)" --model <model> --allowedTools <allowed-tools> <extra-args>`.
 - `stderr` is captured to a file. If non-empty, it is emitted as a single
   `::warning::` group. `stdout` streams to the job log normally.
-- The `claude` invocation is suffixed with `|| true`, so a nonzero exit code
-  **does not fail the step**. Detecting "no changes" and reacting is the job of
-  a downstream fallback step, not this action.
-- If `role-file` is missing, or the token is empty, the step **does** fail
-  (these are configuration errors, not agent outcomes).
+- A nonzero exit **fails the step**, preserving the CLI's own exit code.
+- If `role-file` is missing, or the token is empty, the step fails (these are
+  configuration errors, not agent outcomes).
+
+### Failure classes
+
+Not every nonzero exit is the agent's fault, so a failed attempt is classified
+from the tail of what the CLI printed before it died:
+
+| Class       | Example                                                        | Behaviour |
+|-------------|----------------------------------------------------------------|-----------|
+| `transient` | `API Error: 529 Overloaded`, a dropped or refused connection   | Retried up to `max-attempts`, backing off `retry-base-delay-seconds` and doubling. |
+| `quota`     | `You've hit your session limit · resets 9:20am (UTC)`          | **Not** retried. Fails immediately with a message naming it a capacity wall. |
+| `fatal`     | anything else                                                  | **Not** retried. Fails with the CLI's exit code. |
+
+A `transient` failure clears in seconds, so retrying in-step turns a server-side
+blip into a delay instead of a red run that looks exactly like a broken agent —
+which on a scheduled lane otherwise strands the sweep until the next cron tick.
+
+A `quota` wall clears at a wall-clock reset routinely tens of minutes out, far
+past any step budget. Retrying would only burn the runner, so it fails fast and
+says what it is; the distinct message matters because a quota wall read as an
+agent bug sends people to the wrong place entirely.
+
+Retrying assumes a role can be re-run. The harness already relies on that
+everywhere else — scheduled lanes re-run on cron, `agent_refire` re-fires label
+lanes, the supervisor re-drives stranded work — and roles are written to read
+current state (labels, existing PRs, prior comments) before acting for exactly
+that reason. A lane where that does not hold can set `max-attempts: 1`.
 
 ## Example
 
