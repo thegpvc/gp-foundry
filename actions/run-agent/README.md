@@ -79,7 +79,15 @@ Retrying assumes a role can be re-run. The harness already relies on that
 everywhere else — scheduled lanes re-run on cron, `agent_refire` re-fires label
 lanes, the supervisor re-drives stranded work — and roles are written to read
 current state (labels, existing PRs, prior comments) before acting for exactly
-that reason. A lane where that does not hold can set `max-attempts: 1`.
+that reason.
+
+A lane whose role has an **unconditional** side effect is the exception and should
+set `max-attempts: 1`. From a compiled harness that is the per-node
+`agent_attempts=1` attr; the Herald is the worked example, since it posts a Slack
+digest with no dedup and a retry after a partial run would post it twice. Note
+`agent_attempts=` is deliberately distinct from the `pr-fix` node's
+`max_attempts=`, which bounds the fix↔review **loop** rather than CLI invocations
+within one run.
 
 ## Example
 

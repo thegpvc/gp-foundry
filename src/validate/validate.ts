@@ -71,6 +71,33 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         });
       }
     }
+    if (n.attrs.agent_attempts !== undefined) {
+      // Fail closed rather than silently coercing. A typo'd agent_attempts="3 " or
+      // agent_attempts=0 would otherwise reach the runner as a retry budget nobody
+      // intended — 0 would mean the CLI is never invoked at all.
+      const a = n.attrs.agent_attempts;
+      if (typeof a !== "number" || !Number.isInteger(a) || a < 1) {
+        diags.push({
+          level: "error",
+          code: "node.bad-agent-attempts",
+          message: `agent_attempts= on '${n.id}' must be a whole number >= 1, got ${JSON.stringify(a)}`,
+          where: { node: n.id, line: n.line },
+          hint: `1 disables retrying; omit the attr to use run-agent's default — e.g. agent_attempts=1`,
+        });
+      }
+      // Only a node that emits a run-agent step has anything to retry. Set it
+      // elsewhere and it vanishes at compile time, which the user would discover
+      // as "my lane still retried" long after the fact.
+      if (!AGENT.has(n.type)) {
+        diags.push({
+          level: "warning",
+          code: "node.agent-attempts-ignored",
+          message: `agent_attempts= on '${n.id}' (type ${n.type}) is ignored — this node runs no agent`,
+          where: { node: n.id, line: n.line },
+          hint: "move agent_attempts= to the agent lane whose retry budget you meant to change",
+        });
+      }
+    }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({
         level: "error",
