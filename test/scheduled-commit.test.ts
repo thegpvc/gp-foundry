@@ -10,6 +10,7 @@ import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import yaml from "js-yaml";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
+import { evalGuard } from "../src/sim/gh-expr.js";
 
 function laneJob(commitAttr: string): any {
   const attr = commitAttr ? `, ${commitAttr}` : "";
@@ -44,6 +45,29 @@ describe("scheduled-agent commit= attribute", () => {
     expect(n).not.toContain("Strip protected paths, commit, push");
     expect(n).not.toContain("Commit, push branch, open PR");
     expect(n).not.toContain("Create branch");
+    expect(n).not.toContain("Create recovery branch");
+    expect(n).not.toContain("Preserve failed agent output for review");
+  });
+
+  it("recovers failed direct runs behind human review, never via the direct push", () => {
+    const job = laneJob('commit="direct", paths="memory/"');
+    const direct = step(job, "Strip protected paths, commit, push");
+    expect(direct.if).toBeUndefined(); // default success() keeps main protected
+    const branch = step(job, "Create recovery branch");
+    const recovery = step(job, "Preserve failed agent output for review");
+    expect(recovery.with.branch).not.toBe(recovery.with["base-branch"]);
+    expect(recovery.with["pr-label"]).toBe("needs-human");
+    expect(recovery.with["allowed-paths"]).toBe("memory/");
+    expect(branch.run).toContain('git checkout -b "$BRANCH"');
+    expect(branch.run).toContain("$RUN_ATTEMPT");
+    for (const outcome of ["success", "failure", "skipped", "cancelled"]) {
+      const ctx = { steps: { agent: { outcome }, recovery: { outcome: "success" } } };
+      expect(evalGuard(branch.if.slice(3, -2), ctx)).toBe(outcome === "failure");
+      expect(evalGuard(recovery.if.slice(3, -2), ctx)).toBe(outcome === "failure");
+    }
+    expect(evalGuard(recovery.if.slice(3, -2), { steps: { agent: { outcome: "failure" }, recovery: { outcome: "failure" } } })).toBe(false);
+    expect(branch.if).toContain("!cancelled()");
+    expect(recovery.if).toContain("!cancelled()");
   });
 
   it("commit=pr branches and opens a PR, never touching base directly", () => {

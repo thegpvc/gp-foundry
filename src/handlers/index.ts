@@ -483,7 +483,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   }
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
-  steps.push({ ...runAgentStep(ctx, { withContext: false }), timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
+  steps.push({ ...runAgentStep(ctx, { withContext: false }), id: "agent", timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
   if (commit === "pr") {
     // Output lands on the agent branch and opens a PR — reviewed and gated, never a
     // direct base-branch write. `!cancelled()` salvages partial work behind the review.
@@ -507,6 +507,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
     // agent could edit the gate definitions themselves, so it runs the SAME immutable-path
     // strip the producer lane does (plus an optional per-lane allowlist) first. No
     // `!cancelled()`: a half-failed run must publish nothing to the base branch.
+    // Recover failed runs separately, on a branch requiring human review.
     steps.push({
       uses: ctx.actionRef("agent-fallback"),
       name: "Strip protected paths, commit, push",
@@ -517,6 +518,33 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
         "agent-name": node.id,
         "scope-path": resolveFile(ctx, "agents/scope.yaml"),
         "commit-message": `chore(${node.id}): scheduled update`,
+        ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
+      },
+    });
+    steps.push(runStep({
+      id: "recovery",
+      name: "Create recovery branch",
+      if: "${{ !cancelled() && steps.agent.outcome == 'failure' }}",
+      env: { PREFIX: cfg.repo.branch_prefix, NODE: node.id, RUN_ID: "${{ github.run_id }}", RUN_ATTEMPT: "${{ github.run_attempt }}" },
+      run: [
+        'BRANCH="$PREFIX$NODE-recovery-$RUN_ID-$RUN_ATTEMPT"',
+        'git checkout -b "$BRANCH"',
+        'echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"',
+      ].join("\n"),
+    }));
+    steps.push({
+      uses: ctx.actionRef("agent-fallback"),
+      name: "Preserve failed agent output for review",
+      if: "${{ !cancelled() && steps.agent.outcome == 'failure' && steps.recovery.outcome == 'success' }}",
+      with: {
+        branch: "${{ steps.recovery.outputs.branch }}",
+        "base-branch": cfg.repo.base_branch,
+        token: tokenExpr(ctx),
+        "agent-name": node.id,
+        "scope-path": resolveFile(ctx, "agents/scope.yaml"),
+        "pr-title": `${node.id}: recover incomplete scheduled output`,
+        "pr-body": `Partial output from a failed \`${node.id}\` run. Review for completeness before merging. Run: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}`,
+        "pr-label": ctx.config.labels?.["needs-human"] ?? "needs-human",
         ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
       },
     });

@@ -1,8 +1,8 @@
 name: Run Agent
 description: >-
   Assemble a prompt file in a documented order and run the Claude Code CLI
-  headlessly. Captures stderr, warns on any stderr output, and never fails the
-  step (the agent's side effects are the product, not its exit code).
+  headlessly through stdin. Captures stderr and propagates agent failures so
+  workflows can recover partial work without reporting a false success.
 
 inputs:
   role-file:
@@ -223,11 +223,12 @@ runs:
         # stderr goes to a file (not streamed) so it surfaces as one grouped warning.
         AGENT_EXIT=0
         # shellcheck disable=SC2086
-        claude -p "$(cat "$PROMPT_FILE")" \
+        # Keep large PR diffs out of argv (Linux limits each argument to 128 KiB).
+        claude -p \
           --model "$MODEL" \
           --allowedTools "$ALLOWED_TOOLS" \
           $EXTRA_ARGS \
-          2> "$STDERR_LOG" || AGENT_EXIT=$?
+          < "$PROMPT_FILE" 2> "$STDERR_LOG" || AGENT_EXIT=$?
 
         if [ -s "$STDERR_LOG" ]; then
           echo "::warning::Claude produced stderr output:"
