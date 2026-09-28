@@ -2,9 +2,9 @@
 
 The keystone action of a gp-foundry harness. It assembles a single prompt file
 from ordered fragments, then runs the [Claude Code](https://github.com/anthropics/claude-code)
-CLI headlessly (`claude -p`). It is deliberately **fire-and-forget**: it never
-fails the step, so the agent's side effects (file edits, commits, comments) are
-what downstream steps act on — not the CLI exit code.
+CLI headlessly (`claude -p`) with the prompt on stdin, avoiding operating-system
+argument-size limits. Agent failures fail the step; workflow recovery steps can
+preserve partial output for review.
 
 ## Prompt assembly order
 
@@ -39,12 +39,12 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
 ## Behaviour
 
 - The assembled prompt is written to a temp file; the run step invokes
-  `claude -p "$(cat <promptfile>)" --model <model> --allowedTools <allowed-tools> <extra-args>`.
+  `claude -p --model <model> --allowedTools <allowed-tools> <extra-args> < <promptfile>`.
 - `stderr` is captured to a file. If non-empty, it is emitted as a single
   `::warning::` group. `stdout` streams to the job log normally.
-- The `claude` invocation is suffixed with `|| true`, so a nonzero exit code
-  **does not fail the step**. Detecting "no changes" and reacting is the job of
-  a downstream fallback step, not this action.
+- Nonzero CLI exit codes fail the step. PR lanes preserve partial output through
+  guarded fallback steps. Failed direct-commit scheduled lanes recover output on
+  a separate PR labeled `needs-human`; they never push partial output to base.
 - If `role-file` is missing, or the token is empty, the step **does** fail
   (these are configuration errors, not agent outcomes).
 
