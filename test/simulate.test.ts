@@ -12,7 +12,7 @@ const wiring = wire(harness);
 
 // Mock agents (scripted deterministic stand-ins for `run-agent`).
 const scout: MockAgent = () => [
-  { event: "issues", action: "labeled", payload: { label: { name: "agent" }, issue: { number: 1 } } },
+  { event: "issues", action: "labeled", payload: { label: { name: "agent" }, issue: { number: 1, state: "open" } } },
 ];
 // The head REF matters as much as the SHA now: agent lanes are guarded on the
 // configured branch prefix, so a PR event without one models a human's branch.
@@ -22,7 +22,7 @@ const builder: MockAgent = (_id, _ev, state) => {
     {
       event: "pull_request",
       action: "opened",
-      payload: { pull_request: { number: 10, head: { sha: "abc", ref: "agent/1-widget" } } },
+      payload: { pull_request: { number: 10, state: "open", head: { sha: "abc", ref: "agent/1-widget" } } },
     },
   ];
 };
@@ -32,14 +32,14 @@ const critic: MockAgent = () => [
     action: "submitted",
     payload: {
       review: { state: "approved", body: "**Verdict:** APPROVE", user: { login: "dixie-agent" } },
-      pull_request: { number: 10, head: { sha: "abc", ref: "agent/1-widget" } },
+      pull_request: { number: 10, state: "open", head: { sha: "abc", ref: "agent/1-widget" } },
     },
   },
 ];
 
 describe("plumbing simulator (Tier 2)", () => {
   it("routes issue → scout → builder → critic via the compiled triggers+guards", () => {
-    const seed: SimEvent[] = [{ event: "issues", action: "opened", payload: { issue: { number: 1 } } }];
+    const seed: SimEvent[] = [{ event: "issues", action: "opened", payload: { issue: { number: 1, state: "open" } } }];
     const { fired, state } = runScenario(harness, wiring, seed, {
       scout,
       builder,
@@ -53,16 +53,24 @@ describe("plumbing simulator (Tier 2)", () => {
 
   it("the label guard gates the builder: a non-'agent' label does not fire it", () => {
     const seed: SimEvent[] = [
-      { event: "issues", action: "labeled", payload: { label: { name: "wontfix" }, issue: { number: 2 } } },
+      { event: "issues", action: "labeled", payload: { label: { name: "wontfix" }, issue: { number: 2, state: "open" } } },
     ];
     const { fired } = runScenario(harness, wiring, seed, {});
     expect(fired).not.toContain("builder");
     expect(fired).not.toContain("architect");
   });
 
+  it("a lane label on a CLOSED issue fires nothing: closing never strips the label", () => {
+    const seed: SimEvent[] = [
+      { event: "issues", action: "labeled", payload: { label: { name: "agent" }, issue: { number: 4, state: "closed" } } },
+    ];
+    const { fired } = runScenario(harness, wiring, seed, {});
+    expect(fired).not.toContain("builder");
+  });
+
   it("brainstorm label routes to the architect, not the builder", () => {
     const seed: SimEvent[] = [
-      { event: "issues", action: "labeled", payload: { label: { name: "agent-brainstorm" }, issue: { number: 3 } } },
+      { event: "issues", action: "labeled", payload: { label: { name: "agent-brainstorm" }, issue: { number: 3, state: "open" } } },
     ];
     const { fired } = runScenario(harness, wiring, seed, {});
     expect(fired).toContain("architect");
@@ -70,7 +78,7 @@ describe("plumbing simulator (Tier 2)", () => {
   });
 
   it("terminates (no livelock) on the happy path", () => {
-    const seed: SimEvent[] = [{ event: "issues", action: "opened", payload: { issue: { number: 1 } } }];
+    const seed: SimEvent[] = [{ event: "issues", action: "opened", payload: { issue: { number: 1, state: "open" } } }];
     const { steps } = runScenario(harness, wiring, seed, { scout, builder, critic }, { maxSteps: 50 });
     expect(steps).toBeLessThan(50);
   });

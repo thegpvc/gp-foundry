@@ -45,6 +45,7 @@ describe("compile(dixie) — Tier 1 spec↔output invariants", () => {
     const builder = wf("builder");
     expect(builder.on.issues.types).toContain("labeled");
     expect(builder.jobs.builder.if).toContain("github.event.label.name == 'agent'");
+    expect(builder.jobs.builder.if).toContain("github.event.issue.state == 'open'");
     const critic = wf("critic");
     expect(critic.on.pull_request.types).toContain("opened");
   });

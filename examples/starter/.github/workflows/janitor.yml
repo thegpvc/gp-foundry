@@ -18,7 +18,7 @@ jobs:
       issues: write
       pull-requests: write
       actions: write
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,6 +36,8 @@ jobs:
       - name: Setup agent toolchain
         uses: ./.github/agent-setup
       - name: Run agent
+        id: agent
+        timeout-minutes: 10
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
           role-file: .github/agents/roles/janitor.md
@@ -53,3 +55,28 @@ jobs:
           agent-name: janitor
           scope-path: .github/agents/scope.yaml
           commit-message: "chore(janitor): scheduled update"
+      - name: Create recovery branch
+        id: recovery
+        if: ${{ !cancelled() && steps.agent.outcome == 'failure' }}
+        shell: bash
+        env:
+          PREFIX: agent/
+          NODE: janitor
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |-
+          BRANCH="$PREFIX$NODE-recovery-$RUN_ID-$RUN_ATTEMPT"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+      - name: Preserve failed agent output for review
+        if: ${{ !cancelled() && steps.agent.outcome == 'failure' && steps.recovery.outcome == 'success' }}
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v1
+        with:
+          branch: ${{ steps.recovery.outputs.branch }}
+          base-branch: main
+          token: ${{ secrets.AGENT_PAT }}
+          agent-name: janitor
+          scope-path: .github/agents/scope.yaml
+          pr-title: "janitor: recover incomplete scheduled output"
+          pr-body: "Partial output from a failed `janitor` run. Review for completeness before merging. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          pr-label: needs-human
