@@ -88,24 +88,29 @@ function wireEdge(edge: HarnessEdge, target: HarnessNode, cfg: FoundryConfig): E
   if (edge.on) {
     // `on` may list several events, e.g. "pull_request.opened, pull_request.synchronize".
     const events = edge.on.split(",").map((s) => s.trim()).filter(Boolean);
-    return { events, guard: edge.when ? guardFor(edge.when, target, cfg) : undefined };
+    const delivered = events.map((ev) => effectiveEvent(ev, target));
+    return { events, guard: edge.when ? guardFor(edge.when, delivered, cfg) : undefined };
   }
   if (!edge.when) return undefined;
   const w = edge.when;
   if (w.startsWith("label=")) {
-    return { events: [targetIsPr(target) ? "pull_request.labeled" : "issues.labeled"], guard: guardFor(w, target, cfg) };
+    const events = [targetIsPr(target) ? "pull_request.labeled" : "issues.labeled"];
+    return { events, guard: guardFor(w, events, cfg) };
   }
   if (w.startsWith("verdict=")) {
-    return { events: ["pull_request_review.submitted"], guard: guardFor(w, target, cfg) };
+    const events = ["pull_request_review.submitted"];
+    return { events, guard: guardFor(w, events, cfg) };
   }
   // internal-only transitions (attempts>=N, ci=...) are not triggers for this node
   return undefined;
 }
 
-function guardFor(when: string, _target: HarnessNode, cfg: FoundryConfig): string | undefined {
+function guardFor(when: string, events: string[], cfg: FoundryConfig): string | undefined {
   if (when.startsWith("label=")) {
     // semantic key -> actual repo label via config.labels (identity by default)
-    return `github.event.label.name == '${resolveLabel(when.slice("label=".length), cfg)}'`;
+    const label = `github.event.label.name == '${resolveLabel(when.slice("label=".length), cfg)}'`;
+    const state = openStateClause(events);
+    return state ? `${label} && ${state}` : label;
   }
   // A bot cannot APPROVE/REQUEST_CHANGES its own PR, so the Critic submits a
   // COMMENTED review with the verdict in the body; guard on the body marker.
@@ -121,6 +126,25 @@ function guardFor(when: string, _target: HarnessNode, cfg: FoundryConfig): strin
     const marker = `contains(github.event.review.body, '**Verdict:** ${verdict}')`;
     const actor = reviewActorClause(cfg);
     return actor ? `${marker} && ${actor}` : marker;
+  }
+  return undefined;
+}
+
+/**
+ * `github.event.<issue|pull_request>.state == 'open'` for a label-triggered edge.
+ * GitHub delivers `labeled` for closed issues and PRs too, and a lane label usually
+ * survives the close (auto-close on merge never strips it), so without this a label
+ * toggle on a closed item re-drives a whole agent lane against work already on the
+ * base branch. The payload path is taken from the events the edge actually receives;
+ * when they don't agree on one subject the clause is omitted rather than guessed,
+ * since a path that isn't in the payload would silently suppress the edge.
+ */
+function openStateClause(events: string[]): string | undefined {
+  if (events.length && events.every((e) => e.split(".")[0] === "issues")) {
+    return "github.event.issue.state == 'open'";
+  }
+  if (events.length && events.every((e) => e.split(".")[0] === "pull_request")) {
+    return "github.event.pull_request.state == 'open'";
   }
   return undefined;
 }
@@ -218,7 +242,7 @@ export function wire(ir: Harness): WiringPlan {
       // would run on every human PR, which is the hole the guard exists to close.
       const effEvents = new Set(events.map((ev) => effectiveEvent(ev, firstLeg)));
       const g = applyBranchPrefix(
-        entry.when ? guardFor(entry.when, firstLeg, ir.config) : undefined,
+        entry.when ? guardFor(entry.when, [...effEvents], ir.config) : undefined,
         effEvents,
         ir.config,
       );

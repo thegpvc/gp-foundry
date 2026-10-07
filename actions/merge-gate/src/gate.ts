@@ -166,6 +166,29 @@ export interface MergePolicy {
 }
 
 /** Semver level of a dependabot bump; "unknown" when the title can't be parsed. */
+/**
+ * Keep only the LATEST attempt of each check (same name, same publishing app).
+ *
+ * `checks.listForRef` dedupes only WITHIN a check suite. A SHA that carries two suites
+ * for one workflow — a `workflow_dispatch` re-run alongside the original `pull_request`
+ * run — returns both attempts of the same check. A superseded conclusion is history,
+ * not current state: without this, one dead attempt pins the rollup to "failing" and
+ * no re-run of the live attempt can clear it (range-labs/mono#12952, an approved PR
+ * wedged for 5 cycles while GitHub's own rollup read SUCCESS). Check-run ids are
+ * monotonic, so the highest id is the newest attempt.
+ */
+export function latestAttemptPerCheck<T extends { id?: number | null; name?: string | null; app?: { slug?: string | null } | null }>(
+  checkRuns: T[],
+): T[] {
+  const latest = new Map<string, T>();
+  for (const c of checkRuns) {
+    const key = `${c.app?.slug ?? ""}\u0000${c.name ?? ""}`;
+    const prev = latest.get(key);
+    if (!prev || (c.id ?? 0) > (prev.id ?? 0)) latest.set(key, c);
+  }
+  return [...latest.values()];
+}
+
 export type DependabotBump = "patch" | "minor" | "major" | "unknown";
 
 /** The exact author login a genuine dependabot PR carries. */

@@ -21,6 +21,7 @@ import {
   evaluateMergeGate,
   filterCandidateNumbers,
   filterCountableVerdicts,
+  latestAttemptPerCheck,
   latestValidApproval,
   normalizePolicyKeys,
   parseDependabotBump,
@@ -133,7 +134,7 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
 
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
-  type CheckRunRaw = { name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null };
+  type CheckRunRaw = { id?: number | null; name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null };
   let checkRunsRaw: CheckRunRaw[];
   try {
     // Deliberately a SEPARATE token from the one that merges. Reading check-runs
@@ -147,6 +148,9 @@ async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumb
     // Fail closed, but say what to wire up — see describeCheckRunsFailure.
     throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }));
   }
+  // Superseded attempts are history: judge only the newest attempt of each check, in
+  // both the rollup and the requiredChecks gate below.
+  checkRunsRaw = latestAttemptPerCheck(checkRunsRaw);
   const ciStatus = rollupCi(checkRunsRaw, ignore);
   // Same fetch feeds the requiredChecks gate: those must be present AND green,
   // which the CI rollup cannot express (it only judges checks that exist).

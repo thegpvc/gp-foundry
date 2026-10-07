@@ -564,7 +564,9 @@ describe("CI gates are consumed, not just awaited (item 7)", () => {
   it("emits no gate plumbing when the node declares none", () => {
     const job = reviewerJob("");
     expect(job.steps.some((s: any) => s.name === "Record CI gate results in the context")).toBe(false);
-    expect(job["timeout-minutes"]).toBe(15);
+    // Gate-less: 25-min job default, so the job − 10 step cap leaves the agent 15 min.
+    expect(job["timeout-minutes"]).toBe(25);
+    expect(job.steps.find((s: any) => s.name === "Run agent")["timeout-minutes"]).toBe(15);
   });
 });
 
@@ -642,7 +644,7 @@ describe("scheduled lanes strip immutable paths before pushing to base (item 4)"
 
   it("routes the push through agent-fallback instead of a raw git push", () => {
     const steps = scheduled().steps;
-    const push = steps.at(-1);
+    const push = steps.find((s: any) => s.name === "Strip protected paths, commit, push");
     expect(push.uses).toContain("agent-fallback");
     expect(push.with["scope-path"]).toContain("scope.yaml");
     expect(push.with.branch).toBe("main");
@@ -741,7 +743,7 @@ describe("fixes from the review pass", () => {
     expect(doc.jobs.perf.if).toContain("startsWith(github.event.pull_request.head.ref");
   });
 
-  it("a scheduled lane publishes nothing when its agent step failed", () => {
+  it("a scheduled lane never publishes directly to base when its agent step failed", () => {
     // This lane commits straight to the base branch with no PR and no gate, so
     // salvage-on-failure (which is right for the producer) is wrong here.
     const doc = yaml.load(
@@ -751,7 +753,7 @@ describe("fixes from the review pass", () => {
         }`),
       ).files.find((f) => f.path.endsWith("retro.yml"))!.contents,
     ) as any;
-    const push = doc.jobs.retro.steps.at(-1);
+    const push = doc.jobs.retro.steps.find((s: any) => s.name === "Strip protected paths, commit, push");
     expect(push.uses).toContain("agent-fallback");
     expect(push.if).toBeUndefined();
   });

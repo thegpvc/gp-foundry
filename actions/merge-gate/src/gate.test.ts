@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   evaluateMergeGate,
+  latestAttemptPerCheck,
   globMatch,
   handWrittenAdditions,
   firstProtectedPath,
@@ -846,5 +847,36 @@ describe("dependabot lane (#deps)", () => {
     ];
     expect(filterCandidateNumbers(prs, "agent/", true)).toEqual([1, 2]);
     expect(filterCandidateNumbers(prs, "agent/", false)).toEqual([1]);
+  });
+});
+
+describe("latestAttemptPerCheck (range-labs/mono#12952)", () => {
+  const run = (id: number, name: string, conclusion: string, slug = "github-actions") => ({
+    id,
+    name,
+    status: "completed",
+    conclusion,
+    app: { slug },
+  });
+
+  it("drops a superseded failed attempt of the same check, keeping the newer green one", () => {
+    // A workflow_dispatch suite (cancelled → failure) alongside the re-driven pull_request suite.
+    const out = latestAttemptPerCheck([run(10, "docker_build", "cancelled"), run(42, "docker_build", "success")]);
+    expect(out.map((c) => c.conclusion)).toEqual(["success"]);
+  });
+
+  it("keeps a newer failure over an older success — a real regression still blocks", () => {
+    const out = latestAttemptPerCheck([run(42, "go_unit_tests", "success"), run(50, "go_unit_tests", "failure")]);
+    expect(out.map((c) => c.conclusion)).toEqual(["failure"]);
+  });
+
+  it("treats the same name from a different app as a different check", () => {
+    const out = latestAttemptPerCheck([run(10, "lint", "failure", "other-ci"), run(42, "lint", "success")]);
+    expect(out).toHaveLength(2);
+  });
+
+  it("leaves distinct checks alone", () => {
+    const out = latestAttemptPerCheck([run(1, "a", "success"), run(2, "b", "failure")]);
+    expect(out.map((c) => c.name).sort()).toEqual(["a", "b"]);
   });
 });

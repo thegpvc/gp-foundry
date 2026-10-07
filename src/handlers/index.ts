@@ -151,15 +151,24 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   // one. Put every conclusion in front of the reviewer and say what a non-success
   // means, so a broken build cannot be reviewed as if CI had passed.
   if (gates.length) steps.push(gateResultsStep(gates, gateIds));
-  steps.push(runAgentStep(ctx, { withContext: true }));
+  // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
+  // ignored them would kill the review mid-wait and stall the PR with no verdict.
+  // A gate-less analyst defaults to 25 so the step cap below leaves the agent 15
+  // minutes; the old 15-minute job default would have capped it at 5.
+  const jobTimeout = timeoutOf(node, gates.length ? 15 + 15 * gates.length : 25);
+  const agent = runAgentStep(ctx, { withContext: true });
+  // Without gates, the same job − margin step cap as every other agent lane, so an
+  // overrun fails its step instead of the job cap cancelling the run mid-turn (a
+  // cancelled planner left no plan and no failure to notice). With gates the waits
+  // spend an unknown share of the job budget, so a fixed step cap could starve the
+  // review; that case stays on the job cap alone.
+  steps.push(gates.length ? agent : { ...agent, timeoutMinutes: agentStepTimeout(jobTimeout) });
 
   return {
     jobId: node.id,
     name: node.id,
     permissions,
-    // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
-    // ignored them would kill the review mid-wait and stall the PR with no verdict.
-    timeoutMinutes: timeoutOf(node, 15 + 15 * gates.length),
+    timeoutMinutes: jobTimeout,
     steps,
   };
 }
@@ -483,7 +492,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
   }
   steps.push(setupStep());
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
-  steps.push({ ...runAgentStep(ctx, { withContext: false }), timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
+  steps.push({ ...runAgentStep(ctx, { withContext: false }), id: "agent", timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
   if (commit === "pr") {
     // Output lands on the agent branch and opens a PR — reviewed and gated, never a
     // direct base-branch write. `!cancelled()` salvages partial work behind the review.
@@ -507,6 +516,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
     // agent could edit the gate definitions themselves, so it runs the SAME immutable-path
     // strip the producer lane does (plus an optional per-lane allowlist) first. No
     // `!cancelled()`: a half-failed run must publish nothing to the base branch.
+    // Recover failed runs separately, on a branch requiring human review.
     steps.push({
       uses: ctx.actionRef("agent-fallback"),
       name: "Strip protected paths, commit, push",
@@ -517,6 +527,33 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
         "agent-name": node.id,
         "scope-path": resolveFile(ctx, "agents/scope.yaml"),
         "commit-message": `chore(${node.id}): scheduled update`,
+        ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
+      },
+    });
+    steps.push(runStep({
+      id: "recovery",
+      name: "Create recovery branch",
+      if: "${{ !cancelled() && steps.agent.outcome == 'failure' }}",
+      env: { PREFIX: cfg.repo.branch_prefix, NODE: node.id, RUN_ID: "${{ github.run_id }}", RUN_ATTEMPT: "${{ github.run_attempt }}" },
+      run: [
+        'BRANCH="$PREFIX$NODE-recovery-$RUN_ID-$RUN_ATTEMPT"',
+        'git checkout -b "$BRANCH"',
+        'echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"',
+      ].join("\n"),
+    }));
+    steps.push({
+      uses: ctx.actionRef("agent-fallback"),
+      name: "Preserve failed agent output for review",
+      if: "${{ !cancelled() && steps.agent.outcome == 'failure' && steps.recovery.outcome == 'success' }}",
+      with: {
+        branch: "${{ steps.recovery.outputs.branch }}",
+        "base-branch": cfg.repo.base_branch,
+        token: tokenExpr(ctx),
+        "agent-name": node.id,
+        "scope-path": resolveFile(ctx, "agents/scope.yaml"),
+        "pr-title": `${node.id}: recover incomplete scheduled output`,
+        "pr-body": `Partial output from a failed \`${node.id}\` run. Review for completeness before merging. Run: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}`,
+        "pr-label": ctx.config.labels?.["needs-human"] ?? "needs-human",
         ...(allowedPaths ? { "allowed-paths": allowedPaths } : {}),
       },
     });

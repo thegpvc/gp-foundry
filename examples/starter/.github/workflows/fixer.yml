@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -76,6 +76,7 @@ jobs:
           trusted-authors: agent-bot
       - name: Run agent
         if: steps.attempts.outputs.exhausted != 'true'
+        timeout-minutes: 25
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
           role-file: .github/agents/roles/fixer.md
