@@ -151,15 +151,22 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   // one. Put every conclusion in front of the reviewer and say what a non-success
   // means, so a broken build cannot be reviewed as if CI had passed.
   if (gates.length) steps.push(gateResultsStep(gates, gateIds));
-  steps.push(runAgentStep(ctx, { withContext: true }));
+  // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
+  // ignored them would kill the review mid-wait and stall the PR with no verdict.
+  const jobTimeout = timeoutOf(node, 15 + 15 * gates.length);
+  const agent = runAgentStep(ctx, { withContext: true });
+  // Without gates, the same job − margin step cap as every other agent lane, so an
+  // overrun fails its step instead of the job cap cancelling the run mid-turn (a
+  // cancelled planner left no plan and no failure to notice). With gates the waits
+  // spend an unknown share of the job budget, so a fixed step cap could starve the
+  // review; that case stays on the job cap alone.
+  steps.push(gates.length ? agent : { ...agent, timeoutMinutes: agentStepTimeout(jobTimeout) });
 
   return {
     jobId: node.id,
     name: node.id,
     permissions,
-    // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
-    // ignored them would kill the review mid-wait and stall the PR with no verdict.
-    timeoutMinutes: timeoutOf(node, 15 + 15 * gates.length),
+    timeoutMinutes: jobTimeout,
     steps,
   };
 }

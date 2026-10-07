@@ -79,3 +79,29 @@ describe("agent step timeout (#12545)", () => {
     }
   });
 });
+
+describe("analyst step timeout (range-labs/mono#12877)", () => {
+  const ANALYSTS = `digraph t {
+    start    [type=start]
+    planner  [type=analyst, role="agents/roles/planner.md", timeout=25]
+    gated    [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", gates="Go"]
+    start    -> planner [when="label=plan"]
+    planner  -> gated   [on="pull_request.opened"]
+  }`;
+
+  it("caps a gate-less analyst's Run agent step at job − 10, like every other agent lane", () => {
+    // Without it, an overrun is cancelled by the JOB cap mid-turn: the plan is lost and
+    // the run reads `cancelled`, not a failure anything notices.
+    const job = jobOf(ANALYSTS, "planner");
+    const runAgent = job.steps.find((s: any) => s.name === "Run agent");
+    expect(job["timeout-minutes"]).toBe(25);
+    expect(runAgent["timeout-minutes"]).toBe(15);
+  });
+
+  it("leaves a gated reviewer's Run agent step uncapped: its CI waits share the job budget", () => {
+    const job = jobOf(ANALYSTS, "gated");
+    const runAgent = job.steps.find((s: any) => s.name === "Run agent");
+    expect(job["timeout-minutes"]).toBe(30); // 15 + 15 × 1 gate
+    expect(runAgent["timeout-minutes"]).toBeUndefined();
+  });
+});
