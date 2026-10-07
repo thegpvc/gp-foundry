@@ -110,6 +110,21 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
   if (secrets.length) {
     withBlock["extra-env"] = secrets.map((name) => `${name}=${secretRef(name)}`).join("\n");
   }
+  // How many times run-agent invokes the CLI when it fails TRANSIENTLY (5xx,
+  // overloaded, dropped connection). A genuine agent error and a usage-limit wall
+  // are never retried, so this only trades a little wall-clock for not reddening a
+  // lane on a server-side blip. Per-node because retrying re-runs the whole role,
+  // which is safe only for a role that reads current state before acting — the
+  // assumption the harness already makes when a cron, agent_refire or the
+  // supervisor re-drives a lane. A role with an unconditional side effect (posting
+  // a digest, say) sets agent_attempts=1 so a partial run is never repeated.
+  //
+  // Deliberately NOT named max_attempts: that attr is the pr-fix fix↔review loop
+  // bound, counted from submitted reviews. Sharing the name would silently couple
+  // two unrelated budgets — dropping the Fixer's loop bound to 1 would also
+  // disable its transient retry.
+  const agentAttempts = node.attrs.agent_attempts;
+  if (agentAttempts !== undefined) withBlock["max-attempts"] = String(agentAttempts);
   const override = node.files.prompt;
   if (override) withBlock["prompt-override-file"] = resolveFile(ctx, override);
   return { uses: ctx.actionRef("run-agent"), name: "Run agent", with: withBlock };
