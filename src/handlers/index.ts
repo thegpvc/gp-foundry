@@ -153,7 +153,9 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   if (gates.length) steps.push(gateResultsStep(gates, gateIds));
   // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
   // ignored them would kill the review mid-wait and stall the PR with no verdict.
-  const jobTimeout = timeoutOf(node, 15 + 15 * gates.length);
+  // A gate-less analyst defaults to 25 so the step cap below leaves the agent 15
+  // minutes; the old 15-minute job default would have capped it at 5.
+  const jobTimeout = timeoutOf(node, gates.length ? 15 + 15 * gates.length : 25);
   const agent = runAgentStep(ctx, { withContext: true });
   // Without gates, the same job − margin step cap as every other agent lane, so an
   // overrun fails its step instead of the job cap cancelling the run mid-turn (a
