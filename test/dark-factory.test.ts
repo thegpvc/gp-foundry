@@ -564,7 +564,9 @@ describe("CI gates are consumed, not just awaited (item 7)", () => {
   it("emits no gate plumbing when the node declares none", () => {
     const job = reviewerJob("");
     expect(job.steps.some((s: any) => s.name === "Record CI gate results in the context")).toBe(false);
-    expect(job["timeout-minutes"]).toBe(15);
+    // Gate-less: 25-min job default, so the job − 10 step cap leaves the agent 15 min.
+    expect(job["timeout-minutes"]).toBe(25);
+    expect(job.steps.find((s: any) => s.name === "Run agent")["timeout-minutes"]).toBe(15);
   });
 });
 

@@ -98,6 +98,18 @@ describe("analyst step timeout (range-labs/mono#12877)", () => {
     expect(runAgent["timeout-minutes"]).toBe(15);
   });
 
+  it("defaults a gate-less analyst to a 25-min job, so the agent keeps 15 min, not 5", () => {
+    const dot = `digraph t {
+      start [type=start]
+      scout [type=analyst, role="agents/roles/scout.md"]
+      start -> scout [on="issues.opened"]
+    }`;
+    const job = jobOf(dot, "scout");
+    const runAgent = job.steps.find((s: any) => s.name === "Run agent");
+    expect(job["timeout-minutes"]).toBe(25);
+    expect(runAgent["timeout-minutes"]).toBe(15);
+  });
+
   it("leaves a gated reviewer's Run agent step uncapped: its CI waits share the job budget", () => {
     const job = jobOf(ANALYSTS, "gated");
     const runAgent = job.steps.find((s: any) => s.name === "Run agent");
