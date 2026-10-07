@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -37,6 +37,7 @@ jobs:
           token: ${{ secrets.AGENT_PAT }}
           trusted-authors: agent-bot
       - name: Run agent
+        timeout-minutes: 15
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
           role-file: .github/agents/roles/reviewer.md
