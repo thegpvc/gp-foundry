@@ -13,12 +13,12 @@ permissions:
 jobs:
   builder:
     runs-on: ubuntu-latest
-    if: github.event.label.name == 'build'
+    if: github.event.label.name == 'build' && github.event.issue.state == 'open'
     permissions:
       contents: write
       pull-requests: write
       issues: write
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -55,6 +55,7 @@ jobs:
           token: ${{ secrets.AGENT_PAT }}
           trusted-authors: agent-bot
       - name: Run agent
+        timeout-minutes: 25
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
           role-file: .github/agents/roles/builder.md

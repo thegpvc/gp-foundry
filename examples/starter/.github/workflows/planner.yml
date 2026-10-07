@@ -13,7 +13,7 @@ permissions:
 jobs:
   planner:
     runs-on: ubuntu-latest
-    if: github.event.label.name == 'plan'
+    if: github.event.label.name == 'plan' && github.event.issue.state == 'open'
     permissions:
       contents: read
       issues: write
