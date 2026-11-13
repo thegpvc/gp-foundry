@@ -29,7 +29,7 @@
     "node": ">=20"
   },
   "bin": {
-    "gp-foundry": "./dist/cli/index.cjs"
+    "gp-foundry": "dist/cli/index.cjs"
   },
   "files": [
     "dist/cli",
