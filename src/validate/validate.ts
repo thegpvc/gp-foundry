@@ -8,6 +8,7 @@ import type { Diagnostic, Harness, HarnessEdge, HarnessNode, RoleSpec } from "..
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
 import { parsePermissionsAttr } from "../handlers/index.js";
+import { hasPrContext, parseGates, parseSkip } from "../handlers/attrs.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 
 export interface ValidateDeps {
@@ -22,6 +23,7 @@ const AGENT = new Set(AGENT_TYPES);
 export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
   const diags: Diagnostic[] = [];
   const byId = new Map(ir.nodes.map((n) => [n.id, n] as const));
+  const diamondMembers = detectDiamonds(ir).memberIds;
 
   // Referential: every edge endpoint must be a declared node.
   for (const n of ir.nodes) {
@@ -95,6 +97,148 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           message: `agent_attempts= on '${n.id}' (type ${n.type}) is ignored — this node runs no agent`,
           where: { node: n.id, line: n.line },
           hint: "move agent_attempts= to the agent lane whose retry budget you meant to change",
+        });
+      }
+    }
+    if (n.attrs.cancel_in_progress !== undefined) {
+      if (typeof n.attrs.cancel_in_progress !== "boolean") {
+        diags.push({
+          level: "error",
+          code: "node.bad-cancel-in-progress",
+          message: `cancel_in_progress= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.cancel_in_progress)}`,
+          where: { node: n.id, line: n.line },
+        });
+      }
+      // Concurrency is per WORKFLOW: a diamond's is the fan_in's, fixed at "never
+      // cancel a join mid-synthesis", so the attr on a leg would do nothing.
+      if (!AGENT.has(n.type) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "warning",
+          code: "node.cancel-in-progress-ignored",
+          message: `cancel_in_progress= on '${n.id}' is ignored — it applies to an agent node that owns its own workflow`,
+          where: { node: n.id, line: n.line },
+          hint: "set it on a standalone agent lane (analyst, issue-agent, producer, pr-review, pr-fix, scheduled-agent)",
+        });
+      } else if (
+        n.attrs.cancel_in_progress === true &&
+        (n.type === "producer" || n.type === "pr-fix" || (n.type === "scheduled-agent" && n.attrs.commit !== "none"))
+      ) {
+        // Not an error — sometimes newest-wins is exactly right — but the cost is
+        // invisible until it bites: cancellation skips the `!cancelled()` salvage.
+        diags.push({
+          level: "warning",
+          code: "node.cancel-in-progress-discards-work",
+          message: `cancel_in_progress=true on '${n.id}' (type ${n.type}): a cancelled run skips the commit/push salvage, so whatever the agent had written but not yet pushed is lost`,
+          where: { node: n.id, line: n.line },
+          hint: "keep it for lanes where the newer event supersedes the older run's work; otherwise leave the default (queue)",
+        });
+      }
+    }
+    if (n.attrs.checkout !== undefined) {
+      if (n.attrs.checkout !== "partial") {
+        diags.push({
+          level: "error",
+          code: "node.bad-checkout",
+          message: `checkout= on '${n.id}' must be "partial", got ${JSON.stringify(n.attrs.checkout)}`,
+          where: { node: n.id, line: n.line },
+          hint: `checkout="partial" is a blob-less clone with full history; omit the attr for the lane's default checkout`,
+        });
+      } else if (n.type === "start" || n.type === "exit" || n.type === "parallel" || n.type === "human-gate") {
+        diags.push({
+          level: "warning",
+          code: "node.checkout-ignored",
+          message: `checkout= on '${n.id}' (type ${n.type}) is ignored — this node checks nothing out`,
+          where: { node: n.id, line: n.line },
+        });
+      }
+    }
+    if (n.attrs.gates !== undefined) {
+      try {
+        parseGates(n);
+      } catch (e) {
+        diags.push({
+          level: "error",
+          code: "node.bad-gates",
+          message: (e as Error).message,
+          where: { node: n.id, line: n.line },
+          hint: `comma-separated workflow files or check-run names, each with an optional ?<seconds> grace — e.g. gates="ci.yml, e2e (chromium)?90"`,
+        });
+      }
+    }
+    if (n.attrs.skip !== undefined) {
+      let conds: ReturnType<typeof parseSkip> = [];
+      try {
+        conds = parseSkip(n);
+      } catch (e) {
+        diags.push({
+          level: "error",
+          code: "node.bad-skip",
+          message: (e as Error).message,
+          where: { node: n.id, line: n.line },
+          hint: `e.g. skip="draft,bot-author,label:no-agent-review,unchanged-diff"`,
+        });
+      }
+      const eventDrivenPrLane =
+        (n.type === "pr-review" || n.type === "analyst") &&
+        hasPrContext(n) &&
+        n.attrs.schedule === undefined &&
+        !diamondMembers.has(n.id);
+      if (!eventDrivenPrLane) {
+        // An error, not an "ignored" warning: skip= is a promise that some PRs
+        // are NOT reviewed, and silently reviewing them anyway breaks it.
+        diags.push({
+          level: "error",
+          code: "node.skip-unsupported",
+          message: `skip= on '${n.id}' is not supported here — it needs a standalone, event-driven pr-review/analyst node with context="pr-diff" or "pr-review"`,
+          where: { node: n.id, line: n.line },
+          hint:
+            n.attrs.select !== undefined || n.attrs.schedule !== undefined
+              ? "a scheduled (select=\"sweep\") lane picks its own PRs; skip= guards a lane that reacts to PR events"
+              : diamondMembers.has(n.id)
+                ? "a diamond leg has no guard job of its own; put the review lane outside the diamond"
+                : `set context="pr-diff" on the node — skip= reads the pull request the event is about`,
+        });
+      }
+      if (conds.some((c) => c.kind === "unchanged-diff") && !ir.config.identity?.bot_login) {
+        diags.push({
+          level: "error",
+          code: "node.skip-needs-bot-login",
+          message: `skip="unchanged-diff" on '${n.id}' compares against the bot's last review, but identity.bot_login is unset`,
+          where: { node: n.id, line: n.line },
+          hint: "set identity.bot_login in foundry.config.yaml to the login that posts the reviews",
+        });
+      }
+    }
+    if (n.attrs.select !== undefined) {
+      if (n.attrs.select !== "sweep") {
+        diags.push({
+          level: "error",
+          code: "node.bad-select",
+          message: `select= on '${n.id}' must be "sweep", got ${JSON.stringify(n.attrs.select)}`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (n.type !== "pr-review" || !hasPrContext(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.select-unsupported",
+          message: `select="sweep" on '${n.id}' needs a standalone pr-review node with context="pr-diff" or "pr-review"`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (n.attrs.schedule === undefined) {
+        diags.push({
+          level: "error",
+          code: "node.sweep-no-schedule",
+          message: `select="sweep" on '${n.id}' needs schedule="<cron>" — a sweep is driven by its schedule, not by PR events`,
+          where: { node: n.id, line: n.line },
+          hint: `e.g. schedule="*/15 * * * *"`,
+        });
+      } else if (!ir.config.identity?.bot_login) {
+        diags.push({
+          level: "warning",
+          code: "node.sweep-no-bot-login",
+          message: `select="sweep" on '${n.id}': identity.bot_login is unset, so ANY review carrying a '**Verdict:**' marker counts as the decision — a user can pre-empt the lane by posting one`,
+          where: { node: n.id, line: n.line },
+          hint: "set identity.bot_login in foundry.config.yaml to the login that posts the verdict",
         });
       }
     }

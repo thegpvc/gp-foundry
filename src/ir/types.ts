@@ -124,7 +124,16 @@ export interface FoundryConfig {
     git_name?: string;
     git_email?: string;
   };
-  agent: { cli: string; model: string; oauth_token_secret?: string; conventions?: string; secrets?: string[] };
+  agent: {
+    cli: string;
+    model: string;
+    /** Secret holding the Claude Code OAuth token (bound to one subscription seat). */
+    oauth_token_secret?: string;
+    /** Secret holding an Anthropic API key. When set it is used INSTEAD of the OAuth token. */
+    api_key_secret?: string;
+    conventions?: string;
+    secrets?: string[];
+  };
   repo: { base_branch: string; branch_prefix: string };
   /** semantic role -> repo label (the drift-killer). */
   labels: Record<string, string>;
@@ -221,7 +230,10 @@ export interface WorkflowJobFragment {
   environment?: string;
   /** Job-level guard. */
   if?: string;
-  strategy?: { matrix?: Record<string, AttrValue[]>; "max-parallel"?: number };
+  /** Job outputs (name -> expression), read by a dependent job as `needs.<id>.outputs.<name>`. */
+  outputs?: Record<string, string>;
+  /** A matrix vector is a literal list, or one expression that yields the list at run time. */
+  strategy?: { matrix?: Record<string, AttrValue[] | string>; "max-parallel"?: number; "fail-fast"?: boolean };
   steps: StepSpec[];
   timeoutMinutes?: number;
 }

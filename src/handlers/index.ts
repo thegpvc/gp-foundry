@@ -12,6 +12,7 @@ import type {
   StepSpec,
   WorkflowJobFragment,
 } from "../ir/types.js";
+import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf } from "./attrs.js";
 import {
   appTokenStep,
   checkoutStep,
@@ -122,30 +123,54 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
     ? { contents: "read", "pull-requests": "write" }
     : { contents: "read", issues: "write" };
 
+  // select="sweep": the lane is not reacting to one PR's event, so there is no
+  // event payload to read the PR from — the selector job hands each chosen head
+  // to this job as a matrix entry instead.
+  const sweep = isSweep(node);
+  const skipGuard = !sweep && hasSkipGuard(node);
+  const pre = preJobId(node);
+  const prNumber = sweep ? "${{ matrix.pr.number }}" : PR_NUMBER;
+  const prHeadSha = sweep ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
+
   const steps: StepSpec[] = [];
   const app = appTokenStep(ctx);
   if (app) steps.push(app);
 
   // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
   // action (./.github/actions/…) that cannot resolve before checkout.
-  steps.push(checkoutStep(ctx, isPr ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
+  steps.push(checkoutStep(ctx, isPr ? { ref: prHeadSha, fetchDepth: 0 } : undefined));
 
-  // pr-review waits for named CI gates before reviewing
-  const gatesAttr = typeof node.attrs.gates === "string" ? node.attrs.gates : undefined;
-  const gates = isPr && gatesAttr ? gatesAttr.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  // pr-review waits for named CI gates before reviewing. An entry naming a
+  // workflow file waits on that workflow's runs; any other entry is a check-run
+  // name — the only way to gate on a check GitHub Actions did not produce (an
+  // external CI, a required status app) or on one job of a larger workflow.
+  const gateSpecs = isPr ? gatesOf(node) : [];
+  const gates = gateSpecs.map((g) => g.name);
   const gateIds = gates.map((wf, i) => stepId(`gate-${wf}`, i, gates));
-  gates.forEach((wf, i) => {
+  gateSpecs.forEach((g, i) => {
     steps.push({
       uses: ctx.actionRef("wait-for-checks"),
       id: gateIds[i],
-      name: `Wait for ${wf}`,
-      with: { sha: PR_HEAD_SHA, "workflow-name": wf, token: tokenExpr(ctx) },
+      name: `Wait for ${g.name}`,
+      with: {
+        sha: prHeadSha,
+        ...(g.kind === "workflow"
+          ? { "workflow-name": g.name, token: tokenExpr(ctx) }
+          : // Check-runs are read with GITHUB_TOKEN (see `checks: read` below): the
+            // Checks permission has no fine-grained-PAT equivalent, so the harness
+            // token would 403 in the default `pat` auth mode.
+            { "check-name": g.name, token: "${{ github.token }}" }),
+        // `?N`: how long to wait for the target to APPEAR before calling it
+        // `skipped` — for a check that only runs on some heads.
+        ...(g.graceSeconds !== undefined ? { "missing-grace-seconds": g.graceSeconds } : {}),
+      },
     });
   });
+  if (gateSpecs.some((g) => g.kind === "check")) permissions.checks = "read";
 
   steps.push(setupStep());
   const ctxType = context === "pr-diff" ? "pr-diff" : context === "pr-review" ? "pr-review" : "issue";
-  steps.push(contextStep(ctx, ctxType, isPr ? PR_NUMBER : ISSUE_NUMBER));
+  steps.push(contextStep(ctx, ctxType, isPr ? prNumber : ISSUE_NUMBER));
   // Waiting for a gate is not the same as reading it: wait-for-checks never fails
   // the step, so a red or timed-out gate used to be indistinguishable from a green
   // one. Put every conclusion in front of the reviewer and say what a non-success
@@ -164,13 +189,65 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   // review; that case stays on the job cap alone.
   steps.push(gates.length ? agent : { ...agent, timeoutMinutes: agentStepTimeout(jobTimeout) });
 
-  return {
+  const fragment: WorkflowJobFragment = {
     jobId: node.id,
     name: node.id,
     permissions,
     timeoutMinutes: jobTimeout,
     steps,
   };
+  if (sweep) {
+    fragment.needs = [pre];
+    // An empty matrix is a workflow error, so an empty sweep skips the job outright.
+    fragment.if = `needs.${pre}.outputs.count != '0'`;
+    fragment.strategy = {
+      // One PR's failed review must not cancel the others'.
+      "fail-fast": false,
+      matrix: { pr: `\${{ fromJSON(needs.${pre}.outputs.prs) }}` },
+    };
+  } else if (skipGuard) {
+    fragment.needs = [pre];
+    fragment.if = `needs.${pre}.outputs.run == 'true'`;
+    if (skipOf(node).some((c) => c.kind === "unchanged-diff")) steps.push(diffStampStep(ctx, pre));
+  }
+  return fragment;
+}
+
+/**
+ * skip="unchanged-diff", the writing half: after the review is posted, append
+ * the hash of the diff it covered to the review body as an HTML comment. The
+ * guard job reads it back on the next event. Stamped by the workflow rather than
+ * asked of the agent, so the marker cannot be forgotten, mistyped or invented —
+ * and only onto a review of the exact head the guard hashed.
+ */
+function diffStampStep(ctx: EmitContext, guardJob: string): StepSpec {
+  return runStep({
+    name: "Stamp the review with the diff hash",
+    // success(): a failed or timed-out agent reviewed nothing worth remembering.
+    if: `\${{ success() && needs.${guardJob}.outputs.diff_hash != '' }}`,
+    env: {
+      GH_TOKEN: tokenExpr(ctx),
+      PR: PR_NUMBER,
+      HEAD_SHA: `\${{ needs.${guardJob}.outputs.head_sha }}`,
+      DIFF_HASH: `\${{ needs.${guardJob}.outputs.diff_hash }}`,
+      BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
+      MARKER_PREFIX: diffMarkerPrefix(ctx.node),
+    },
+    run: [
+      `# Best-effort: a missing stamp only means the next event is reviewed again.`,
+      `ID=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
+      `  .[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)`,
+      `  | select((.body // "") | contains(env.MARKER_PREFIX) | not) | .id' 2>/dev/null | tail -n 1) || ID=""`,
+      `if [ -z "$ID" ]; then`,
+      `  echo "no unstamped review by $BOT_LOGIN on $HEAD_SHA — nothing to stamp"`,
+      `  exit 0`,
+      `fi`,
+      `BODY=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$ID" --jq '.body // ""') || exit 0`,
+      `gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$ID" \\`,
+      `  -f body="$(printf '%s\\n\\n%s%s -->' "$BODY" "$MARKER_PREFIX" "$DIFF_HASH")" >/dev/null \\`,
+      `  || echo "::warning::could not stamp review $ID with the diff hash"`,
+    ].join("\n"),
+  });
 }
 
 /** A workflow name → a valid, unique GitHub step id. */

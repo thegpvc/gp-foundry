@@ -46,7 +46,17 @@ export function appTokenStep(ctx: EmitContext): UsesStep | undefined {
 export function checkoutStep(ctx: EmitContext, opts: { ref?: string; fetchDepth?: number } = {}): UsesStep {
   const withBlock: Record<string, string | number> = { token: tokenExpr(ctx) };
   if (opts.ref) withBlock.ref = opts.ref;
-  if (opts.fetchDepth !== undefined) withBlock["fetch-depth"] = opts.fetchDepth;
+  if (ctx.node.attrs.checkout === "partial") {
+    // checkout="partial": a blob-less partial clone. Every commit and tree is
+    // fetched, so `git log`, `git blame` and merge-base diffs work as in a full
+    // clone, but file contents arrive on demand — the cost of history without
+    // the cost of every version of every file. It overrides the lane's default
+    // depth: a shallow blob-less clone would have no history to be cheap about.
+    withBlock["fetch-depth"] = 0;
+    withBlock.filter = "blob:none";
+  } else if (opts.fetchDepth !== undefined) {
+    withBlock["fetch-depth"] = opts.fetchDepth;
+  }
   return { uses: "actions/checkout@v5", name: "Checkout", with: withBlock };
 }
 
@@ -90,7 +100,11 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
     model: cfg.agent.model,
     "comms-file": resolveFile(ctx, "agents/communication.md"),
     "scope-path": resolveFile(ctx, "agents/scope.yaml"),
-    "claude-code-oauth-token": secretRef(cfg.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN"),
+    // One credential, never both: an API key (usage-billed, not tied to a person)
+    // replaces the OAuth token (bound to one subscription seat) when configured.
+    ...(cfg.agent.api_key_secret
+      ? { "anthropic-api-key": secretRef(cfg.agent.api_key_secret) }
+      : { "claude-code-oauth-token": secretRef(cfg.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN") }),
     "github-token": tokenExpr(ctx),
   };
   if (opts.withContext) withBlock["context-file"] = "${{ steps.ctx.outputs.context-file }}";

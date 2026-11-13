@@ -7,8 +7,11 @@
  * label/state writes by a prior node, exactly as dixie already coordinates.
  */
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
+import { AGENT_TYPES } from "../ir/types.js";
+import { hasSkipGuard, skipOf } from "../handlers/attrs.js";
 import { detectDiamonds } from "./diamond.js";
 
+const AGENT = new Set(AGENT_TYPES);
 const PR_CONTEXT_TYPES = new Set(["pr-review", "pr-fix"]);
 
 /**
@@ -41,6 +44,7 @@ function mergeEvent(triggers: Record<string, any>, event: string, target: Harnes
     case "pull_request.synchronize": return addType("pull_request", "synchronize");
     case "pull_request.labeled": return addType("pull_request", "labeled");
     case "pull_request.closed": return addType("pull_request", "closed");
+    case "pull_request.ready_for_review": return addType("pull_request", "ready_for_review");
     case "pull_request_review.submitted": return addType("pull_request_review", "submitted");
     case "push":
       // a push into a pr-review node means "re-review after the branch moved"
@@ -201,9 +205,20 @@ function applyBranchPrefix(
   return guard ? `(${guard}) && ${clause}` : clause;
 }
 
+/**
+ * `cancel_in_progress=true|false` on an agent node overrides the lane's default
+ * (on for issue-agent, off everywhere else): a newer event for the same unit
+ * cancels the run already in flight instead of queueing behind it. Anything but
+ * a boolean on an agent node is validate()'s to report; the default stands.
+ */
+function cancelInProgress(node: HarnessNode, dflt: boolean): boolean {
+  const v = node.attrs.cancel_in_progress;
+  return typeof v === "boolean" && AGENT.has(node.type) ? v : dflt;
+}
+
 function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress": boolean } {
   if (node.attrs.schedule !== undefined) {
-    return { group: node.id, "cancel-in-progress": false };
+    return { group: node.id, "cancel-in-progress": cancelInProgress(node, false) };
   }
   // human-gate approvals ride PR events (verdict edges → pull_request_review), whose
   // payload has pull_request.number, not issue.number — an issue-scoped key would
@@ -212,7 +227,7 @@ function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress
   const num = prScoped
     ? "${{ github.event.pull_request.number }}"
     : "${{ github.event.issue.number }}";
-  return { group: `${node.id}-${num}`, "cancel-in-progress": node.type === "issue-agent" };
+  return { group: `${node.id}-${num}`, "cancel-in-progress": cancelInProgress(node, node.type === "issue-agent") };
 }
 
 export function wire(ir: Harness): WiringPlan {
@@ -275,6 +290,18 @@ export function wire(ir: Harness): WiringPlan {
         for (const ev of w.events) allEvents.add(effectiveEvent(ev, node));
         if (w.guard) guards.add(w.guard);
         else for (const ev of w.events) unguardedEvents.add(effectiveEvent(ev, node));
+      }
+      // skip="draft" turns a draft PR's events into no-ops, so the lane must hear
+      // the moment the draft is marked ready — otherwise a PR opened as a draft
+      // is never reviewed until someone happens to push to it again.
+      if (
+        triggers.pull_request &&
+        hasSkipGuard(node) &&
+        skipOf(node).some((c) => c.kind === "draft")
+      ) {
+        mergeEvent(triggers, "pull_request.ready_for_review", node);
+        allEvents.add("pull_request.ready_for_review");
+        unguardedEvents.add("pull_request.ready_for_review");
       }
       // Mixed guarded + unguarded edges: the unguarded events must still pass the
       // job-level `if`, so they contribute an event-discriminator OR-clause.
