@@ -57,9 +57,17 @@ inputs:
     default: ""
   claude-code-oauth-token:
     description: >-
-      Claude Code OAuth token. Composites have no secrets context, so this must
-      be passed in explicitly by the caller.
-    required: true
+      Claude Code OAuth token — authenticates as one subscription seat. Pass
+      this OR `anthropic-api-key`, never both. Composites have no secrets
+      context, so the credential must be passed in explicitly by the caller.
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: >-
+      Anthropic API key — usage-billed and not tied to a person's seat, the
+      alternative to `claude-code-oauth-token`. Pass exactly one of the two.
+    required: false
+    default: ""
   github-token:
     description: >-
       Token for the agent's own `gh`/git operations (labels, comments, PRs).
@@ -180,6 +188,7 @@ runs:
       shell: bash
       env:
         CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         GH_TOKEN: ${{ inputs.github-token }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         PROMPT_FILE: ${{ steps.assemble.outputs.prompt-file }}
@@ -193,8 +202,19 @@ runs:
       run: |
         set -uo pipefail
 
-        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
-          echo "::error::claude-code-oauth-token is empty"
+        # Exactly one credential. Which one the CLI prefers when it sees both is
+        # its business, not something a billing decision should rest on — so two
+        # is an error, and the unused variable is removed rather than left empty
+        # in the agent's environment.
+        if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+          echo "::error::both anthropic-api-key and claude-code-oauth-token are set — pass exactly one"
+          exit 1
+        elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+          unset CLAUDE_CODE_OAUTH_TOKEN
+        elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+          unset ANTHROPIC_API_KEY
+        else
+          echo "::error::no agent credential: both claude-code-oauth-token and anthropic-api-key are empty"
           exit 1
         fi
 

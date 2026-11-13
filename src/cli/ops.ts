@@ -220,7 +220,10 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
   );
 
   const secretNames = new Set((ghJson<{ name: string }[]>(["secret", "list", "--json", "name"], root) ?? []).map((s) => s.name));
-  const needSecrets = [harness.config.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN"];
+  // The agent credential: an API key replaces the OAuth token when configured.
+  const needSecrets = [
+    harness.config.agent.api_key_secret || (harness.config.agent.oauth_token_secret ?? "CLAUDE_CODE_OAUTH_TOKEN"),
+  ];
   const authCfg = harness.config.auth;
   if (authCfg?.mode === "pat" && authCfg.token_secret) needSecrets.push(authCfg.token_secret);
   if (authCfg?.mode === "app") needSecrets.push(authCfg.app_id_secret ?? "APP_ID", authCfg.app_key_secret ?? "APP_PRIVATE_KEY");

@@ -18,6 +18,7 @@ import type {
 } from "../ir/types.js";
 import { isUsesStep } from "../ir/types.js";
 import { emitFanIn, emitNode } from "../handlers/index.js";
+import { emitPreJob } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
 
@@ -174,6 +175,7 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     }
     if (fragment.timeoutMinutes) job["timeout-minutes"] = fragment.timeoutMinutes;
     if (fragment.needs?.length) job.needs = fragment.needs;
+    if (fragment.outputs && Object.keys(fragment.outputs).length) job.outputs = fragment.outputs;
     if (fragment.strategy) job.strategy = fragment.strategy;
     job.steps = fragment.steps.map(stepToObject);
     return job;
@@ -198,7 +200,11 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     if (diamond) {
       const jobs: Record<string, unknown> = {};
       for (const legId of diamond.legIds) {
-        const leg = byId.get(legId)!;
+        // skip= / select= need a pre-job of their own, which a diamond has no
+        // place for (validate() errors on them); drop the attrs so a leg can
+        // never be emitted `needs:`-chained to a job that does not exist.
+        const { skip: _skip, select: _select, ...legAttrs } = byId.get(legId)!.attrs;
+        const leg: HarnessNode = { ...byId.get(legId)!, attrs: legAttrs };
         const legFragment = emitNode(leg, ir, mkCtx(leg));
         // The entry-edge guard gates the LEGS; the fan_in is gated by `needs:` instead.
         if (legFragment) jobs[legFragment.jobId] = fragmentToJob(legFragment, nw.guard);
@@ -218,12 +224,19 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
 
     const fragment = emitNode(node, ir, mkCtx(node));
     if (!fragment) continue;
+    // A skip guard / sweep selector runs FIRST and carries the wiring guard; the
+    // node's own job is `needs:`-chained behind it and gated on its outputs (the
+    // handler sets that `if:`), so a guard the wiring skips skips the lane too.
+    const pre = emitPreJob(mkCtx(node));
+    const jobs: Record<string, unknown> = pre
+      ? { [pre.jobId]: fragmentToJob(pre, nw.guard), [fragment.jobId]: fragmentToJob(fragment) }
+      : { [fragment.jobId]: fragmentToJob(fragment, nw.guard) };
     emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,
       ...(nw.concurrency ? { concurrency: nw.concurrency } : {}),
       permissions: { contents: "read" },
-      jobs: { [fragment.jobId]: fragmentToJob(fragment, nw.guard) },
+      jobs,
     });
   }
 

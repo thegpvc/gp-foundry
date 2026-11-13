@@ -68,6 +68,12 @@ repo checks) cleanly when there's no GitHub remote yet, and builds the workflows
 | `CLAUDE_CODE_OAUTH_TOKEN` | The coding agent's auth token — how each agent job authenticates to Claude Code. | n/a (agent credential) |
 | `AGENT_PAT` | A fine-grained Personal Access Token used for the agents' git writes, PRs, and comments. Needed because pushes made with the built-in `GITHUB_TOKEN` do **not** trigger downstream workflows, so the pipeline couldn't cascade stage to stage. | Contents · Pull requests · Issues · Actions — **read/write**, scoped to this repo |
 
+Prefer an **Anthropic API key** to the OAuth token? The token authenticates as one
+person's subscription seat; a key is usage-billed and belongs to nobody. Set
+`agent.api_key_secret: ANTHROPIC_API_KEY` in `foundry.config.yaml`, run
+`gh secret set ANTHROPIC_API_KEY`, and rebuild — agents then use the key *instead*
+(run-agent takes exactly one credential and refuses both).
+
 (`AGENT_PAT` is the default `auth.mode: pat`. You can instead run under a GitHub App
 (`mode: app`, set `app_id_secret`/`app_key_secret`) or the built-in token (`mode:
 github-token`, zero setup but no cascading) — see `foundry.config.yaml`.)

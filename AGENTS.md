@@ -65,6 +65,10 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN   # the coding agent's auth token
 gh secret set AGENT_PAT                 # fine-grained PAT: Contents + Pull requests + Issues + Actions, RW, this repo
 ```
 
+(Not tied to one person's seat? Set `agent.api_key_secret: ANTHROPIC_API_KEY` in
+`.github/agents/foundry.config.yaml` and have them set that secret instead of
+`CLAUDE_CODE_OAUTH_TOKEN` — an Anthropic API key, usage-billed.)
+
 (`AGENT_PAT` exists because the built-in `GITHUB_TOKEN` cannot trigger downstream
 workflows — the pipeline would silently stall between stages.)
 

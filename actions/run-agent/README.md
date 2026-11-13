@@ -38,7 +38,8 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
 | `scope-path`              | no       | `.github/agents/scope.yaml`   | Scope config file, included verbatim if it exists. |
 | `model`                   | yes      | —                             | Value for `claude --model`. |
 | `allowed-tools`           | yes      | —                             | Value for `claude --allowedTools` (comma-separated). |
-| `claude-code-oauth-token` | yes      | —                             | OAuth token; passed explicitly (composites have no `secrets`). |
+| `claude-code-oauth-token` | one of   | `""`                          | OAuth token (one subscription seat); passed explicitly (composites have no `secrets`). |
+| `anthropic-api-key`       | one of   | `""`                          | Anthropic API key (usage-billed, no seat). Pass exactly one of the two credentials; both or neither fails the step. |
 | `github-token`            | no       | `""`                          | Token for the agent's own `gh`/git calls (`GH_TOKEN`/`GITHUB_TOKEN`). |
 | `comms-file`              | no       | `.github/agents/communication.md` | Team communication guide, included verbatim if it exists. |
 | `extra-args`              | no       | `""`                          | Extra args appended verbatim to the `claude` invocation. |

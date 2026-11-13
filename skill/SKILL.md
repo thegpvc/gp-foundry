@@ -132,7 +132,8 @@ config (`labels:` in `foundry.config.yaml`), never hardcoded strings.
 
 Fill `foundry.config.yaml`: `identity` (App-id/App-key **secret names**, bot login,
 git name/email — never a literal like `dixie-agent[bot]`), `agent.cli`/`agent.model`/
-`agent.oauth_token_secret`, `repo.base_branch`/`repo.branch_prefix`, `labels`, and
+`agent.oauth_token_secret` (or `agent.api_key_secret` — an Anthropic API key used
+*instead*, when the agents should not run on one person's seat), `repo.base_branch`/`repo.branch_prefix`, `labels`, and
 `runtime.mode` (`vendored` default — `gp-foundry vendor`/`up` copies the runtime actions
 into the repo; switch to `pinned` + a SHA once the actions repo is public). Size/merge
 policy lives in `agents/policy/merge.yaml`, not the config. If a toolchain is needed,
@@ -173,8 +174,8 @@ paths:
 Then fill in the four spec surfaces you drafted from the interview:
 
 - **`harness.dot`** — the graph. Nodes carry `type`, `role="agents/roles/<name>.md"`, and typed
-  attrs (`context`, `gates`, `max_attempts`, `schedule`, `policy`, `environment`,
-  `output`). Edges carry `on=` and/or `when=`. See `templates/harness.dot` and
+  attrs (`context`, `gates`, `skip`, `select`, `max_attempts`, `schedule`, `policy`,
+  `environment`, `output`, `checkout`, `cancel_in_progress`). Edges carry `on=` and/or `when=`. See `templates/harness.dot` and
   `reference/node-types.md`.
 - **`agents/roles/<name>.md`** — one per agent node. Front-matter (`role`, `type`, `mission`,
   `accountable_for`, `inputs`, `outputs`, `handoffs`, `tools`, `quality_bar`) + prose

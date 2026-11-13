@@ -29,6 +29,7 @@ agent: # the coding-agent CLI + default model
   cli: claude
   model: claude-opus-4-8
   oauth_token_secret: CLAUDE_CODE_OAUTH_TOKEN # gh secret set CLAUDE_CODE_OAUTH_TOKEN --body <token>
+  # api_key_secret: ANTHROPIC_API_KEY # use an Anthropic API key INSTEAD of the seat-bound OAuth token
   # allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh:*)"  # roles may widen/narrow
 
 repo:

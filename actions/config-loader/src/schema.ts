@@ -58,6 +58,10 @@ export const CONFIG_SCHEMA = {
           "type": "string",
           "description": "Name of the Actions secret holding the agent OAuth token."
         },
+        "api_key_secret": {
+          "type": "string",
+          "description": "Name of the Actions secret holding an Anthropic API key. When set, agents authenticate with it INSTEAD of the OAuth token: usage-billed and not bound to one person's subscription seat."
+        },
         "allowed_tools": {
           "$ref": "#/$defs/allowedTools",
           "description": "Default allowed-tools list for the agent CLI."
