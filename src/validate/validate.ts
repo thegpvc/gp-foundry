@@ -8,7 +8,17 @@ import type { Diagnostic, Harness, HarnessEdge, HarnessNode, RoleSpec } from "..
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
 import { parsePermissionsAttr } from "../handlers/index.js";
-import { hasPrContext, parseGates, parseSkip } from "../handlers/attrs.js";
+import {
+  KNOWN_EDGE_ATTRS,
+  KNOWN_NODE_ATTRS,
+  hasPrContext,
+  nearestAttr,
+  parseAuthors,
+  parseConfigAuthors,
+  parseGates,
+  parseSkip,
+  takesAuthors,
+} from "../handlers/attrs.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 
 export interface ValidateDeps {
@@ -38,8 +48,75 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   }
 
+  // Unknown attributes. The parser keeps whatever it is handed, so without this
+  // a typo or an attribute from a newer gp-foundry compiles cleanly and does
+  // nothing — fatal when the attribute was a restriction the user is relying on.
+  const unknownAttr = (name: string, known: ReadonlySet<string>, on: string, where: Diagnostic["where"]): void => {
+    const near = nearestAttr(name, known);
+    diags.push({
+      level: "error",
+      code: "attr.unknown",
+      message: `unknown attribute '${name}=' on ${on} — it would be silently ignored`,
+      where,
+      hint: near
+        ? `did you mean '${near}='?`
+        : "see reference/node-types.md for the attributes this version of gp-foundry understands",
+    });
+  };
+  for (const n of ir.nodes) {
+    for (const k of Object.keys(n.raw)) {
+      if (!KNOWN_NODE_ATTRS.has(k)) unknownAttr(k, KNOWN_NODE_ATTRS, `node '${n.id}'`, { node: n.id, line: n.line });
+    }
+  }
+  for (const e of ir.edges) {
+    for (const k of Object.keys(e.raw)) {
+      if (!KNOWN_EDGE_ATTRS.has(k)) {
+        unknownAttr(k, KNOWN_EDGE_ATTRS, `edge '${e.from} -> ${e.to}'`, { edge: [e.from, e.to], line: e.line });
+      }
+    }
+  }
+
+  // repo.authors (config-wide allowlist) is checked once, not per node.
+  try {
+    parseConfigAuthors(ir.config);
+  } catch (e) {
+    diags.push({
+      level: "error",
+      code: "config.bad-authors",
+      message: (e as Error).message,
+      hint: "repo.authors is a list of GitHub logins, e.g. authors: [dpup]",
+    });
+  }
+
   // Per-node requirements.
   for (const n of ir.nodes) {
+    if (n.attrs.authors !== undefined) {
+      if (!takesAuthors(n) || diamondMembers.has(n.id)) {
+        // An error for the same reason an unknown attribute is: an allowlist
+        // that binds nothing reads, in the spec, exactly like one that does.
+        diags.push({
+          level: "error",
+          code: "node.authors-unsupported",
+          message: `authors= on '${n.id}' is not supported here — it binds a standalone pr-review / pr-fix node, or an analyst with context="pr-diff" or "pr-review"`,
+          where: { node: n.id, line: n.line },
+          hint: diamondMembers.has(n.id)
+            ? "a diamond is bound by repo.authors in foundry.config.yaml"
+            : "to restrict every PR lane at once, set repo.authors in foundry.config.yaml",
+        });
+      } else {
+        try {
+          parseAuthors(n, ir.config);
+        } catch (e) {
+          diags.push({
+            level: "error",
+            code: "node.bad-authors",
+            message: (e as Error).message,
+            where: { node: n.id, line: n.line },
+            hint: `comma-separated GitHub logins, e.g. authors="dpup, octocat"`,
+          });
+        }
+      }
+    }
     if (AGENT.has(n.type) && !n.files.role) {
       diags.push({
         level: "error",

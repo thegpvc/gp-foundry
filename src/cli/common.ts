@@ -1,9 +1,29 @@
 /** Shared CLI helpers (kept out of index.ts so ops.ts can use them without cycles). */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pc from "picocolors";
-import type { Diagnostic } from "../ir/types.js";
+import type { Diagnostic, GeneratedFile } from "../ir/types.js";
+import { GENERATED_MARKER } from "../assemble/assemble.js";
+
+/**
+ * Generated workflows on disk that the current graph no longer produces — a
+ * lane that was removed, a guard that no longer applies. Left in place they keep
+ * RUNNING: GitHub executes whatever is in .github/workflows/, not what the spec
+ * says. Only files carrying the generated header are ever returned, so a
+ * hand-written workflow is never touched. Paths are repo-relative.
+ */
+export function staleGeneratedWorkflows(root: string, files: GeneratedFile[]): string[] {
+  const dir = join(root, ".github", "workflows");
+  if (!existsSync(dir)) return [];
+  const current = new Set(files.map((f) => f.path));
+  return readdirSync(dir)
+    .filter((name) => /\.ya?ml$/.test(name))
+    .map((name) => `.github/workflows/${name}`)
+    .filter((rel) => !current.has(rel))
+    .filter((rel) => readFileSync(join(root, rel), "utf8").startsWith(GENERATED_MARKER))
+    .sort();
+}
 
 /** Resolve a path inside the installed package (works in dev via tsx and when bundled/published). */
 export function pkgFile(rel: string): string {

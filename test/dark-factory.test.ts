@@ -699,7 +699,7 @@ describe("immutable-paths guard is scaffolded (item 12)", () => {
     return yaml.load(file.contents) as any;
   };
 
-  it("is emitted for every harness, scoped to agent branches", () => {
+  it("is emitted for a harness with a code-writing lane, scoped to agent branches", () => {
     const doc = guard();
     const job = doc.jobs["immutable-paths"];
     expect(doc.on.pull_request.types).toContain("synchronize");

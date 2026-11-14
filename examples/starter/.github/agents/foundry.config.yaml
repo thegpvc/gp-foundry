@@ -35,6 +35,7 @@ agent: # the coding-agent CLI + default model
 repo:
   base_branch: main
   branch_prefix: agent/ # branches look like agent/<issue>-slug (matches policy branch_prefix)
+  # authors: [your-login] # only PRs opened by these logins reach the PR lanes (or authors="…" per node)
 
 labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resolve
   # through this map, so renaming a repo label is a one-line change HERE —

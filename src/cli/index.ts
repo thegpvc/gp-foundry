@@ -3,7 +3,7 @@
 import { Command } from "commander";
 import pc from "picocolors";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { RoleSpec } from "../ir/types.js";
 import { compile, hasErrors } from "../index.js";
@@ -13,7 +13,7 @@ import { parseRoleFrontmatter } from "../roles/role.js";
 import { validate } from "../validate/validate.js";
 import { modelCheck } from "../modelcheck/check.js";
 import { renderDiagram } from "../diagram/render.js";
-import { emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
+import { staleGeneratedWorkflows, emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
 import { registerOpsCommands } from "./ops.js";
 
 const program = new Command();
@@ -139,17 +139,22 @@ program
     const { files, diagnostics } = compile(harness, { fileExists }, { specDir });
     if (!opts.json) printDiagnostics(diagnostics);
 
+    // Generated workflows the graph no longer produces still run on GitHub.
+    const stale = staleGeneratedWorkflows(out, files);
+
     if (opts.check) {
       const drift = files.filter((f) => {
         const p = join(out, f.path);
         return (existsSync(p) ? readFileSync(p, "utf8") : null) !== f.contents;
       });
-      if (opts.json) emitJson({ upToDate: drift.length === 0, drift: drift.map((f) => f.path), diagnostics });
-      else if (drift.length) {
+      const upToDate = drift.length === 0 && stale.length === 0;
+      if (opts.json) emitJson({ upToDate, drift: drift.map((f) => f.path), stale, diagnostics });
+      else if (!upToDate) {
         for (const f of drift) process.stderr.write(pc.yellow(`drift: ${f.path}\n`));
+        for (const p of stale) process.stderr.write(pc.yellow(`stale: ${p} (no longer generated)\n`));
         process.stderr.write(pc.red("generated files are out of date — run `gp-foundry build`\n"));
       } else process.stdout.write(pc.green("up to date\n"));
-      process.exit(drift.length ? 1 : 0);
+      process.exit(upToDate ? 0 : 1);
     }
 
     if (hasErrors(diagnostics) && !opts.force) {
@@ -159,8 +164,11 @@ program
     }
 
     if (opts.dryRun) {
-      if (opts.json) emitJson({ diagnostics, files });
-      else for (const f of files) process.stdout.write(pc.cyan(`--- ${f.path}\n`) + f.contents + "\n");
+      if (opts.json) emitJson({ diagnostics, files, stale });
+      else {
+        for (const f of files) process.stdout.write(pc.cyan(`--- ${f.path}\n`) + f.contents + "\n");
+        for (const p of stale) process.stdout.write(pc.yellow(`would remove ${p} (no longer generated)\n`));
+      }
       return;
     }
 
@@ -170,7 +178,11 @@ program
       writeFileSync(p, f.contents);
       if (!opts.json) process.stdout.write(pc.green(`wrote ${f.path}\n`));
     }
-    if (opts.json) emitJson({ ok: !hasErrors(diagnostics), diagnostics, wrote: files.map((f) => f.path) });
+    for (const p of stale) {
+      rmSync(join(out, p));
+      if (!opts.json) process.stdout.write(pc.yellow(`removed ${p} (no longer generated)\n`));
+    }
+    if (opts.json) emitJson({ ok: !hasErrors(diagnostics), diagnostics, wrote: files.map((f) => f.path), removed: stale });
   });
 
 program
