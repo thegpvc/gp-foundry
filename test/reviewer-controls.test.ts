@@ -18,6 +18,7 @@ import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
 import { parseGates } from "../src/handlers/attrs.js";
+import { staleGeneratedWorkflows } from "../src/cli/common.js";
 import type { Diagnostic, FoundryConfig, Harness, HarnessNode } from "../src/ir/types.js";
 
 const BOT = "agent-bot";
@@ -555,7 +556,7 @@ describe('select="sweep" on pr-review', () => {
 
   it("fans the lane out over the selected heads", () => {
     const w = wf();
-    expect(Object.keys(w.jobs)).toEqual(["approver_select", "approver"]);
+    expect(Object.keys(w.jobs)).toEqual(["approver_select", "approver", "approver_mark"]);
     expect(w.jobs.approver_select.if).toBeUndefined();
     expect(w.jobs.approver_select.permissions).toEqual({
       contents: "read",
@@ -599,7 +600,7 @@ describe('select="sweep" on pr-review', () => {
     it("does not combine with skip=", () => {
       const dot = SWEEP.replace('select="sweep"', 'select="sweep", skip="draft"');
       expect(codes(diags(dot), "error")).toContain("node.skip-unsupported");
-      expect(Object.keys(workflow(dot, "approver").jobs)).toEqual(["approver_select", "approver"]);
+      expect(Object.keys(workflow(dot, "approver").jobs)).toEqual(["approver_select", "approver", "approver_mark"]);
     });
 
     it("warns when no bot login pins who may decide", () => {
@@ -684,6 +685,28 @@ describe('select="sweep" on pr-review', () => {
         { number: 2, sha: "sha2" },
         { number: 3, sha: "sha3" },
         { number: 4, sha: "sha4" },
+      ]);
+    });
+
+    it("skips a head an earlier sweep already ran the lane on, verdict or not", () => {
+      // The shadow-mode loop: a role that posts nothing leaves no verdict, so
+      // without the lane's own marker the head is re-picked on every tick.
+      const swept = (app = "github-actions", name = "gp-foundry/swept (approver)") => ({
+        status: "completed",
+        name,
+        app: { slug: app },
+      });
+      const r = select({
+        [LIST]: [open(1), open(2), open(3)],
+        ...head(1, { checks: [{ status: "completed", name: "ci" }, swept()] }),
+        // Only GITHUB_TOKEN's check counts: the harness token must not be able to fake "done".
+        ...head(2, { checks: [swept("my-agent-app")] }),
+        // Another sweep lane's marker is not this lane's.
+        ...head(3, { checks: [swept("github-actions", "gp-foundry/swept (other)")] }),
+      });
+      expect(r.prs).toEqual([
+        { number: 2, sha: "sha2" },
+        { number: 3, sha: "sha3" },
       ]);
     });
 
@@ -809,5 +832,307 @@ describe("API-key auth for run-agent", () => {
       expect(neither.status).not.toBe(0);
       expect(neither.stdout).toContain("no agent credential");
     });
+  });
+});
+
+// ── the sweep's own "done" marker ────────────────────────────────────────────
+
+describe("sweep mark job: a head the lane ran on is not swept again", () => {
+  const SWEEP = `digraph t {
+    approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/10 * * * *"]
+  }`;
+  const wf = () => workflow(SWEEP, "approver");
+
+  it("runs after the lane, in a job of its own that holds checks: write and no agent", () => {
+    const w = wf();
+    const mark = w.jobs.approver_mark;
+    expect(mark.needs).toEqual(["approver_select", "approver"]);
+    expect(mark.if).toContain("always()");
+    expect(mark.permissions).toEqual({ checks: "write", actions: "read" });
+    expect(mark.steps).toHaveLength(1);
+    expect(mark.steps[0].env.GH_TOKEN).toBe("${{ github.token }}");
+    expect(mark.steps[0].run).not.toContain("${{");
+    // The agent lane itself never gains the scope the human-gate approval is written with.
+    expect(w.jobs.approver.permissions.checks).toBeUndefined();
+    // The lane job is named per PR so its result can be read back.
+    expect(w.jobs.approver.name).toBe("approver #${{ matrix.pr.number }}");
+    expect(mark.steps[0].env.JOB_PREFIX).toBe("approver #");
+  });
+
+  describe("the mark script, run against a stub gh", () => {
+    const JOBS = "repos/o/r/actions/runs/99/attempts/1/jobs?per_page=100";
+    const env = {
+      RUN_ID: "99",
+      RUN_ATTEMPT: "1",
+      PRS: JSON.stringify([
+        { number: 1, sha: "sha1" },
+        { number: 2, sha: "sha2" },
+        { number: 12, sha: "sha12" },
+      ]),
+    };
+    const run = (fx: Record<string, unknown>, e = env) => runStepScript(wf().jobs.approver_mark.steps[0], fx, e);
+
+    it("marks exactly the heads whose lane job succeeded", () => {
+      const r = run({
+        [JOBS]: {
+          jobs: [
+            { name: "approver_select", conclusion: "success" },
+            { name: "approver #1", conclusion: "success" },
+            { name: "approver #2", conclusion: "failure" },
+            { name: "approver #12", conclusion: "success" },
+          ],
+        },
+      });
+      expect(r.status).toBe(0);
+      const posts = r.writes.split("\n").filter((l) => l.startsWith("POST"));
+      expect(posts).toEqual(["POST repos/o/r/check-runs", "POST repos/o/r/check-runs"]);
+      expect(r.stdout).toContain("#1: marked sha1");
+      expect(r.stdout).toContain("#12: marked sha12");
+      // A failed lane is retried by the next sweep.
+      expect(r.stdout).toContain("#2: lane did not succeed");
+    });
+
+    it("matches the job name exactly: #1 succeeding does not mark #12", () => {
+      const r = run({ [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } });
+      expect(r.stdout).toContain("#1: marked sha1");
+      expect(r.stdout).toContain("#12: lane did not succeed");
+    });
+
+    it("fails loudly when it cannot tell which lanes succeeded", () => {
+      const r = run({});
+      expect(r.status).not.toBe(0);
+      expect(r.writes).toBe("");
+    });
+  });
+});
+
+// ── authors= ─────────────────────────────────────────────────────────────────
+
+describe("authors= restricts a PR lane to an allowlist", () => {
+  const AUTHORS_IF = "github.event.pull_request.user.login == 'dpup'";
+
+  it("puts the allowlist on the job-level if:, so no runner is spent on anyone else", () => {
+    const w = workflow(lane('authors="Dpup"'), "reviewer");
+    // The first job of the workflow carries it; lower-cased (GitHub's == ignores case).
+    expect(w.jobs.reviewer_guard.if).toContain(AUTHORS_IF);
+    expect(w.jobs.reviewer_guard.if).toContain("startsWith(github.event.pull_request.head.ref, 'agent/')");
+    expect(w.jobs.reviewer.needs).toEqual(["reviewer_guard"]);
+  });
+
+  it("ORs several logins inside one parenthesized clause", () => {
+    const w = workflow(lane('authors="dpup, octocat, dependabot[bot]"'), "reviewer");
+    expect(w.jobs.reviewer_guard.if).toContain(
+      "(github.event.pull_request.user.login == 'dpup' || github.event.pull_request.user.login == 'octocat' || github.event.pull_request.user.login == 'dependabot[bot]')",
+    );
+  });
+
+  it("emits a guard job even with no skip=, and re-checks the live author there", () => {
+    const step = workflow(lane('authors="dpup"'), "reviewer").jobs.reviewer_guard.steps[0];
+    expect(step.env.AUTHORS).toBe("dpup");
+    expect(step.run).toContain("env.AUTHORS");
+    expect(step.run).not.toContain("dpup");
+  });
+
+  it("can come from repo.authors in foundry.config.yaml, and the node attr overrides it", () => {
+    const repo = { ...loadConfig(undefined).repo, authors: ["DPUP", "octocat"] };
+    const fromCfg = workflow(lane(), "reviewer", { repo });
+    expect(fromCfg.jobs.reviewer_guard.steps[0].env.AUTHORS).toBe("dpup,octocat");
+    const overridden = workflow(lane('authors="hubot"'), "reviewer", { repo });
+    expect(overridden.jobs.reviewer_guard.steps[0].env.AUTHORS).toBe("hubot");
+    expect(overridden.jobs.reviewer_guard.if).not.toContain("'dpup'");
+  });
+
+  it("binds the fixer too (job-level if only — it has no guard job)", () => {
+    const dot = `digraph t {
+      start    [type=start]
+      builder  [type=producer, role="agents/roles/builder.md"]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+      fixer    [type=pr-fix, role="agents/roles/fixer.md"]
+      human    [type=exit]
+      start    -> builder  [on="issues.opened"]
+      builder  -> reviewer [on="pull_request.opened"]
+      reviewer -> fixer    [when="verdict=request_changes"]
+      fixer    -> reviewer [on="push"]
+      fixer    -> human    [when="attempts>=3"]
+    }`;
+    const repo = { ...loadConfig(undefined).repo, authors: ["dpup"] };
+    const w = workflow(dot, "fixer", { repo });
+    expect(Object.keys(w.jobs)).toEqual(["fixer"]);
+    expect(w.jobs.fixer.if).toContain(AUTHORS_IF);
+    expect(w.jobs.fixer.if).toContain("**Verdict:** REQUEST_CHANGES");
+  });
+
+  it("leaves issue lanes and unrestricted harnesses alone", () => {
+    const w = workflow(lane(), "reviewer");
+    expect(Object.keys(w.jobs)).toEqual(["reviewer"]);
+    expect(w.jobs.reviewer.if).not.toContain("user.login");
+    const repo = { ...loadConfig(undefined).repo, authors: ["dpup"] };
+    expect(JSON.stringify(workflow(lane(), "builder", { repo }))).not.toContain("user.login");
+  });
+
+  it("filters the sweep's selection by the same list", () => {
+    const dot = `digraph t {
+      approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *", authors="dpup"]
+    }`;
+    const step = workflow(dot, "approver").jobs.approver_select.steps[0];
+    expect(step.env.AUTHORS).toBe("dpup");
+    const pr = (number: number, login: string) => ({
+      number,
+      draft: false,
+      user: { login },
+      head: { ref: `agent/${number}`, sha: `sha${number}` },
+      requested_reviewers: [],
+      requested_teams: [],
+    });
+    const fx: Record<string, unknown> = {
+      "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100": [pr(1, "someone-else"), pr(2, "DPup"), pr(3, "dpup-impostor")],
+    };
+    for (const n of [1, 2, 3]) {
+      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100`] = { check_runs: [] };
+      fx[`repos/o/r/commits/sha${n}/status`] = { total_count: 0 };
+      fx[`repos/o/r/pulls/${n}/reviews?per_page=100`] = [];
+    }
+    const r = runStepScript(step, fx);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.outputs.prs!)).toEqual([{ number: 2, sha: "sha2" }]);
+  });
+
+  describe("the guard script, run against a stub gh", () => {
+    const step = () => workflow(lane('authors="dpup, octocat"'), "reviewer").jobs.reviewer_guard.steps[0];
+    const run = (fx: Record<string, unknown>) => runStepScript(step(), fx, { PR: "7" });
+    const pr = (login: string) => ({ "repos/o/r/pulls/7": { user: { login }, head: { sha: "h" }, draft: false, labels: [] } });
+
+    it("runs for an allowlisted author, whatever the case", () => {
+      expect(run(pr("dpup")).outputs.run).toBe("true");
+      expect(run(pr("OctoCat")).outputs.run).toBe("true");
+    });
+
+    it("skips everyone else — no prefix or substring matches", () => {
+      for (const login of ["mallory", "dpup2", "xdpup", "dpu", ""]) {
+        const r = run(pr(login));
+        expect(r.outputs.run, login).toBe("false");
+        expect(r.outputs.reason, login).toContain("allowlist");
+      }
+    });
+
+    it("fails CLOSED when the author cannot be verified", () => {
+      const r = run({});
+      expect(r.status).toBe(0);
+      expect(r.outputs.run).toBe("false");
+      expect(r.outputs.reason).toContain("verify its author");
+    });
+  });
+
+  describe("validation", () => {
+    it("rejects a value that is not a login (it is spliced into an if: expression)", () => {
+      for (const bad of ["dpup' || true || '", "a b", "-lead", "trail-", ","]) {
+        expect(codes(diags(lane(`authors="${bad}"`)), "error"), bad).toContain("node.bad-authors");
+      }
+      expect(codes(diags(lane('authors="dpup, my-app[bot]"')), "error")).toEqual([]);
+    });
+
+    it("a malformed allowlist compiles to nobody, never to everybody", () => {
+      const w = workflow(lane(`authors="dpup' || true || '"`), "reviewer");
+      expect(w.jobs.reviewer_guard.if).not.toContain("true");
+      expect(w.jobs.reviewer_guard.if).toContain("user.login == 'no author matches");
+    });
+
+    it("rejects a malformed repo.authors", () => {
+      const repo = { ...loadConfig(undefined).repo, authors: ["ok", "not a login"] };
+      expect(codes(diags(lane(), { repo }), "error")).toContain("config.bad-authors");
+    });
+
+    it("refuses a node it cannot bind", () => {
+      const onProducer = lane().replace('role="agents/roles/builder.md"', 'role="agents/roles/builder.md", authors="dpup"');
+      expect(codes(diags(onProducer), "error")).toContain("node.authors-unsupported");
+      const noCtx = lane('authors="dpup"').replace(', context="pr-diff"', "");
+      expect(codes(diags(noCtx), "error")).toContain("node.authors-unsupported");
+    });
+  });
+});
+
+// ── unknown attributes ───────────────────────────────────────────────────────
+
+describe("unknown attributes are errors, not silent no-ops", () => {
+  it("rejects an attribute the compiler does not know", () => {
+    const d = diags(lane('reviewers="dpup"')).find((x) => x.code === "attr.unknown");
+    expect(d?.level).toBe("error");
+    expect(d?.message).toContain("'reviewers='");
+    expect(d?.where?.node).toBe("reviewer");
+  });
+
+  it("suggests the attribute a typo was reaching for", () => {
+    const hint = (attr: string) => diags(lane(attr)).find((x) => x.code === "attr.unknown")?.hint;
+    expect(hint('author="dpup"')).toContain("'authors='");
+    expect(hint("max_attempt=3")).toContain("'max_attempts='");
+    expect(hint('cancel_in_progres=true')).toContain("'cancel_in_progress='");
+  });
+
+  it("rejects unknown edge attributes too", () => {
+    const dot = lane().replace('[on="issues.opened"]', '[on="issues.opened", if="label=x"]');
+    const d = diags(dot).find((x) => x.code === "attr.unknown");
+    expect(d?.where?.edge).toEqual(["start", "builder"]);
+  });
+
+  it("accepts every attribute the shipped templates and reference use", () => {
+    for (const rel of ["../skill/templates/harness.dot", "../examples/starter/.github/harness.dot", "./fixtures/dixie/harness.dot"]) {
+      const dot = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+      expect(codes(diags(dot)).filter((c) => c === "attr.unknown"), rel).toEqual([]);
+    }
+    const all = `digraph t {
+      a [type=analyst, role="r.md", prompt="p.md", tools="t", context=issue, name="A", output=comment, timeout=20,
+         agent_attempts=1, secrets="X", permissions="id-token: write", cancel_in_progress=false, checkout=partial]
+      b [type=pr-review, role="r.md", context="pr-diff", gates="ci.yml", skip="draft", authors="dpup"]
+      c [type=pr-review, role="r.md", context="pr-diff", select="sweep", schedule="0 * * * *"]
+      d [type=pr-fix, role="r.md", max_attempts=3]
+      e [type=scheduled-agent, role="r.md", schedule="0 8 * * *", commit=pr, paths="memory/"]
+      f [type=merge-gate, policy="p.yaml", schedule="*/30 * * * *"]
+      g [type=human-gate, environment=production]
+      h [type=fan_in, role="r.md", on_complete_label=done]
+      a -> b [on="pull_request.opened", when="label=x", do="dispatch"]
+    }`;
+    expect(codes(diags(all)).filter((c) => c === "attr.unknown")).toEqual([]);
+  });
+});
+
+// ── immutable guard / stale generated workflows ──────────────────────────────
+
+describe("immutable-paths guard is only generated where a lane writes code", () => {
+  const paths = (dot: string) => compile(mkHarness(dot)).files.map((f) => f.path);
+  const GUARD = ".github/workflows/immutable-guard.yml";
+  const reviewOnly = (extra = "") => `digraph t {
+    start    [type=start]
+    reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+    ${extra}
+    start    -> reviewer [on="pull_request.opened"]
+  }`;
+
+  it("is omitted from a review-only harness", () => {
+    expect(paths(reviewOnly())).not.toContain(GUARD);
+    // A read-only scheduled lane and a merge gate write no code either.
+    expect(paths(reviewOnly('herald [type=scheduled-agent, role="r.md", schedule="0 8 * * *", commit=none]'))).not.toContain(GUARD);
+    expect(paths(reviewOnly('gate [type=merge-gate, policy="p.yaml", schedule="*/30 * * * *"]'))).not.toContain(GUARD);
+  });
+
+  it("is kept as soon as any lane can commit", () => {
+    expect(paths(lane())).toContain(GUARD); // producer
+    expect(paths(reviewOnly('fixer [type=pr-fix, role="r.md"]'))).toContain(GUARD);
+    expect(paths(reviewOnly('scribe [type=scheduled-agent, role="r.md", schedule="0 8 * * *"]'))).toContain(GUARD);
+    expect(paths(reviewOnly('scribe [type=scheduled-agent, role="r.md", schedule="0 8 * * *", commit=pr]'))).toContain(GUARD);
+  });
+
+  it("a guard left on disk by an earlier build is reported as stale — hand-written workflows never are", () => {
+    const root = mkdtempSync(join(tmpdir(), "gpf-stale-"));
+    const wfDir = join(root, ".github", "workflows");
+    mkdirSync(wfDir, { recursive: true });
+    const before = compile(mkHarness(lane())).files;
+    for (const f of before.filter((x) => x.path.startsWith(".github/workflows/"))) {
+      writeFileSync(join(root, f.path), f.contents);
+    }
+    writeFileSync(join(wfDir, "ci.yml"), "name: CI\non: push\n");
+    expect(staleGeneratedWorkflows(root, before)).toEqual([]);
+
+    const after = compile(mkHarness(reviewOnly())).files;
+    expect(staleGeneratedWorkflows(root, after)).toEqual([".github/workflows/builder.yml", GUARD]);
   });
 });

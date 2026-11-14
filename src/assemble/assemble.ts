@@ -18,12 +18,15 @@ import type {
 } from "../ir/types.js";
 import { isUsesStep } from "../ir/types.js";
 import { emitFanIn, emitNode } from "../handlers/index.js";
-import { emitPreJob } from "../handlers/prejob.js";
+import { emitPostJob, emitPreJob } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
 
+/** First line of every generated workflow — how a stale one is told from a hand-written one. */
+export const GENERATED_MARKER = "# GENERATED FROM harness.dot — DO NOT EDIT.";
+
 const HEADER =
-  "# GENERATED FROM harness.dot — DO NOT EDIT.\n" +
+  `${GENERATED_MARKER}\n` +
   "# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.\n";
 
 export function makeActionRef(cfg: FoundryConfig): (name: string) => string {
@@ -140,6 +143,16 @@ function immutableGuardWorkflow(cfg: FoundryConfig, specDir: string): Record<str
   };
 }
 
+/** Does any lane commit? (producer, pr-fix, or a scheduled agent that persists its output.) */
+export function writesCode(ir: Harness): boolean {
+  return ir.nodes.some(
+    (n) =>
+      n.type === "producer" ||
+      n.type === "pr-fix" ||
+      (n.type === "scheduled-agent" && n.attrs.commit !== "none"),
+  );
+}
+
 export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): GeneratedFile[] {
   const files: GeneratedFile[] = [];
   const actionRef = makeActionRef(ir.config);
@@ -166,7 +179,9 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
   });
 
   const fragmentToJob = (fragment: WorkflowJobFragment, guard?: string): Record<string, unknown> => {
-    const job: Record<string, unknown> = { "runs-on": "ubuntu-latest" };
+    const job: Record<string, unknown> = {};
+    if (fragment.displayName) job.name = fragment.displayName;
+    job["runs-on"] = "ubuntu-latest";
     const g = fragment.if ?? guard;
     if (g) job.if = g;
     if (fragment.environment) job.environment = fragment.environment;
@@ -188,8 +203,12 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
 
   const diamonds = detectDiamonds(ir);
 
-  // The claim scope.yaml makes ("CI-enforced") has to be true out of the box.
-  emitFile("immutable-guard", immutableGuardWorkflow(ir.config, specDir));
+  // The claim scope.yaml makes ("CI-enforced") has to be true out of the box —
+  // wherever there is something to enforce. A harness with no lane that writes
+  // code (a review-only factory) has no agent branch for the guard to police,
+  // and all it could then do is fail the PRs humans open against a prefix that
+  // was never reserved for agents.
+  if (writesCode(ir)) emitFile("immutable-guard", immutableGuardWorkflow(ir.config, specDir));
 
   for (const node of ir.nodes) {
     if (diamonds.memberIds.has(node.id)) continue; // legs/parallel ride in the fan_in's file
@@ -231,6 +250,8 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     const jobs: Record<string, unknown> = pre
       ? { [pre.jobId]: fragmentToJob(pre, nw.guard), [fragment.jobId]: fragmentToJob(fragment) }
       : { [fragment.jobId]: fragmentToJob(fragment, nw.guard) };
+    const post = emitPostJob(mkCtx(node));
+    if (post) jobs[post.jobId] = fragmentToJob(post);
     emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,

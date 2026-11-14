@@ -11,13 +11,13 @@
  */
 import type { Command } from "commander";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import yaml from "js-yaml";
 import pc from "picocolors";
 import { compile, hasErrors } from "../index.js";
 import { loadConfig, loadHarness } from "../config/load.js";
-import { emitJson, pkgFile, resolvePaths } from "./common.js";
+import { staleGeneratedWorkflows, emitJson, pkgFile, resolvePaths } from "./common.js";
 import type { Harness } from "../ir/types.js";
 import { relative } from "node:path";
 
@@ -163,9 +163,12 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
     const p = join(root, f.path);
     return (existsSync(p) ? readFileSync(p, "utf8") : null) !== f.contents;
   });
+  // A generated workflow the graph no longer produces still runs on GitHub.
+  const stale = staleGeneratedWorkflows(root, files);
+  const outOfSync = [...drift.map((f) => f.path), ...stale.map((p) => `${p} (stale)`)];
   checks.push(
-    drift.length
-      ? { name: "workflows in sync", status: "fail", detail: `${drift.length} file(s) drifted: ${drift.slice(0, 3).map((f) => f.path).join(", ")}${drift.length > 3 ? ", …" : ""}`, hint: "run `gp-foundry build`" }
+    outOfSync.length
+      ? { name: "workflows in sync", status: "fail", detail: `${outOfSync.length} file(s) out of sync: ${outOfSync.slice(0, 3).join(", ")}${outOfSync.length > 3 ? ", …" : ""}`, hint: "run `gp-foundry build`" }
       : { name: "workflows in sync", status: "ok", detail: `${files.length} generated files match` },
   );
 
@@ -468,6 +471,10 @@ export function registerOpsCommands(program: Command): void {
         writeFileSync(p, f.contents);
       }
       result.wrote = files.map((f) => f.path);
+      const stale = staleGeneratedWorkflows(root, files);
+      for (const p of stale) rmSync(join(root, p));
+      result.removed = stale;
+      if (stale.length && !opts.json) process.stdout.write(pc.yellow(`removed ${stale.length} stale generated workflow(s): ${stale.join(", ")}\n`));
       const wfCount = files.filter((f) => f.path.startsWith(".github/workflows/")).length;
       if (!opts.json) process.stdout.write(pc.green(`built ${wfCount} workflows + HARNESS.md\n`));
 

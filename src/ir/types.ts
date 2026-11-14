@@ -134,7 +134,12 @@ export interface FoundryConfig {
     conventions?: string;
     secrets?: string[];
   };
-  repo: { base_branch: string; branch_prefix: string };
+  repo: {
+    base_branch: string;
+    branch_prefix: string;
+    /** Only pull requests opened by these logins reach the PR lanes (case-insensitive). */
+    authors?: string[];
+  };
   /** semantic role -> repo label (the drift-killer). */
   labels: Record<string, string>;
   /** parseable markers shared by prompts + guards + enforcers. */
@@ -224,6 +229,8 @@ export function isUsesStep(s: StepSpec): s is UsesStep {
 export interface WorkflowJobFragment {
   jobId: string;
   name?: string;
+  /** Emitted as the job's `name:` — set only where something reads the job by name. */
+  displayName?: string;
   permissions: Record<string, Permission>;
   needs?: string[];
   /** GitHub Environment (for human-gate / protected deploys). */

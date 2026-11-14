@@ -22,8 +22,8 @@ import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
 const DOT = `digraph t {
   start [type=start]
-  scout [type=issue-agent, role="agents/roles/scout.md"]
-  start -> scout [on="issues.opened"]
+  builder [type=producer, role="agents/roles/builder.md"]
+  start -> builder [on="issues.opened"]
 }`;
 
 /** The guard's `run:` script, as compiled. */

@@ -5,7 +5,50 @@
  * value; validate() turns that into an error diagnostic, and the emitters catch
  * it and fall back to "attribute absent" so assemble stays non-throwing.
  */
-import type { HarnessNode } from "../ir/types.js";
+import type { FoundryConfig, HarnessNode } from "../ir/types.js";
+
+// ── the attribute vocabulary ─────────────────────────────────────────────────
+
+/**
+ * Every attribute a node statement may carry. An attribute outside this set is
+ * an ERROR, not a no-op: the parser stores whatever it is given, so a misspelt
+ * or not-yet-supported attribute used to compile cleanly and do nothing — and
+ * when the attribute was a restriction (`authors=`, `skip=`), "nothing" meant
+ * the lane ran on exactly the pull requests it was told to stay away from.
+ */
+export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
+  "type", "role", "prompt", "policy", "tools", "context", "name", "output",
+  "gates", "skip", "select", "authors", "max_attempts", "agent_attempts",
+  "schedule", "timeout", "environment", "paths", "commit", "secrets",
+  "permissions", "on_complete_label", "cancel_in_progress", "checkout",
+]);
+
+/** Every attribute an edge may carry. */
+export const KNOWN_EDGE_ATTRS: ReadonlySet<string> = new Set(["on", "when", "do"]);
+
+/** The closest known name within two edits, for a "did you mean" hint. */
+export function nearestAttr(name: string, known: ReadonlySet<string>): string | undefined {
+  const distance = (a: string, b: string): number => {
+    const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      let prev = row[0]!;
+      row[0] = i;
+      for (let j = 1; j <= b.length; j++) {
+        const tmp = row[j]!;
+        row[j] = Math.min(row[j]! + 1, row[j - 1]! + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+        prev = tmp;
+      }
+    }
+    return row[b.length]!;
+  };
+  let best: string | undefined;
+  let bestD = 3;
+  for (const k of known) {
+    const d = distance(name.toLowerCase(), k);
+    if (d < bestD) [best, bestD] = [k, d];
+  }
+  return best;
+}
 
 // ── gates= ───────────────────────────────────────────────────────────────────
 
@@ -104,6 +147,71 @@ export function skipOf(node: HarnessNode): SkipCondition[] {
   }
 }
 
+// ── authors= ─────────────────────────────────────────────────────────────────
+
+/** A GitHub login (`dpup`, `dependabot[bot]`). Strict: the list is spliced into an `if:` expression. */
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$/;
+
+function normalizeAuthors(list: unknown[], where: string): string[] {
+  const out: string[] = [];
+  for (const raw of list) {
+    const login = String(raw).trim();
+    if (!login) continue;
+    if (!LOGIN.test(login)) throw new Error(`${where}: '${login}' is not a GitHub login`);
+    const lower = login.toLowerCase(); // logins are case-insensitive
+    if (!out.includes(lower)) out.push(lower);
+  }
+  if (!out.length) throw new Error(`${where}: names no login — an empty allowlist would match nobody`);
+  return out;
+}
+
+/** The node types an author allowlist can bind: lanes handed one pull request. */
+export function takesAuthors(node: HarnessNode): boolean {
+  return node.type === "pr-fix" || ((node.type === "pr-review" || node.type === "analyst") && hasPrContext(node));
+}
+
+/**
+ * The logins whose pull requests this lane may run on — `authors="a, b"` on the
+ * node, else `repo.authors` in foundry.config.yaml; undefined when neither is
+ * set (no restriction). Lower-cased. Throws on a malformed list.
+ */
+export function parseAuthors(node: HarnessNode, cfg: FoundryConfig): string[] | undefined {
+  const attr = node.attrs.authors;
+  if (attr !== undefined) {
+    return normalizeAuthors(String(attr).split(","), `node '${node.id}': authors=`);
+  }
+  return parseConfigAuthors(cfg);
+}
+
+/** `repo.authors` alone — what a diamond, which has no single node to ask, is bound by. */
+export function parseConfigAuthors(cfg: FoundryConfig): string[] | undefined {
+  const list = cfg.repo?.authors;
+  if (list === undefined) return undefined;
+  if (!Array.isArray(list)) throw new Error("repo.authors must be a list of GitHub logins");
+  return normalizeAuthors(list, "repo.authors");
+}
+
+/**
+ * parseAuthors for emitters. A malformed allowlist is validate()'s to report,
+ * but it must not compile to "no restriction": the sentinel matches no login
+ * (a login cannot contain a space), so a broken filter admits nobody.
+ */
+export function authorsOf(node: HarnessNode, cfg: FoundryConfig): string[] | undefined {
+  if (!takesAuthors(node)) return undefined;
+  try {
+    return parseAuthors(node, cfg);
+  } catch {
+    return [NO_AUTHOR];
+  }
+}
+export const NO_AUTHOR = "no author matches a malformed allowlist";
+
+/** `github.event.pull_request.user.login == 'a' || … ` — GitHub compares strings case-insensitively. */
+export function authorClause(authors: string[]): string {
+  const terms = authors.map((a) => `github.event.pull_request.user.login == '${a}'`);
+  return terms.length === 1 ? terms[0]! : `(${terms.join(" || ")})`;
+}
+
 // ── context / select= / checkout= ────────────────────────────────────────────
 
 /** A node whose job is handed a pull request (the context an analyst emits for). */
@@ -126,19 +234,35 @@ export function isSweep(node: HarnessNode): boolean {
   );
 }
 
-/** A skip guard is emitted for an event-driven PR analyst (never a sweep). */
-export function hasSkipGuard(node: HarnessNode): boolean {
+/**
+ * A guard job is emitted for an event-driven PR analyst (never a sweep) that
+ * has something to guard on: a `skip=` condition or an author allowlist.
+ */
+export function hasSkipGuard(node: HarnessNode, cfg: FoundryConfig): boolean {
   return (
     (node.type === "pr-review" || node.type === "analyst") &&
     hasPrContext(node) &&
     node.attrs.schedule === undefined &&
-    skipOf(node).length > 0
+    (skipOf(node).length > 0 || authorsOf(node, cfg) !== undefined)
   );
 }
 
 /** The job that decides whether (or for which PRs) the node's own job runs. */
 export function preJobId(node: HarnessNode): string {
   return isSweep(node) ? `${node.id}_select` : `${node.id}_guard`;
+}
+
+/** A sweep lane's matrix job is NAMED per PR, so the mark job can tell which ones succeeded. */
+export function sweepJobNamePrefix(node: HarnessNode): string {
+  return `${node.id} #`;
+}
+
+/**
+ * The check-run a sweep publishes on a head once its lane has run there — the
+ * sweep's own record of "done", independent of anything the agent posts.
+ */
+export function sweptCheckName(node: HarnessNode): string {
+  return `gp-foundry/swept (${node.id})`;
 }
 
 /**

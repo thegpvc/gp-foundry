@@ -12,7 +12,7 @@ import type {
   StepSpec,
   WorkflowJobFragment,
 } from "../ir/types.js";
-import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf } from "./attrs.js";
+import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf, sweepJobNamePrefix } from "./attrs.js";
 import {
   appTokenStep,
   checkoutStep,
@@ -127,7 +127,7 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   // event payload to read the PR from — the selector job hands each chosen head
   // to this job as a matrix entry instead.
   const sweep = isSweep(node);
-  const skipGuard = !sweep && hasSkipGuard(node);
+  const skipGuard = !sweep && hasSkipGuard(node, ctx.config);
   const pre = preJobId(node);
   const prNumber = sweep ? "${{ matrix.pr.number }}" : PR_NUMBER;
   const prHeadSha = sweep ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
@@ -198,6 +198,9 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   };
   if (sweep) {
     fragment.needs = [pre];
+    // Named per PR: the mark job reads this run's jobs to learn which heads
+    // the lane actually finished, and a matrix job's default name is not stable.
+    fragment.displayName = `${sweepJobNamePrefix(node)}\${{ matrix.pr.number }}`;
     // An empty matrix is a workflow error, so an empty sweep skips the job outright.
     fragment.if = `needs.${pre}.outputs.count != '0'`;
     fragment.strategy = {

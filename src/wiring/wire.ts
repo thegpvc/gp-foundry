@@ -8,7 +8,7 @@
  */
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
-import { hasSkipGuard, skipOf } from "../handlers/attrs.js";
+import { authorClause, authorsOf, hasSkipGuard, parseConfigAuthors, skipOf, NO_AUTHOR } from "../handlers/attrs.js";
 import { detectDiamonds } from "./diamond.js";
 
 const AGENT = new Set(AGENT_TYPES);
@@ -194,7 +194,27 @@ function applyBranchPrefix(
   events: Set<string>,
   cfg: FoundryConfig,
 ): string | undefined {
-  const branch = branchPrefixClause(cfg);
+  return andForPrEvents(guard, events, branchPrefixClause(cfg));
+}
+
+/**
+ * AND the author allowlist onto a workflow PR events can reach. The same
+ * allowlist is re-checked against live PR state in the guard job; this copy is
+ * what keeps a runner from being spent on a PR the lane will never touch.
+ */
+function applyAuthors(
+  guard: string | undefined,
+  events: Set<string>,
+  authors: string[] | undefined,
+): string | undefined {
+  return andForPrEvents(guard, events, authors ? authorClause(authors) : undefined);
+}
+
+function andForPrEvents(
+  guard: string | undefined,
+  events: Set<string>,
+  branch: string | undefined,
+): string | undefined {
   const prEvents = [...events].filter(carriesPrPayload);
   if (!branch || prEvents.length === 0) return guard;
 
@@ -256,10 +276,22 @@ export function wire(ir: Harness): WiringPlan {
       // single node's. A review panel is still an agent lane: without this it
       // would run on every human PR, which is the hole the guard exists to close.
       const effEvents = new Set(events.map((ev) => effectiveEvent(ev, firstLeg)));
-      const g = applyBranchPrefix(
-        entry.when ? guardFor(entry.when, [...effEvents], ir.config) : undefined,
+      // A diamond has no single node to carry authors=, so it is bound by the
+      // config-wide allowlist (malformed → nobody, as for a single lane).
+      let panelAuthors: string[] | undefined;
+      try {
+        panelAuthors = parseConfigAuthors(ir.config);
+      } catch {
+        panelAuthors = [NO_AUTHOR];
+      }
+      const g = applyAuthors(
+        applyBranchPrefix(
+          entry.when ? guardFor(entry.when, [...effEvents], ir.config) : undefined,
+          effEvents,
+          ir.config,
+        ),
         effEvents,
-        ir.config,
+        panelAuthors,
       );
       if (g) nw.guard = g;
       // Unit scope follows the entry event; convention `<node-id>-<num>`, never cancel
@@ -296,7 +328,7 @@ export function wire(ir: Harness): WiringPlan {
       // is never reviewed until someone happens to push to it again.
       if (
         triggers.pull_request &&
-        hasSkipGuard(node) &&
+        hasSkipGuard(node, ir.config) &&
         skipOf(node).some((c) => c.kind === "draft")
       ) {
         mergeEvent(triggers, "pull_request.ready_for_review", node);
@@ -317,10 +349,10 @@ export function wire(ir: Harness): WiringPlan {
       }
     }
 
-    const guard = applyBranchPrefix(
-      guards.size ? [...guards].join(" || ") : undefined,
+    const guard = applyAuthors(
+      applyBranchPrefix(guards.size ? [...guards].join(" || ") : undefined, allEvents, ir.config),
       allEvents,
-      ir.config,
+      authorsOf(node, ir.config),
     );
     const nw: NodeWiring = {
       nodeId: node.id,

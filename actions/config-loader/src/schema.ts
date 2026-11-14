@@ -74,7 +74,13 @@ export const CONFIG_SCHEMA = {
       "additionalProperties": false,
       "properties": {
         "base_branch": { "type": "string", "minLength": 1 },
-        "branch_prefix": { "type": "string", "minLength": 1 }
+        "branch_prefix": { "type": "string", "minLength": 1 },
+        "authors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Only pull requests opened by these GitHub logins reach the PR lanes (pr-review, pr-fix, PR-context analysts, review panels, sweeps). Case-insensitive. A node's own authors= attribute overrides it for that lane."
+        }
       }
     },
     "labels": {
