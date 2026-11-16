@@ -55,19 +55,24 @@ if [ "$REQUIRE_VERDICT" = "true" ] && ! jq -e '__IS_VERDICT_JQ__' <<< "$REVIEW" 
   exit 0
 fi
 
-# Line 1 of the posted body: the heading that makes a re-run idempotent.
+# Line 1 of the posted body: the heading that makes a re-run idempotent. The
+# check is keyed by verdict-ness, the way the sweep tells decided from reviewed:
+# a verdict lane counts only its own kind (reviews ending in a verdict line), a
+# plain lane only reviews without one. So an event reviewer and a verdict sweep
+# can share a bot login and a marker without one's review silencing the other.
 MARKER="\${POST_MARKER//<n>/$PR}"
 MARKER="\${MARKER//<sha>/$HEAD_SHA}"
 export MARKER
 if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100" --paginate --jq '
   [.[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)
-   | select((((.body // "") | split("\\n") | .[0]) // "" | gsub("^\\\\s+|\\\\s+$"; "")) == env.MARKER)] | length' \\
+   | select((((.body // "") | split("\\n") | .[0]) // "" | gsub("^\\\\s+|\\\\s+$"; "")) == env.MARKER)
+   | select(__IS_VERDICT_JQ__ == (env.REQUIRE_VERDICT == "true"))] | length' \\
   | awk '{s+=$1} END {print s+0}'); then
   echo "::error::could not read the PR's reviews — not posting, so a re-run cannot post the review twice"
   exit 1
 fi
 if [ "$EXISTING" != "0" ]; then
-  echo "a review headed '$MARKER' by $BOT_LOGIN is already on $HEAD_SHA — not posting it again"
+  echo "a $([ "$REQUIRE_VERDICT" = "true" ] && echo "verdict" || echo "non-verdict") review headed '$MARKER' by $BOT_LOGIN is already on $HEAD_SHA — not posting it again"
   exit 0
 fi
 
@@ -123,7 +128,7 @@ export function postReviewStep(
       REQUIRE_VERDICT: String(opts.verdictLane),
       VERDICT_LINES: verdictLinesOf(ctx.config),
     },
-    run: SCRIPT.replace("__IS_VERDICT_JQ__", IS_VERDICT_JQ),
+    run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ),
   });
 }
 

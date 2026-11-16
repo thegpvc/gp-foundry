@@ -10,6 +10,7 @@ import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
+import { IS_VERDICT_JQ } from "../src/handlers/attrs.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
 const BOT = "agent-bot[bot]";
@@ -237,6 +238,41 @@ describe("the post script, run against a stub gh", () => {
     // The same heading on another head, or by someone else, does not count.
     expect(runPost(plain(), fence(REVIEW), [{ ...existing[0], commit_id: "old" }]).posts).toHaveLength(1);
     expect(runPost(plain(), fence(REVIEW), [{ ...existing[0], user: { login: "mallory" } }]).posts).toHaveLength(1);
+  });
+
+  it("keys the idempotency check by verdict-ness, so two lanes can share a login and a marker", () => {
+    const heading = "PR #7 head head1\n\n";
+    const plainReview = { user: { login: BOT }, commit_id: "head1", body: `${heading}Two findings, both minor.` };
+    const verdictReview = { user: { login: BOT }, commit_id: "head1", body: `${heading}Fine.\n\n**Verdict:** APPROVE\n\n<!-- gp-foundry:diff:approver:abc -->` };
+    const approve = fence({ body: "Ship it.\n\n**Verdict:** APPROVE" });
+
+    // The event reviewer's review on the head does not stop the approver's verdict.
+    const approver = runPost(verdictLane(), approve, [plainReview]);
+    expect(approver.status).toBe(0);
+    expect(approver.posts).toHaveLength(1);
+    expect(approver.posts[0].body).toBe(`${heading}Ship it.\n\n**Verdict:** APPROVE`);
+    // A verdict already on the head does.
+    const again = runPost(verdictLane(), approve, [plainReview, verdictReview]);
+    expect(again.posts).toEqual([]);
+    expect(again.stdout).toContain("a verdict review headed 'PR #7 head head1'");
+
+    // And the other way round: the approver's verdict does not stop the reviewer.
+    expect(runPost(plain(), fence(REVIEW), [verdictReview]).posts).toHaveLength(1);
+    const twice = runPost(plain(), fence(REVIEW), [verdictReview, plainReview]);
+    expect(twice.posts).toEqual([]);
+    expect(twice.stdout).toContain("a non-verdict review headed");
+  });
+
+  it("selects existing reviews with the shared verdict test, by the lane's mode", () => {
+    for (const step of [plain(), verdictLane()]) {
+      const read = step.run.slice(step.run.indexOf("EXISTING=$("), step.run.indexOf("| awk"));
+      expect(read).toContain(`select(${IS_VERDICT_JQ} == (env.REQUIRE_VERDICT == "true"))`);
+    }
+    expect(plain().env.REQUIRE_VERDICT).toBe("false");
+    expect(verdictLane().env.REQUIRE_VERDICT).toBe("true");
+    // Both places the script tests verdict-ness use the one expression.
+    expect(plain().run).not.toContain("__IS_VERDICT_JQ__");
+    expect(plain().run.split(IS_VERDICT_JQ)).toHaveLength(3);
   });
 
   it("on a 422 for an inline comment, retries once with the findings in the body", () => {
