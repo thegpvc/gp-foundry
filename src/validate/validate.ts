@@ -466,6 +466,23 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         });
       }
     }
+    if (n.attrs.requires_review !== undefined) {
+      if (typeof n.attrs.requires_review !== "boolean") {
+        diags.push({
+          level: "error",
+          code: "node.bad-requires-review",
+          message: `requires_review= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.requires_review)}`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (!isSweep(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.requires-review-unsupported",
+          message: `requires_review= on '${n.id}' is not supported here — it narrows the heads a select="sweep" lane picks`,
+          where: { node: n.id, line: n.line },
+        });
+      }
+    }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({
         level: "error",

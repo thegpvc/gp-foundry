@@ -13,6 +13,7 @@
  */
 import type { EmitContext, WorkflowJobFragment } from "../ir/types.js";
 import {
+  ALSO_HEAD_ANY_NODE_PATTERN,
   VERDICT_MARKER,
   alsoHeadMarkerPrefix,
   authorsOf,
@@ -23,6 +24,7 @@ import {
   preJobId,
   skipOf,
   sweepFailedCheckName,
+  sweepRequiresReview,
   sweepJobNamePrefix,
   sweptCheckName,
 } from "./attrs.js";
@@ -60,10 +62,25 @@ export function emitPostJob(ctx: EmitContext): WorkflowJobFragment | null {
  * let a lane posting as the same bot decide a head just by quoting the marker.
  * Shared by the select job ("decided") and the mark job ("the lane delivered").
  */
+const BY_BOT_JQ = `(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`;
+const IS_VERDICT_JQ = `((.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
 const VERDICT_REVIEWS_JQ = [
   `[ .[] | select(.commit_id == env.SHA)`,
-  `  | select(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`,
-  `  | select((.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER)) ] | length`,
+  `  | select(${BY_BOT_JQ})`,
+  `  | select(${IS_VERDICT_JQ}) ] | length`,
+];
+
+/**
+ * The select job's one read of a head's reviews, as "<decided> <reviewed>" per
+ * page: verdict reviews by the bot on the head (as above), and the bot's
+ * non-verdict reviews that cover the head — submitted on it, or marked
+ * `also-head` for it by a guard that skipped it as an unchanged diff.
+ */
+const SELECT_REVIEWS_JQ = [
+  `[ .[] | select(${BY_BOT_JQ}) | ${IS_VERDICT_JQ} as $verdict`,
+  `  | { decided: (.commit_id == env.SHA and $verdict),`,
+  `      reviewed: ((.commit_id == env.SHA or ((.body // "") | test(env.ALSO_HEAD_PATTERN + env.SHA + " -->"))) and ($verdict | not)) } ]`,
+  `| [ (map(select(.decided)) | length), (map(select(.reviewed)) | length) ] | @tsv`,
 ];
 
 /** The check-run author a swept marker must have: written with GITHUB_TOKEN. */
@@ -261,6 +278,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `#               been quiet for $SETTLE_SECONDS s (a repo with no CI still gets swept)`,
     `#   undecided   no verdict review on this exact head yet, and no earlier`,
     `#               sweep has marked it delivered (the swept check)`,
+    ...(sweepRequiresReview(node)
+      ? [`#   reviewed    a non-verdict review by the bot covers the head (on it, or marked also-head)`]
+      : []),
     `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head`,
     `LIST=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&sort=created&direction=asc&per_page=100" --paginate --jq '`,
     `  .[] | select(.draft | not)`,
@@ -310,10 +330,13 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" --jq '`,
     `    if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }`,
     `  if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi`,
-    `  DECIDED=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
-    ...VERDICT_REVIEWS_JQ.map((l) => `    ${l}`),
-    `  ' | awk '{s+=$1} END {print s+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
+    `  REVIEWS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
+    ...SELECT_REVIEWS_JQ.map((l) => `    ${l}`),
+    `  ' | awk '{d+=$1; r+=$2} END {print d+0, r+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
+    `  read -r DECIDED REVIEWED <<< "$REVIEWS"`,
     `  if [ "$DECIDED" != "0" ]; then echo "#$NUM: already decided at $SHA"; continue; fi`,
+    `  # requires_review: the lane acts on an upstream review, so a head no review covers is still waiting.`,
+    `  if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi`,
     `  echo "#$NUM: selected at $SHA"`,
     `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" '. + [{number: $n, sha: $s, base: $b}]' <<< "$SELECTED")`,
     `  if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then`,
@@ -343,6 +366,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           PREFIX: ctx.config.repo.branch_prefix,
           BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
           VERDICT_MARKER,
+          REQUIRES_REVIEW: String(sweepRequiresReview(node)),
+          ALSO_HEAD_PATTERN: ALSO_HEAD_ANY_NODE_PATTERN,
           SWEPT_CHECK: sweptCheckName(node),
           FAILED_CHECK: sweepFailedCheckName(node),
           MARK_APP,

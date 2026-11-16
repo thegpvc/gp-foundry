@@ -22,7 +22,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
-  "mode", "check_name",
+  "mode", "check_name", "requires_review",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -328,6 +328,18 @@ export function isSweep(node: HarnessNode): boolean {
     node.attrs.schedule !== undefined
   );
 }
+
+/**
+ * `requires_review=true` on a sweep: a head is a candidate only once a review by
+ * the bot covers it (on the head, or marked `also-head` for it) — for a lane that
+ * acts on an upstream review, so it does not spend a run on heads still waiting.
+ */
+export function sweepRequiresReview(node: HarnessNode): boolean {
+  return isSweep(node) && node.attrs.requires_review === true;
+}
+
+/** The also-head marker for any node, as a regex prefix: a sweep does not know which lane wrote it. */
+export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
 
 /**
  * A guard job is emitted for an event-driven PR analyst (never a sweep) that

@@ -643,6 +643,22 @@ describe('select="sweep" on pr-review', () => {
       expect(codes(diags(bad), "error")).toContain("node.skip-unsupported");
     });
 
+    it("passes requires_review into the select script's env, in one reviews filter", () => {
+      const on = workflow(SWEEP.replace('select="sweep"', 'select="sweep", requires_review=true'), "approver").jobs.approver_select.steps[0];
+      expect(on.env.REQUIRES_REVIEW).toBe("true");
+      expect(on.run).toContain('if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]');
+      expect(on.run).toContain('test(env.ALSO_HEAD_PATTERN + env.SHA + " -->")');
+      // One gh read and one jq filter answer both "decided" and "reviewed".
+      expect(on.run.match(/pulls\/\$NUM\/reviews/g)).toHaveLength(1);
+      expect(wf().jobs.approver_select.steps[0].env.REQUIRES_REVIEW).toBe("false");
+    });
+
+    it("accepts requires_review only on a sweep, and only as a boolean", () => {
+      expect(codes(diags(SWEEP.replace('select="sweep"', 'select="sweep", requires_review=true')), "error")).toEqual([]);
+      expect(codes(diags(SWEEP.replace('select="sweep"', 'select="sweep", requires_review="yes"')), "error")).toContain("node.bad-requires-review");
+      expect(codes(diags(lane("requires_review=true")), "error")).toContain("node.requires-review-unsupported");
+    });
+
     it("warns when no bot login pins who may decide", () => {
       expect(codes(diags(SWEEP, { identity: {} }), "warning")).toContain("node.sweep-no-bot-login");
     });
@@ -762,6 +778,40 @@ describe('select="sweep" on pr-review', () => {
         { number: 3, sha: "sha3" },
         { number: 4, sha: "sha4" },
       ]);
+    });
+
+    it("requires_review=true: selects a head only once a non-verdict review by the bot covers it", () => {
+      const dot = SWEEP.replace('select="sweep"', 'select="sweep", requires_review=true');
+      const st = workflow(dot, "approver").jobs.approver_select.steps[0];
+      const review = (n: number, over: Record<string, unknown> = {}) => ({
+        user: { login: BOT },
+        commit_id: `sha${n}`,
+        body: "Two findings, both minor.\n\n<!-- gp-foundry:diff:reviewer:abc -->",
+        ...over,
+      });
+      const r = runStepScript(st, {
+        [LIST]: [open(1), open(2), open(3), open(4), open(5), open(6), open(7)],
+        // No review at all: the head is still waiting on the upstream reviewer.
+        ...head(1),
+        // The bot's review on the head.
+        ...head(2, { reviews: [review(2)] }),
+        // Only the bot's own verdict on the head: decided, never "reviewed".
+        ...head(3, { reviews: [verdict(3)] }),
+        // A review on an older head that a guard marked as covering this one.
+        ...head(4, { reviews: [review(4, { commit_id: "older", body: "Looks fine.\n<!-- gp-foundry:also-head:reviewer:sha4 -->" })] }),
+        // A review on an older head, with no marker for this one.
+        ...head(5, { reviews: [review(5, { commit_id: "older", body: "Looks fine.\n<!-- gp-foundry:also-head:reviewer:sha55 -->" })] }),
+        // Someone else's review does not count.
+        ...head(6, { reviews: [review(6, { user: { login: "mallory" } })] }),
+        // A verdict (last line) carrying the marker is still a verdict, not a review to act on.
+        ...head(7, { reviews: [review(7, { commit_id: "older", body: "<!-- gp-foundry:also-head:reviewer:sha7 -->\n\n**Verdict:** APPROVE" })] }),
+      });
+      expect(r.status).toBe(0);
+      expect(JSON.parse(r.outputs.prs!).map((p: any) => p.number)).toEqual([2, 4]);
+      expect(r.stdout).toContain("#1: no review by agent-bot covers sha1 yet");
+      expect(r.stdout).toContain("#3: already decided at sha3");
+      // Without the attribute, the same heads are selected as before.
+      expect(select({ [LIST]: [open(1)], ...head(1) }).prs).toEqual([{ number: 1, sha: "sha1" }]);
     });
 
     it("skips a head an earlier sweep already ran the lane on, verdict or not", () => {
