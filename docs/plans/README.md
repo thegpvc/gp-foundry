@@ -14,6 +14,7 @@ dated plan and mark the old one superseded.
 | Date | Plan | Status |
 |------|------|--------|
 | 2026-07-01 | [gp-foundry — System Design](./2026-07-01-gp-foundry-system-design.md) | Draft — for review |
+| 2026-11-16 | [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md) | Draft — for review |
 
 Anticipated follow-on plans (each a component deep-spec spawned from the system design):
 `…-harness-spec-and-ir.md`, `…-dot-compiler.md`, `…-runtime-core-actions.md`,
