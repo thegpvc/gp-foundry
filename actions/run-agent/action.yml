@@ -81,6 +81,18 @@ inputs:
       (passthrough for flags like --max-turns, --add-dir, etc.).
     required: false
     default: ""
+  step-summary:
+    description: >-
+      Write the agent's final output to the job summary ($GITHUB_STEP_SUMMARY) under a
+      heading, so a reviewer can read it without opening the log. "true" (default) or
+      "false". Output over the summary size limit is truncated with a note; the log keeps
+      the full text.
+    required: false
+    default: "true"
+  step-summary-heading:
+    description: Heading for the job-summary section. Defaults to "Agent output".
+    required: false
+    default: "Agent output"
   max-attempts:
     description: >-
       How many times to run the CLI when it exits non-zero for a reason that is
@@ -199,6 +211,8 @@ runs:
         EXTRA_ENV: ${{ inputs.extra-env }}
         MAX_ATTEMPTS: ${{ inputs.max-attempts }}
         RETRY_BASE_DELAY_SECONDS: ${{ inputs.retry-base-delay-seconds }}
+        STEP_SUMMARY: ${{ inputs.step-summary }}
+        STEP_SUMMARY_HEADING: ${{ inputs.step-summary-heading }}
       run: |
         set -uo pipefail
 
@@ -355,6 +369,26 @@ runs:
           ATTEMPT=$((ATTEMPT + 1))
           DELAY=$((DELAY * 2))
         done
+
+        # The final message is the product of an analyst lane. Put it where a
+        # person looks first: the job summary. GitHub caps a summary at 1 MiB, so
+        # a long output is cut with a pointer to the log, which keeps all of it.
+        if [ "${STEP_SUMMARY:-true}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$STDOUT_LOG" ]; then
+          SUMMARY_LIMIT=900000
+          {
+            echo "### ${STEP_SUMMARY_HEADING:-Agent output}"
+            echo
+            if [ "$(wc -c < "$STDOUT_LOG")" -gt "$SUMMARY_LIMIT" ]; then
+              head -c "$SUMMARY_LIMIT" "$STDOUT_LOG"
+              echo
+              echo
+              echo "_Output truncated at ${SUMMARY_LIMIT} bytes; the job log has the full text._"
+            else
+              cat "$STDOUT_LOG"
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
 
         if [ "$AGENT_EXIT" -ne 0 ]; then
           echo "::error::agent exited with code $AGENT_EXIT — failing the step so the run is visibly red"
