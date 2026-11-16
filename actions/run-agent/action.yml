@@ -118,6 +118,14 @@ inputs:
       it, so the default gives 15s and then 30s.
     required: false
     default: "15"
+  output-contract:
+    description: >-
+      Optional inline text appended as the LAST section of the prompt ("## Output"),
+      after the context payload, so it is the final thing the agent reads. The
+      compiler uses it for post="review" lanes: the agent prints its review as a
+      fenced json block and a workflow step posts it.
+    required: false
+    default: ""
   extra-env:
     description: >-
       Optional newline-separated NAME=VALUE pairs exported into the agent's
@@ -127,6 +135,14 @@ inputs:
       NAME=<value> pair per line. Values are never echoed.
     required: false
     default: ""
+
+outputs:
+  stdout-file:
+    description: >-
+      Path to the file holding the agent's stdout (its final message) from the
+      last attempt. A later step in the same job can read it, e.g. to post a
+      review the agent printed.
+    value: ${{ steps.run.outputs.stdout-file }}
 
 runs:
   using: composite
@@ -141,6 +157,7 @@ runs:
         CONVENTIONS: ${{ inputs.conventions }}
         COMMS_FILE: ${{ inputs.comms-file }}
         SCOPE_PATH: ${{ inputs.scope-path }}
+        OUTPUT_CONTRACT: ${{ inputs.output-contract }}
       run: |
         set -euo pipefail
 
@@ -153,6 +170,7 @@ runs:
         #   3. conventions          (optional — repo guardrails from config)
         #   4. scope-path           (optional — path/boundary config)
         #   5. context-file         (optional — the runtime payload)
+        #   6. output-contract      (optional — how to hand back the result)
 
         # 1. role — include the BODY only. The YAML front-matter (role/type/tools/
         #    handoffs) is compiler metadata, not agent instructions; leaving it in
@@ -204,9 +222,15 @@ runs:
           printf '\n' >> "$PROMPT_FILE"
         fi
 
+        # 6. output contract (optional) — last, so it is the final instruction read
+        if [ -n "${OUTPUT_CONTRACT:-}" ]; then
+          printf '\n## Output\n\n%s\n' "$OUTPUT_CONTRACT" >> "$PROMPT_FILE"
+        fi
+
         echo "::notice::Assembled prompt at ${PROMPT_FILE} ($(wc -c < "$PROMPT_FILE") bytes)"
 
     - name: Run agent
+      id: run
       shell: bash
       env:
         CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
@@ -308,6 +332,7 @@ runs:
         STDERR_LOG="$(mktemp)"
         STDOUT_LOG="$(mktemp)"
         EXIT_FILE="$(mktemp)"
+        echo "stdout-file=${STDOUT_LOG}" >> "${GITHUB_OUTPUT:-/dev/null}"
 
         # classify_failure names why an attempt died, read from the tail of what
         # the CLI produced. The CLI prints its terminal error last, so a bounded

@@ -14,6 +14,7 @@ import type {
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
+import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
   authorsOf,
   diffMarkerPrefix,
@@ -21,6 +22,7 @@ import {
   hasSkipGuard,
   isEvaluateGate,
   isSweep,
+  postsReview,
   optInLabelOf,
   parseEvaluateCheckName,
   preJobId,
@@ -227,13 +229,17 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // A gate-less analyst defaults to 25 so the step cap below leaves the agent 15
   // minutes; the old 15-minute job default would have capped it at 5.
   const jobTimeout = timeoutOf(node, gates.length ? 15 + 15 * gates.length : 25);
-  const agent = runAgentStep(ctx, { withContext: true });
+  // post="review": the agent prints its review and the step below posts it.
+  const posts = postsReview(node);
+  const agent = runAgentStep(ctx, { withContext: true, ...(posts ? { outputContract: reviewOutputContract(ctx, sweep) } : {}) });
   // Without gates, the same job − margin step cap as every other agent lane, so an
   // overrun fails its step instead of the job cap cancelling the run mid-turn (a
   // cancelled planner left no plan and no failure to notice). With gates the waits
   // spend an unknown share of the job budget, so a fixed step cap could starve the
   // review; that case stays on the job cap alone.
   steps.push(gates.length ? agent : { ...agent, timeoutMinutes: agentStepTimeout(jobTimeout) });
+  // A sweep lane's review is its verdict, so the post step holds it to the verdict grammar.
+  if (posts) steps.push(postReviewStep(ctx, { prNumber, headSha: prHeadSha, verdictLane: sweep }));
 
   const fragment: WorkflowJobFragment = {
     jobId: node.id,

@@ -14,6 +14,8 @@ import {
   hasPrContext,
   isEvaluateGate,
   isSweep,
+  parsePostMarker,
+  postsReview,
   parseOptInLabel,
   nearestAttr,
   parseAuthors,
@@ -26,6 +28,8 @@ import {
 } from "../handlers/attrs.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
+import { roleCanUseGh } from "../handlers/steps.js";
+import { parseRoleFrontmatter } from "../roles/role.js";
 
 export interface ValidateDeps {
   /** returns true if a consumer-repo-relative path exists. Omit to skip file checks. */
@@ -476,6 +480,53 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           where: { node: n.id, line: n.line },
           hint: "set identity.bot_login in foundry.config.yaml to the login that posts the verdict",
         });
+      }
+    }
+    if (n.attrs.post !== undefined) {
+      if (n.attrs.post !== "review") {
+        diags.push({
+          level: "error",
+          code: "node.bad-post",
+          message: `post= on '${n.id}' must be "review", got ${JSON.stringify(n.attrs.post)}`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (!postsReview(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.post-unsupported",
+          message: `post="review" on '${n.id}' needs a standalone pr-review node, or an analyst, with context="pr-diff" or "pr-review"`,
+          where: { node: n.id, line: n.line },
+        });
+      } else {
+        // The post step posts; a role that still lists gh tools gets no token to run them with.
+        const tools =
+          deps.roles?.get(n.id)?.tools ??
+          (n.files.role && deps.readFile ? parseRoleFrontmatter(deps.readFile(n.files.role) ?? "")?.tools : undefined);
+        if (typeof tools === "string" && roleCanUseGh(tools)) {
+          diags.push({
+            level: "warning",
+            code: "node.post-review-gh-tools",
+            message: `post="review" on '${n.id}': its role still lists gh tools (${tools}), but the agent gets no GitHub token — the post step posts; drop gh from tools`,
+            where: { node: n.id, line: n.line },
+            hint: "remove Bash(gh …) / Bash from the role's tools: front-matter",
+          });
+        }
+      }
+    }
+    if (n.attrs.post_marker !== undefined) {
+      if (n.attrs.post !== "review") {
+        diags.push({
+          level: "error",
+          code: "node.post-marker-without-post",
+          message: `post_marker= on '${n.id}' needs post="review" — it heads the review the post step posts`,
+          where: { node: n.id, line: n.line },
+        });
+      } else {
+        try {
+          parsePostMarker(n);
+        } catch (e) {
+          diags.push({ level: "error", code: "node.bad-post-marker", message: (e as Error).message, where: { node: n.id, line: n.line } });
+        }
       }
     }
     if (n.attrs.requires_review !== undefined) {

@@ -128,3 +128,12 @@ within one run.
 - Nothing here is repo-specific: model, tools, labels, and conventions all
   arrive as inputs or via the config JSON, so the same action drives every node
   type in the harness.
+
+## Output contract and stdout
+
+`output-contract` (optional) is appended as the prompt's last section, `## Output`,
+after the context payload. `post="review"` lanes use it to ask for a fenced json
+review block. The composite's `stdout-file` output is the path of the file holding
+the agent's stdout from the last attempt, for a later step in the same job (the
+compiled `Post the review` step reads it).
+

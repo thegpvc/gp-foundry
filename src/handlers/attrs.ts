@@ -23,7 +23,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
-  "mode", "check_name", "requires_review",
+  "mode", "check_name", "requires_review", "post", "post_marker",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -341,6 +341,32 @@ export function sweepRequiresReview(node: HarnessNode): boolean {
 
 /** The also-head marker for any node, as a regex prefix: a sweep does not know which lane wrote it. */
 export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
+
+// ── post="review" ────────────────────────────────────────────────────────────
+
+/**
+ * `post="review"` on a pr-review / PR-context analyst: the agent PRINTS its review
+ * as a fenced json block and a compiled step posts it with the lane's token. The
+ * agent gets no GitHub token and needs no `gh` — a shell under dontAsk denies the
+ * quoting a real review body needs, and an agent reading untrusted PR text should
+ * not hold a token anyway. True only for a node it applies to.
+ */
+export function postsReview(node: HarnessNode): boolean {
+  return node.attrs.post === "review" && (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);
+}
+
+/** Default heading the post step puts on line 1 of the review: placeholders `<n>` and `<sha>`. */
+export const DEFAULT_POST_MARKER = "PR #<n> head <sha>";
+
+/** `post_marker="…"`, else the default. Throws on a malformed value. */
+export function parsePostMarker(node: HarnessNode): string {
+  const raw = node.attrs.post_marker;
+  if (raw === undefined) return DEFAULT_POST_MARKER;
+  if (typeof raw !== "string" || !raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new Error(`node '${node.id}': post_marker= must be a non-empty single line, e.g. "PR #<n> head <sha>"`);
+  }
+  return raw.trim();
+}
 
 /**
  * A guard job is emitted for an event-driven PR analyst (never a sweep) that
