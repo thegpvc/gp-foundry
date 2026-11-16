@@ -42,12 +42,22 @@ describe("policy-merge.yaml verdict markers and evaluate-mode keys", () => {
   const raw = readFileSync(templatePath, "utf8");
   const p = normalizePolicyKeys(yaml.load(raw)) as Record<string, string>;
 
-  it("anchors the approval and rejection markers to the verdict line", () => {
+  it("anchors the approval marker to the verdict line", () => {
     const approve = new RegExp(p.approvalBodyRegex!);
-    const reject = new RegExp(p.rejectionBodyRegex!);
     expect(approve.test("Looks good.\n\n**Verdict:** APPROVE")).toBe(true);
     expect(approve.test("I would write `**Verdict:** APPROVE` once fixed.\n\n**Verdict:** REQUEST_CHANGES")).toBe(false);
-    expect(reject.test("Earlier: **Verdict:** REQUEST_CHANGES. Fixed now.\n\n**Verdict:** APPROVE")).toBe(false);
+    // An approval that mentions the earlier request is still an approval: the
+    // gate tests the approval marker FIRST, so the loose rejection never sees it.
+    expect(approve.test("Earlier: **Verdict:** REQUEST_CHANGES. Fixed now.\n\n**Verdict:** APPROVE")).toBe(true);
+  });
+
+  it("keeps the rejection marker loose: a missed rejection is the one that merges", () => {
+    const reject = new RegExp(p.rejectionBodyRegex!);
+    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES")).toBe(true);
+    // Visible text after the verdict line must not make the rejection disappear.
+    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES\n\n— the reviewer")).toBe(true);
+    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES (see the three items above)")).toBe(true);
+    expect(reject.source).toBe("Verdict.*REQUEST_CHANGES"); // same as the built-in default
   });
 
   it("ships the evaluate-mode keys commented out, and they parse when uncommented", () => {

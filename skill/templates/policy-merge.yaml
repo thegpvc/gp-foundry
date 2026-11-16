@@ -26,10 +26,12 @@ allow_comment_approvals: false
 # An entry may pin the author as "<name>@<app-slug>": a check-run's name is public,
 # so anything that can write checks could otherwise publish its own "approval".
 required_checks: []
-# A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
-# to the verdict line — a bare substring would misread approvals that mention the
-# earlier requested changes in prose.
-rejection_body_regex: '\*\*Verdict:\*\* REQUEST_CHANGES$'
+# A matching body INVALIDATES earlier approvals (latest verdict wins). Deliberately
+# looser than the approval marker above: a rejection the gate fails to recognize
+# leaves an earlier approval standing, so this one matches the marker anywhere on a
+# line. It cannot misread an approval that mentions the earlier request in prose —
+# the approval marker is tested first.
+rejection_body_regex: "Verdict.*REQUEST_CHANGES"
 approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)
 
 # CI — require the check rollup to be passing; optionally ignore named checks.

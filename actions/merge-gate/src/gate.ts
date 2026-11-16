@@ -713,6 +713,23 @@ export interface ReviewFact {
  * rejection or escalation. Bodies are tested with trailing whitespace trimmed,
  * so an anchored `…$` marker matches a verdict line followed by a newline.
  */
+/**
+ * A review or comment body as a reader sees it: HTML comments removed, trailing
+ * whitespace trimmed. Every verdict marker is matched against THIS, never the
+ * raw body.
+ *
+ * The harness appends machine markers after the verdict line — the
+ * unchanged-diff stamp (`<!-- gp-foundry:diff:… -->`) and the also-head marker.
+ * Against the raw body an anchored marker (`\*\*Verdict:\*\* REQUEST_CHANGES$`)
+ * then matches nothing, and for a REJECTION that fails open: the gate does not
+ * see the request for changes and an earlier approval stands. Text hidden in a
+ * comment is not part of what the reviewer said either way, so it can neither
+ * supply a verdict nor hide one.
+ */
+export function visibleBody(body: string | null | undefined): string {
+  return (body ?? "").replace(/<!--[\s\S]*?-->/g, "").trimEnd();
+}
+
 export function latestHeadVerdictIsEscalation(
   reviews: ReviewFact[],
   headSha: string | undefined,
@@ -723,7 +740,7 @@ export function latestHeadVerdictIsEscalation(
   const verdicts = reviews
     .filter((r) => r.sha === headSha && r.body)
     .filter((r) => isCountableVerdict({ at: r.at, kind: "approve", author: r.author, authorAssociation: r.authorAssociation, source: "review" }, trust))
-    .map((r) => ({ at: r.at, body: r.body!.trimEnd() }))
+    .map((r) => ({ at: r.at, body: visibleBody(r.body) }))
     .filter((r) => [markers.approval, markers.rejection, markers.escalation].some((re) => re?.test(r.body)))
     .sort((a, b) => parseTimestamp(a.at) - parseTimestamp(b.at));
   const last = verdicts[verdicts.length - 1];

@@ -686,12 +686,15 @@ describe('select="sweep" on pr-review', () => {
       expect(plain).not.toContain('endswith("[bot]")');
     });
 
-    it("reads a verdict only from the review's last non-empty line", () => {
-      const run: string = wf().jobs.approver_select.steps[0].run;
-      expect(run).toContain(
-        '(.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER)',
-      );
-      expect(run).not.toContain("contains(env.VERDICT_MARKER)");
+    it("reads a verdict only from the last line of the review's visible text", () => {
+      // The behaviour is pinned by execution in "sweep: what counts as a verdict";
+      // here, only that both jobs use the anchored test and never a substring match.
+      for (const job of ["approver_select", "approver_mark"]) {
+        const run: string = wf().jobs[job].steps[0].run;
+        expect(run, job).toContain("| (last // \"\") | startswith(env.VERDICT_MARKER)");
+        expect(run, job).toContain('gsub("<!--[\\\\s\\\\S]*?-->"; "")');
+        expect(run, job).not.toContain("contains(env.VERDICT_MARKER)");
+      }
     });
   });
 
@@ -1091,13 +1094,42 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
       ]) {
         const r = run({ ...jobs, ...fx }, one);
         expect(r.status).toBe(0);
-        expect(r.writes).toBe(""); // neither swept nor counted as a failure
-        expect(r.stdout).toContain("#1: no verdict posted on sha1; left for the next sweep");
+        // Not swept, and not a failure — but counted, so it cannot repeat forever.
+        expect(r.writes).not.toContain("gp-foundry/swept");
+        expect(r.writes).not.toContain("gp-foundry/sweep-failed");
+        expect(r.writes).toContain("name=gp-foundry/sweep-idle (approver)");
+        expect(r.writes).toContain("conclusion=neutral");
+        expect(r.stdout).toContain("#1: no verdict posted on sha1 — recorded run 1 of 3 without one");
       }
       const r = run({ ...jobs, ...reviews(1) }, one);
       expect(r.writes).toContain("POST repos/o/r/check-runs");
       expect(r.writes).toContain("name=gp-foundry/swept (approver)");
       expect(r.stdout).toContain("#1: marked sha1");
+    });
+
+    it("stops retrying a head after three runs that posted no verdict", () => {
+      const jobs = { [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } };
+      const one = { ...env, PRS: JSON.stringify([{ number: 1, sha: "sha1" }]) };
+      const idle = { status: "completed", name: "gp-foundry/sweep-idle (approver)", app: { slug: "github-actions" } };
+      const prior = (n: number) => ({
+        // Only `filter=all` lists every record; the default view shows the newest one.
+        "repos/o/r/commits/sha1/check-runs?per_page=100&filter=all": { check_runs: Array(n).fill(idle) },
+        "repos/o/r/commits/sha1/check-runs?per_page=100": { check_runs: n ? [idle] : [] },
+      });
+      const noVerdict = { "repos/o/r/pulls/1/reviews?per_page=100": [] };
+
+      const second = run({ ...jobs, ...noVerdict, ...prior(1) }, one);
+      expect(second.writes).toContain("output[title]=approver run 2 of 3 posted no verdict");
+
+      const third = run({ ...jobs, ...noVerdict, ...prior(2) }, one);
+      expect(third.status).toBe(0);
+      expect(third.writes).toContain("output[title]=approver stopped after 3 runs without a verdict");
+      expect(third.writes).not.toContain("gp-foundry/swept");
+
+      // A verdict on a later run still marks the head, whatever came before.
+      const late = run({ ...jobs, ...reviews(1), ...prior(2) }, one);
+      expect(late.writes).toContain("name=gp-foundry/swept (approver)");
+      expect(late.writes).not.toContain("sweep-idle");
     });
 
     it("leaves a successful head unmarked when its reviews cannot be read", () => {
@@ -2161,5 +2193,110 @@ describe("run-agent: output handling", () => {
       const r = run(`echo "gh=\${GH_TOKEN-UNSET}"`, { GH_TOKEN: "t0k", GITHUB_TOKEN: "t0k" });
       expect(r.stdout).toContain("gh=t0k");
     });
+  });
+});
+
+// A verdict is the last line of the review AS A READER SEES IT. The harness
+// appends HTML-comment markers after that line, and models leave stray
+// whitespace; none of that may make a real verdict invisible to the sweep —
+// an unrecognized verdict means the head is handed to the agent again.
+describe("sweep: what counts as a verdict", () => {
+  const SWEEP = `digraph t {
+    approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *"]
+  }`;
+  const LIST = "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100";
+  const STAMP = `<!-- gp-foundry:diff:reviewer:${"f".repeat(64)} -->`;
+  const ALSO = `<!-- gp-foundry:also-head:reviewer:${"b".repeat(40)} -->`;
+  const V = "**Verdict:** APPROVE";
+
+  /** Is a head carrying one bot review with this body treated as decided? */
+  function decided(body: string): boolean {
+    const step = workflow(SWEEP, "approver").jobs.approver_select.steps[0];
+    const r = runStepScript(step, {
+      [LIST]: [
+        {
+          number: 1,
+          draft: false,
+          head: { ref: "agent/1", sha: "sha1" },
+          base: { ref: "main" },
+          requested_reviewers: [],
+          requested_teams: [],
+          updated_at: "2020-01-01T00:00:00Z",
+        },
+      ],
+      "repos/o/r/commits/sha1/check-runs?per_page=100&filter=all": { check_runs: [{ status: "completed", name: "ci", app: { slug: "github-actions" } }] },
+      "repos/o/r/commits/sha1/status": { total_count: 0 },
+      "repos/o/r/pulls/1/reviews?per_page=100": [{ user: { login: BOT }, commit_id: "sha1", body }],
+    });
+    expect(r.status, r.stdout).toBe(0);
+    return r.outputs.count === "0";
+  }
+
+  it.each([
+    ["the plain form", `Fine.\n\n${V}`],
+    ["a trailing newline", `Fine.\n\n${V}\n`],
+    ["CRLF line endings", `Fine.\r\n\r\n${V}\r\n`],
+    ["a whitespace-only line after it", `Fine.\n\n${V}\n   \n`],
+    ["an indented verdict line", `Fine.\n\n  ${V}`],
+    ["the unchanged-diff stamp after it", `Fine.\n\n${V}\n\n${STAMP}`],
+    ["the stamp and an also-head marker after it", `Fine.\n\n${V}\n\n${STAMP}\n${ALSO}\n`],
+    ["a multi-line HTML comment after it", `Fine.\n\n${V}\n<!--\nnotes\n-->`],
+  ])("recognizes a verdict with %s", (_name, body) => {
+    expect(decided(body)).toBe(true);
+  });
+
+  it.each([
+    ["the marker quoted in a blockquote", `Fine.\n\n> ${V}`],
+    ["the marker mid-sentence on the last line", `The role says to end with ${V}`],
+    ["the verdict line followed by more prose", `${V}\n\nReasons: tests pass.`],
+    ["a verdict hidden inside an HTML comment", `Just notes.\n\n<!-- ${V} -->`],
+    ["no marker at all", "Just notes."],
+  ])("does not treat %s as a verdict", (_name, body) => {
+    expect(decided(body)).toBe(false);
+  });
+});
+
+describe("sweep: a head that never gets a verdict is not swept forever", () => {
+  const SWEEP = `digraph t {
+    approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *"]
+  }`;
+  const LIST = "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100";
+  const open = (number: number) => ({
+    number,
+    draft: false,
+    head: { ref: `agent/${number}`, sha: `sha${number}` },
+    base: { ref: "main" },
+    requested_reviewers: [],
+    requested_teams: [],
+    updated_at: "2020-01-01T00:00:00Z",
+  });
+  const ci = { status: "completed", name: "ci", app: { slug: "github-actions" } };
+  const idle = (app = "github-actions") => ({ status: "completed", name: "gp-foundry/sweep-idle (approver)", app: { slug: app } });
+  const head = (n: number, checks: unknown[]) => ({
+    [`repos/o/r/commits/sha${n}/check-runs?per_page=100&filter=all`]: { check_runs: checks },
+    [`repos/o/r/commits/sha${n}/status`]: { total_count: 0 },
+    [`repos/o/r/pulls/${n}/reviews?per_page=100`]: [],
+  });
+
+  it("the selector gives up after three verdict-less runs — counted from GITHUB_TOKEN's records only", () => {
+    const step = workflow(SWEEP, "approver").jobs.approver_select.steps[0];
+    expect(step.env.IDLE_CHECK).toBe("gp-foundry/sweep-idle (approver)");
+    expect(step.env.MAX_IDLE).toBe("3");
+    const r = runStepScript(step, {
+      [LIST]: [open(1), open(2), open(3)],
+      ...head(1, [ci, idle(), idle()]), // two: one retry left
+      ...head(2, [ci, idle(), idle(), idle()]), // spent
+      ...head(3, [ci, idle("my-agent-app"), idle("my-agent-app"), idle("my-agent-app")]), // not ours
+    });
+    expect(r.status).toBe(0);
+    expect((JSON.parse(r.outputs.prs!) as any[]).map((p) => p.number)).toEqual([1, 3]);
+    expect(r.stdout).toContain("#2: gave up on sha2 after 3 runs that posted no verdict");
+  });
+
+  it("the idle budget and the failure budget are separate", () => {
+    const step = workflow(SWEEP, "approver").jobs.approver_select.steps[0];
+    const failed = { status: "completed", name: "gp-foundry/sweep-failed (approver)", app: { slug: "github-actions" } };
+    const r = runStepScript(step, { [LIST]: [open(1)], ...head(1, [ci, idle(), idle(), failed, failed]) });
+    expect((JSON.parse(r.outputs.prs!) as any[]).map((p) => p.number)).toEqual([1]);
   });
 });

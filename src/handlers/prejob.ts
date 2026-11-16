@@ -24,6 +24,7 @@ import {
   preJobId,
   skipOf,
   sweepFailedCheckName,
+  sweepIdleCheckName,
   sweepRequiresReview,
   sweepJobNamePrefix,
   sweptCheckName,
@@ -37,6 +38,16 @@ export const SWEEP_LIMIT = 10;
 
 /** Failed lane runs on one head before the sweep stops handing it to the agent. */
 export const SWEEP_MAX_FAILURES = 3;
+
+/**
+ * Successful lane runs that leave NO verdict on a head before the sweep stops
+ * handing it to the agent. A run can legitimately have nothing to decide yet
+ * (the head moved after selection, a check restarted), so one such run must not
+ * retire the head — but neither may a role that never posts a verdict (a shadow
+ * run, an abstention, a verdict the filter does not recognize) be re-run on
+ * every tick forever, posting a fresh review each time.
+ */
+export const SWEEP_MAX_IDLE = 3;
 
 /**
  * How long a head with NO check-runs at all is left alone. "Every check has
@@ -58,12 +69,26 @@ export function emitPostJob(ctx: EmitContext): WorkflowJobFragment | null {
 
 /**
  * jq filter over a reviews array: the verdict reviews on head `env.SHA` by the
- * bot. A verdict is the review's LAST non-empty line — a substring match would
- * let a lane posting as the same bot decide a head just by quoting the marker.
+ * bot. A verdict is the LAST line of the review as a reader sees it — a
+ * substring match would let a lane posting as the same bot decide a head just
+ * by quoting the marker.
+ *
+ * "As a reader sees it" is load-bearing. The harness itself appends HTML
+ * comments after the verdict line (the unchanged-diff stamp, the also-head
+ * marker), and a model will leave trailing spaces or indent the line; a test on
+ * the raw last line calls every one of those reviews "not a verdict", and a head
+ * whose verdict goes unrecognized is swept again. So: HTML comments are removed,
+ * each line is trimmed, blank lines are dropped — then the last line must start
+ * with the marker. A quoted marker (`> **Verdict:**`) or one mid-body still does
+ * not count. The merge gate applies the same rule (visibleBody in gate.ts).
+ * The regexes are written to mean the same under Oniguruma (jq) and RE2 (gh's gojq).
+ *
  * Shared by the select job ("decided") and the mark job ("the lane delivered").
  */
 const BY_BOT_JQ = `(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`;
-const IS_VERDICT_JQ = `((.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
+const IS_VERDICT_JQ =
+  `((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
+  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
 const VERDICT_REVIEWS_JQ = [
   `[ .[] | select(.commit_id == env.SHA)`,
   `  | select(${BY_BOT_JQ})`,
@@ -281,7 +306,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     ...(sweepRequiresReview(node)
       ? [`#   reviewed    a non-verdict review by the bot covers the head (on it, or marked also-head)`]
       : []),
-    `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head`,
+    `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head, and fewer`,
+    `#               than $MAX_IDLE runs that succeeded without leaving a verdict`,
     `LIST=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&sort=created&direction=asc&per_page=100" --paginate --jq '`,
     `  .[] | select(.draft | not)`,
     `  | select(.head.ref | startswith(env.PREFIX))`,
@@ -313,9 +339,10 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `    .check_runs | [ length,`,
     `      ([.[] | select(.status != "completed")] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP)] | length),`,
-    `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP)] | length) ] | @tsv' \\`,
-    `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4} END {print t+0, r+0, s+0, f+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
-    `  read -r TOTAL RUNNING SWEPT FAILURES <<< "$CHECKS"`,
+    `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP)] | length),`,
+    `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP)] | length) ] | @tsv' \\`,
+    `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
+    `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
     `  if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
     `  if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then`,
     `    echo "#$NUM: no check-run on $SHA yet and the PR changed \${QUIET}s ago — waiting for CI to register"`,
@@ -327,6 +354,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  if [ "$SWEPT" != "0" ]; then echo "#$NUM: already swept at $SHA"; continue; fi`,
     `  # …and a lane that keeps FAILING on a head is not retried forever either.`,
     `  if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi`,
+    `  # …nor is one that keeps succeeding without ever leaving a verdict.`,
+    `  if [ "$IDLE" -ge "$MAX_IDLE" ]; then echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi`,
     `  STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" --jq '`,
     `    if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }`,
     `  if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi`,
@@ -370,6 +399,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           ALSO_HEAD_PATTERN: ALSO_HEAD_ANY_NODE_PATTERN,
           SWEPT_CHECK: sweptCheckName(node),
           FAILED_CHECK: sweepFailedCheckName(node),
+          IDLE_CHECK: sweepIdleCheckName(node),
+          MAX_IDLE: String(SWEEP_MAX_IDLE),
           MARK_APP,
           LIMIT: String(SWEEP_LIMIT),
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
@@ -425,6 +456,8 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           JOB_PREFIX: sweepJobNamePrefix(node),
           SWEPT_CHECK: sweptCheckName(node),
           FAILED_CHECK: sweepFailedCheckName(node),
+          IDLE_CHECK: sweepIdleCheckName(node),
+          MAX_IDLE: String(SWEEP_MAX_IDLE),
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           RUN_ID: "${{ github.run_id }}",
           RUN_ATTEMPT: "${{ github.run_attempt }}",
@@ -455,7 +488,25 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `      if [ -z "$VERDICTS" ]; then`,
           `        echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"`,
           `      elif [ "$VERDICTS" = "0" ]; then`,
-          `        echo "::notice::#$NUM: no verdict posted on $SHA; left for the next sweep"`,
+          `        # Retried — but counted, so a role that never posts a verdict is not`,
+          `        # run on every tick forever. One check-run per such run; the selector`,
+          `        # stops at $MAX_IDLE.`,
+          `        PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
+          `          [.check_runs[] | select(.name == env.IDLE_CHECK)] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
+          `        N=$((PRIOR + 1))`,
+          `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
+          `          TITLE="$NODE stopped after $N runs without a verdict"`,
+          `          SUMMARY="The $NODE lane ran $N times on $SHA and never posted a verdict there. It will not be run on this head again; push a new commit, or re-run the lane by hand, to try again."`,
+          `        else`,
+          `          TITLE="$NODE run $N of $MAX_IDLE posted no verdict"`,
+          `          SUMMARY="The $NODE lane ran on $SHA and posted no verdict. The next sweep retries it; after $MAX_IDLE such runs it stops."`,
+          `        fi`,
+          `        if publish "$IDLE_CHECK" "$SHA" "$TITLE" "$SUMMARY"; then`,
+          `          echo "::notice::#$NUM: no verdict posted on $SHA — recorded run $N of $MAX_IDLE without one"`,
+          `        else`,
+          `          echo "::error::#$NUM: could not record the verdict-less run on $SHA — its retries are not being counted"`,
+          `          FAILED=1`,
+          `        fi`,
           `      elif publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA and posted its verdict."; then`,
           `        echo "#$NUM: marked $SHA"`,
           `      else`,

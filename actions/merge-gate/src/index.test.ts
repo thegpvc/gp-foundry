@@ -35,6 +35,8 @@ const CHECK = "fletch/approval";
 
 interface World {
   approved: boolean;
+  /** When set, the PR's reviews verbatim (overrides `approved`). */
+  reviews?: unknown[];
   threads: unknown[];
   existing: { id: number; name: string; status: string; conclusion: string; app: { slug: string }; output: { summary: string; text: string } }[];
 }
@@ -73,9 +75,10 @@ function makeOctokit(world: World) {
         get: rec("pulls.get", pr),
         listReviews: rec(
           "pulls.listReviews",
-          world.approved
-            ? [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "Looks right.\n\n**Verdict:** APPROVE\n" }]
-            : [],
+          world.reviews ??
+            (world.approved
+              ? [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "Looks right.\n\n**Verdict:** APPROVE\n" }]
+              : []),
         ),
         listFiles: rec("pulls.listFiles", [{ filename: "src/w.ts", additions: 10, deletions: 0 }]),
         merge: rec("pulls.merge", {}),
@@ -194,5 +197,67 @@ describe("merge-gate evaluate mode", () => {
     await run();
     expect(methods()).toContain("pulls.merge");
     expect(methods()).not.toContain("checks.create");
+  });
+});
+
+// The harness appends machine markers AFTER the verdict line: the unchanged-diff
+// stamp, and the also-head marker a guard adds when it skips a head. A marker
+// regex anchored with `$` must still see the verdict — above all a rejection,
+// where not seeing it means an earlier approval stands and the PR merges.
+describe("verdict markers are read from the visible body", () => {
+  const STAMP = `<!-- gp-foundry:diff:reviewer:${"f".repeat(64)} -->`;
+  const ALSO = `<!-- gp-foundry:also-head:reviewer:${"b".repeat(40)} -->`;
+  const review = (at: string, body: string) => ({
+    submitted_at: at,
+    state: "COMMENTED",
+    commit_id: HEAD,
+    user: { login: BOT },
+    author_association: "NONE",
+    body,
+  });
+  const approve = (at: string, tail = "") => review(at, `Looks right.\n\n**Verdict:** APPROVE${tail}`);
+  const reject = (at: string, tail = "") => review(at, `Needs work.\n\n**Verdict:** REQUEST_CHANGES${tail}`);
+  const mergeMode = (reviews: unknown[], policyYaml = "") => {
+    setup({ reviews }, policyYaml);
+    inputs.mode = "";
+  };
+
+  it("a stamped approval still approves under an anchored regex", async () => {
+    mergeMode([approve("2026-01-01T00:00:00Z", `\n\n${STAMP}\n${ALSO}\n`)]);
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+
+  it("a stamped rejection after an approval blocks the merge (default rejection regex)", async () => {
+    mergeMode([approve("2026-01-01T00:00:00Z"), reject("2026-01-02T00:00:00Z", `\n\n${STAMP}`)]);
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("…and with the also-head marker a guard appends later", async () => {
+    mergeMode([approve("2026-01-01T00:00:00Z"), reject("2026-01-02T00:00:00Z", `\n\n${STAMP}\n${ALSO}`)]);
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("…and under the anchored rejection regex the policy template ships", async () => {
+    mergeMode(
+      [approve("2026-01-01T00:00:00Z"), reject("2026-01-02T00:00:00Z", `\n\n${STAMP}`)],
+      `rejection_body_regex: '\\*\\*Verdict:\\*\\* REQUEST_CHANGES$'\n`,
+    );
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("a verdict hidden inside an HTML comment is not a verdict", async () => {
+    mergeMode([review("2026-01-01T00:00:00Z", "Just notes.\n\n<!-- **Verdict:** APPROVE -->")]);
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("evaluate mode reads an escalation through the markers too", async () => {
+    setup({ reviews: [review("2026-01-01T00:00:00Z", `Unsure.\n\n**Verdict:** ESCALATE\n\n${STAMP}`)] });
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("action_required");
   });
 });

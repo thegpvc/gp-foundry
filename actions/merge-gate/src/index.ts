@@ -17,6 +17,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import yaml from "js-yaml";
 import {
+  visibleBody,
   checkConclusion,
   describeCheckRunsFailure,
   evaluateMergeGate,
@@ -56,8 +57,12 @@ interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   escalationBodyRegex?: string;
 }
 
-/** Anchored verdict markers: the reviewer's verdict is the body's final line. */
-export const DEFAULT_REJECTION_BODY_REGEX = "\\*\\*Verdict:\\*\\* REQUEST_CHANGES$";
+// Deliberately LOOSE (no `$` anchor), unlike the approval marker a policy sets.
+// The two errors are not symmetric: a rejection the gate fails to recognize
+// leaves an earlier approval standing and the PR merges, while a rejection it
+// recognizes too eagerly only holds a merge back. So the default matches the
+// marker anywhere on a line; a policy that wants the strict form can set it.
+export const DEFAULT_REJECTION_BODY_REGEX = "Verdict.*REQUEST_CHANGES";
 export const DEFAULT_ESCALATION_BODY_REGEX = "\\*\\*Verdict:\\*\\* ESCALATE$";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -176,12 +181,13 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
   // final "**Verdict:** …" line, and an approval may legitimately quote or discuss
   // the earlier REQUEST_CHANGES items in its prose. A body matching the approval
   // marker is an approval, full stop.
-  // Bodies are tested with trailing whitespace trimmed, so an anchored `…$`
-  // marker matches a verdict line that ends in a newline.
+  // Bodies are tested as a reader sees them (visibleBody: HTML comments removed,
+  // trailing whitespace trimmed), so an anchored `…$` marker matches a verdict
+  // line that ends in a newline OR is followed by the harness's own markers.
   for (const r of reviews) {
     if (!r.submitted_at) continue;
     const who = { author: r.user?.login, authorAssociation: r.author_association, source: "review" as const };
-    const body = r.body?.trimEnd();
+    const body = visibleBody(r.body);
     if (isApprovalReview({ state: r.state, body }, bodyRe)) {
       rawEvents.push({ at: r.submitted_at, kind: "approve", sha: r.commit_id, ...who });
     } else if (r.state === "CHANGES_REQUESTED" || (r.state === "COMMENTED" && body && rejectRe.test(body))) {
@@ -196,7 +202,7 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     for (const c of comments) {
       if (!c.body || !c.created_at) continue;
       const who = { author: c.user?.login, authorAssociation: c.author_association, source: "comment" as const };
-      const body = c.body.trimEnd();
+      const body = visibleBody(c.body);
       if (bodyRe.test(body)) rawEvents.push({ at: c.created_at, kind: "approve", ...who });
       else if (rejectRe.test(body)) rawEvents.push({ at: c.created_at, kind: "reject", ...who });
     }

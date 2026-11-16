@@ -127,10 +127,17 @@ never makes. The token needs only `checks: write`, `pull-requests: read` and
 
 ## Verdict markers
 
-Review bodies are matched with trailing whitespace trimmed, so an anchored
-marker matches a verdict line that ends the body. The shipped policy template
-uses `\*\*Verdict:\*\* APPROVE$` for `approvalBodyRegex`;
-`rejectionBodyRegex` defaults to `\*\*Verdict:\*\* REQUEST_CHANGES$`.
+Review bodies are matched as a reader sees them: HTML comments removed (the
+harness appends its own after the verdict line — the unchanged-diff stamp, the
+also-head marker) and trailing whitespace trimmed. An anchored marker therefore
+matches a verdict line that ends the *visible* body. The shipped policy template
+uses `\*\*Verdict:\*\* APPROVE$` for `approvalBodyRegex`.
+
+`rejectionBodyRegex` defaults to the loose `Verdict.*REQUEST_CHANGES`, on purpose:
+a rejection the gate fails to recognize leaves an earlier approval standing and
+the PR merges, while one it recognizes too eagerly only holds a merge back. The
+approval marker is tested first, so an approval that mentions the earlier request
+in prose is still an approval.
 
 ## Inputs
 
@@ -200,7 +207,7 @@ allowCommentApprovals: false             # plain issue comments are NOT approval
 
 # wrapper-only (I/O) knobs:
 approvalBodyRegex: '\*\*Verdict:\*\* APPROVE$'   # count a COMMENTED review as approval
-rejectionBodyRegex: '\*\*Verdict:\*\* REQUEST_CHANGES$'   # the default
+rejectionBodyRegex: 'Verdict.*REQUEST_CHANGES'   # the default (loose on purpose)
 
 # evaluate-mode clauses (off by default; also apply in merge mode when set):
 requireNoOpenThreads: true

@@ -370,6 +370,15 @@ export function sweepFailedCheckName(node: HarnessNode): string {
 }
 
 /**
+ * The check-run a sweep publishes for each run on a head that SUCCEEDED but
+ * left no verdict there. A lane cannot fail its job on purpose, so "nothing to
+ * decide yet" looks like success; it is retried, but not without limit.
+ */
+export function sweepIdleCheckName(node: HarnessNode): string {
+  return `gp-foundry/sweep-idle (${node.id})`;
+}
+
+/**
  * The check-run a sweep publishes on a head once its lane has run there — the
  * sweep's own record of "done", independent of anything the agent posts.
  */
