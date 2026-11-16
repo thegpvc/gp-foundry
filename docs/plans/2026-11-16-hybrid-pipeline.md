@@ -1,7 +1,6 @@
 # Hybrid pipeline (0.3.0)
 
-**Date:** 2026-11-16 · **Status:** In design — decisions below are settled, open items are
-not · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
+**Date:** 2026-11-16 · **Status:** Design settled; not yet built · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
 
 ## What changed from the earlier plan
 
@@ -41,9 +40,24 @@ convention for agent branches; nothing's safety rests on it in a harness that op
    also merges ready agent-written PRs. An enumeration, so a later value can be added
    without changing these two.
 4. **Scope is a rollout dial, not access control.** One repo-wide block in the config says
-   which PRs the pipeline looks at (these authors, or an opt-in label; minus drafts, bots
-   and a skip label). Every lane and the gate use it. Its end state is "every PR", so it is
-   cheap to widen, easy to delete, and has no per-lane overrides.
+   which human PRs the pipeline looks at. Every lane and the gate use it; there are no
+   per-lane overrides. Its end state is "every PR", so it is cheap to widen and easy to
+   delete:
+
+   ```yaml
+   rollout:
+     authors: [alice, bob]        # human PRs by these people are reviewed
+     opt_in_label: agent-review   # ...or any PR carrying this label
+     skip_label: no-agent-review  # never these
+   ```
+
+   - **No `rollout` block means every PR is in scope.** Finishing the rollout is deleting it.
+   - **Agent-written PRs are always in scope**, whatever the dial says: the pipeline made
+     them. What it does with its own work is governed elsewhere — by which issues are
+     labelled for the builder, and by the gate's `merge=`.
+   - **Drafts and other bots' PRs are always skipped**, with no setting. A bot's PR is
+     reviewed only if that bot is named in `authors`. (The merge gate's existing dependabot
+     lane is separate, opt-in in the policy file, and unchanged.)
 5. **One implementation.** "Is this PR in scope", "is it agent-written" and "what is the
    result" are one tested TypeScript function, called by the guard, the sweep and the gate.
    Generated workflows stop carrying that logic in shell.
@@ -63,22 +77,56 @@ gp-foundry runs in several repos. The rule for 0.3.0:
 - `mode="evaluate"` and `mode="merge"`, and the per-node `authors=`, `opt_in_label=` and
   `skip=`, keep working as aliases with a deprecation note. They are not removed in 0.3.0.
 
+A hybrid graph then carries no scope attributes at all:
+
+```dot
+reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+approver [type=pr-review, role="agents/roles/approver.md", select="sweep", schedule="*/10 * * * *"]
+gate     [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="off"]
+```
+
+## Releases and refs
+
+Consumers are typically **vendored**: `up` copies the actions and rebuilds the workflows
+together, so the two cannot drift. Compatibility is therefore a property of the compiler's
+output.
+
+For pinned harnesses, the same property is restored by tagging:
+
+- Every release gets an exact git tag (`v0.3.0`). None has been cut since 0.1.2.
+- The compiler writes that exact tag into pinned workflows when the config names no ref,
+  instead of `@v1`. A pinned harness then upgrades its actions only when it rebuilds, which
+  is also when its workflows are regenerated to match.
+- `doctor` warns when a harness is still on `v1`.
+- The `v1` tag itself is left where it is (0.1.2). Moving it would put today's actions
+  under workflows compiled months ago.
+
 ## Shipping
 
 One release, 0.3.0, built on `release/0.3.0` across several reviewable PRs into that
 branch. `main` stays at 0.2.16 and publishable until 0.3.0 is complete; there are no
-further 0.2.x feature releases.
+further 0.2.x releases. Fixes that arrive meanwhile are folded into the branch.
 
 ## Open
 
-1. How each existing consumer takes updates (vendored via `up`, or pinned to a ref), and
-   whether the `v1` tag — still pointing at 0.1.2 — should move. Pinned consumers on the
-   default ref are running July's actions.
-2. A regression check for the compatibility rule: compile real consumer harnesses with
+1. A regression check for the compatibility rule: compile real consumer harnesses with
    0.2.16 and with 0.3.0 and compare the output.
-3. Names: the config key for the rollout scope, and whether "agent-only" is the final
-   spelling.
-4. The gate's check can still be published by any workflow in the repo. Unchanged from
+2. The gate's check can still be published by any workflow in the repo. Unchanged from
    0.2.15, and less pressing while a person is the last step on human PRs.
-5. Whether a human may opt a PR in to the fixer. Not built until asked for; if built, the
+3. Whether a human may opt a PR in to the fixer. Not built until asked for; if built, the
    PR stays human-written and human-merged.
+
+## Build order
+
+Each step is its own PR into `release/0.3.0`, and each leaves the branch releasable.
+
+1. **The policy function.** Scope, agent-written and result as one tested function in the
+   merge-gate action, with the `rollout` config block. No workflow changes yet.
+2. **One gate.** `merge="off" | "agent-only"`; `mode=` becomes an alias; the gate publishes
+   the check in both settings and merges through the policy function.
+3. **Lanes read or write.** The guard and the sweep call the policy function; the fixer
+   and the merge are limited to agent-written PRs when a harness opts in; per-node
+   `authors=`, `opt_in_label=` and `skip=` become aliases for the rollout block.
+4. **Refs.** Exact tags, the compiler's pinned default, the `doctor` warning.
+5. **Compatibility pass.** The regression check above, `init` writing `merge="off"`,
+   docs, the starter example.
