@@ -374,5 +374,15 @@ export function diffMarkerPrefix(node: HarnessNode): string {
   return `<!-- gp-foundry:diff:${node.id}:`;
 }
 
+/**
+ * `<!-- gp-foundry:also-head:<node>:` — the prefix of the marker appended to a
+ * review, one per head, when the guard skips a push whose diff that review
+ * already covers: the review stands for the new head too. A downstream sweep
+ * (`requires_review=true`) reads it as "reviewed" for that head.
+ */
+export function alsoHeadMarkerPrefix(node: HarnessNode): string {
+  return `<!-- gp-foundry:also-head:${node.id}:`;
+}
+
 /** The marker every verdict review carries; a sweep reads it as "decided". */
 export const VERDICT_MARKER = "**Verdict:**";

@@ -14,6 +14,7 @@
 import type { EmitContext, WorkflowJobFragment } from "../ir/types.js";
 import {
   VERDICT_MARKER,
+  alsoHeadMarkerPrefix,
   authorsOf,
   diffMarkerPrefix,
   hasSkipGuard,
@@ -25,7 +26,7 @@ import {
   sweepJobNamePrefix,
   sweptCheckName,
 } from "./attrs.js";
-import { runStep } from "./steps.js";
+import { appTokenStep, runStep, tokenExpr } from "./steps.js";
 
 const PR_NUMBER = "${{ github.event.pull_request.number }}";
 
@@ -159,7 +160,10 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
       );
     } else {
       env.MARKER_PREFIX = diffMarkerPrefix(node);
+      env.ALSO_HEAD_PREFIX = alsoHeadMarkerPrefix(node);
       env.EVENT_ACTION = "${{ github.event.action }}";
+      // The review is the bot's, so only the token that posted (and stamps) it can edit it.
+      env.STAMP_TOKEN = tokenExpr(ctx);
       lines.push(
         `# unchanged-diff: hash the PR's merge-base diff and compare it with the hash`,
         `# stamped into this bot's last review. Blob ids and hunk positions are`,
@@ -174,10 +178,25 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
         `  DIFF_HASH=$(printf '%s\\n' "$DIFF" \\`,
         `    | sed -E -e '/^index [0-9a-f]+\\.\\.[0-9a-f]+/d' -e 's/^@@ -[0-9,]+ \\+[0-9,]+ @@/@@/' \\`,
         `    | sha256sum | cut -d' ' -f1)`,
-        `  LAST=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
-        `    .[] | select(.user.login == env.BOT_LOGIN) | (.body // "")`,
-        `    | select(contains(env.MARKER_PREFIX)) | split(env.MARKER_PREFIX) | last | .[0:64]' 2>/dev/null | tail -n 1) || LAST=""`,
+        `  LAST_REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
+        `    .[] | select(.user.login == env.BOT_LOGIN) | select((.body // "") | contains(env.MARKER_PREFIX))`,
+        `    | "\\(.id) \\((.body // "") | split(env.MARKER_PREFIX) | last | .[0:64])"' 2>/dev/null | tail -n 1) || LAST_REVIEW=""`,
+        `  LAST_ID=\${LAST_REVIEW%% *}; LAST=\${LAST_REVIEW#* }`,
         `  if [ "$EVENT_ACTION" = "synchronize" ] && [ -n "$LAST" ] && [ "$LAST" = "$DIFF_HASH" ]; then`,
+        `    # That review covers this head too: say so in it, so a downstream lane can`,
+        `    # tell "reviewed" from the other reasons this lane skips. One marker per`,
+        `    # head, appended; best-effort — the skip stands either way.`,
+        `    MARK="$ALSO_HEAD_PREFIX$HEAD_SHA -->"`,
+        `    if BODY=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" --jq '.body // ""' 2>/dev/null); then`,
+        `      case "$BODY" in`,
+        `        *"$MARK"*) ;;`,
+        `        *) GH_TOKEN="$STAMP_TOKEN" gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" \\`,
+        `             -f body="$(printf '%s\\n%s' "$BODY" "$MARK")" >/dev/null \\`,
+        `             || echo "::warning::could not mark review $LAST_ID as covering $HEAD_SHA" ;;`,
+        `      esac`,
+        `    else`,
+        `      echo "::warning::could not read review $LAST_ID to mark it as covering $HEAD_SHA"`,
+        `    fi`,
         `    skip "the diff is unchanged since the last review"`,
         `  fi`,
         `else`,
@@ -188,11 +207,17 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
   }
   lines.push(``, `finish`);
 
+  // unchanged-diff edits the bot's review (the also-head marker) with the stamp
+  // step's token: an App token is minted for it, scoped to pull requests; with
+  // github-token auth that token is GITHUB_TOKEN, so the job needs the write.
+  const marks = conds.some((c) => c.kind === "unchanged-diff");
+  const app = marks ? appTokenStep(ctx, { "pull-requests": "write" }) : undefined;
+  const writesWithGithubToken = marks && tokenExpr(ctx) === "${{ github.token }}";
   return {
     jobId: preJobId(node),
     name: `${node.id} skip guard`,
     displayName: `${node.id} guard`,
-    permissions: { contents: "read", "pull-requests": "read" },
+    permissions: { contents: "read", "pull-requests": writesWithGithubToken ? "write" : "read" },
     timeoutMinutes: 5,
     outputs: {
       run: "${{ steps.decide.outputs.run }}",
@@ -200,7 +225,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
       head_sha: "${{ steps.decide.outputs.head_sha }}",
       diff_hash: "${{ steps.decide.outputs.diff_hash }}",
     },
-    steps: [runStep({ id: "decide", name: "Decide whether to run", env, run: lines.join("\n") })],
+    steps: [...(app ? [app] : []), runStep({ id: "decide", name: "Decide whether to run", env, run: lines.join("\n") })],
   };
 }
 

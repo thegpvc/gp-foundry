@@ -291,10 +291,27 @@ describe("skip= compiles to a guard job", () => {
     expect(w.jobs.reviewer.needs).toEqual(["reviewer_guard"]);
     expect(w.jobs.reviewer.if).toBe("needs.reviewer_guard.outputs.run == 'true'");
     expect(w.jobs.reviewer_guard.outputs.run).toBe("${{ steps.decide.outputs.run }}");
-    // Read-only, on GITHUB_TOKEN, with no checkout and no agent.
-    expect(w.jobs.reviewer_guard.permissions).toEqual({ contents: "read", "pull-requests": "read" });
+    // Reads on GITHUB_TOKEN, with no checkout and no agent. unchanged-diff edits the
+    // bot's review (the also-head marker) with the stamp token, which under
+    // github-token auth is GITHUB_TOKEN, so that one scope is write.
+    expect(w.jobs.reviewer_guard.permissions).toEqual({ contents: "read", "pull-requests": "write" });
     expect(w.jobs.reviewer_guard.steps).toHaveLength(1);
     expect(w.jobs.reviewer_guard.steps[0].env.GH_TOKEN).toBe("${{ github.token }}");
+    expect(w.jobs.reviewer_guard.steps[0].env.STAMP_TOKEN).toBe(w.jobs.reviewer.steps.at(-1).env.GH_TOKEN);
+  });
+
+  it("stays read-only without unchanged-diff, and under PAT or App auth", () => {
+    const plain = workflow(lane('skip="draft"'), "reviewer");
+    expect(plain.jobs.reviewer_guard.permissions).toEqual({ contents: "read", "pull-requests": "read" });
+    const pat = workflow(lane(SKIP), "reviewer", { auth: { mode: "pat", token_secret: "AGENT_PAT" } } as Partial<FoundryConfig>);
+    expect(pat.jobs.reviewer_guard.permissions).toEqual({ contents: "read", "pull-requests": "read" });
+    expect(pat.jobs.reviewer_guard.steps[0].env.STAMP_TOKEN).toBe("${{ secrets.AGENT_PAT }}");
+    // App auth: the guard mints its own token, narrowed to pull requests.
+    const app = workflow(lane(SKIP), "reviewer", { auth: { mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>);
+    const guard = app.jobs.reviewer_guard;
+    expect(guard.permissions).toEqual({ contents: "read", "pull-requests": "read" });
+    expect(guard.steps[0]).toMatchObject({ id: "app-token", with: { "permission-pull-requests": "write" } });
+    expect(guard.steps[1].env.STAMP_TOKEN).toBe("${{ steps.app-token.outputs.token }}");
   });
 
   it("keeps untrusted values out of the script text", () => {
@@ -461,6 +478,28 @@ describe("skip= compiles to a guard job", () => {
       // Another lane's stamp (same bot, different node) is not this lane's.
       const other = { user: { login: BOT }, body: `<!-- gp-foundry:diff:approver:${hash} -->` };
       expect(run(fixtures(pr(), [other])).outputs.run).toBe("true");
+    });
+
+    it("marks the covering review with the skipped head, appending once", () => {
+      const hash = run(fixtures(pr())).outputs.diff_hash!;
+      const body = `Looks fine.\n\n<!-- gp-foundry:diff:reviewer:${hash} -->\n<!-- gp-foundry:also-head:reviewer:older -->`;
+      const fx = { ...fixtures(pr(), [{ id: 41, user: { login: BOT }, body }]), "repos/o/r/pulls/7/reviews/41": { body } };
+      const r = run(fx);
+      expect(r.outputs.run).toBe("false");
+      expect(r.writes).toContain("PUT repos/o/r/pulls/7/reviews/41");
+      // Appended after every existing marker, never replacing one.
+      expect(r.writes).toContain(`body=${body}\n<!-- gp-foundry:also-head:reviewer:head1 -->`);
+
+      // Already marked for this head: no second write.
+      const marked = `${body}\n<!-- gp-foundry:also-head:reviewer:head1 -->`;
+      const again = run({ ...fixtures(pr(), [{ id: 41, user: { login: BOT }, body: marked }]), "repos/o/r/pulls/7/reviews/41": { body: marked } });
+      expect(again.outputs.run).toBe("false");
+      expect(again.writes).toBe("");
+
+      // A changed diff is reviewed, and nothing is marked.
+      const changed = run({ ...fx, "repos/o/r/compare/base1...head1": DIFF.replace("+two", "+2") });
+      expect(changed.outputs.run).toBe("true");
+      expect(changed.writes).toBe("");
     });
 
     it("only ever skips a push on unchanged-diff — an explicit ask is still reviewed", () => {
