@@ -43,6 +43,7 @@ import {
   type VerdictEvent,
   type VerdictTrustPolicy,
 } from "./gate.js";
+import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
@@ -55,15 +56,33 @@ interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   rebaseLabel?: string;
   /** Evaluate mode: a trusted verdict on the head matching this is an escalation (check `action_required`). */
   escalationBodyRegex?: string;
+  /** From the `verdicts` input (not the policy file): the words the default markers are built from. */
+  verdictWords?: VerdictWords;
 }
 
-// Deliberately LOOSE (no `$` anchor), unlike the approval marker a policy sets.
-// The two errors are not symmetric: a rejection the gate fails to recognize
-// leaves an earlier approval standing and the PR merges, while a rejection it
-// recognizes too eagerly only holds a merge back. So the default matches the
-// marker anywhere on a line; a policy that wants the strict form can set it.
-export const DEFAULT_REJECTION_BODY_REGEX = "Verdict.*REQUEST_CHANGES";
-export const DEFAULT_ESCALATION_BODY_REGEX = "\\*\\*Verdict:\\*\\* ESCALATE$";
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The approval / rejection / escalation markers, derived from the verdict words
+ * (the `verdicts` input, else APPROVE / REQUEST_CHANGES / ESCALATE) — the grammar
+ * the sweep reads, so a head the sweep counts as decided is one the gate can read.
+ * Approval and escalation are the exact last line. Rejection is deliberately
+ * LOOSE (`Verdict.*<word>`): the errors are not symmetric — a rejection the gate
+ * misses leaves an earlier approval standing and the PR merges, one it reads too
+ * eagerly only holds a merge back — and approval is tested first, so the loose
+ * form cannot misread an approval that discusses the earlier request. A policy
+ * regex overrides any of them.
+ */
+export function verdictMarkers(policy: PolicyFile): { approval: RegExp; rejection: RegExp; escalation: RegExp } {
+  const words = policy.verdictWords ?? parseVerdictWords(undefined);
+  return {
+    approval: new RegExp(policy.approvalBodyRegex ?? verdictRegexSource(words.approve)),
+    rejection: new RegExp(policy.rejectionBodyRegex ?? `Verdict.*${escapeRegex(words.requestChanges)}`),
+    escalation: new RegExp(policy.escalationBodyRegex ?? verdictRegexSource(words.escalate)),
+  };
+}
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
@@ -166,11 +185,12 @@ export async function fetchReviewThreads(octokit: Octokit, owner: string, repo: 
 export async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumber: number, policy: PolicyFile, checksOctokit: Octokit = octokit): Promise<PullRequestFacts> {
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
-  const bodyRe = policy.approvalBodyRegex ? new RegExp(policy.approvalBodyRegex) : undefined;
+  const markers = verdictMarkers(policy);
+  const bodyRe = markers.approval;
   // Rejections invalidate earlier approvals. The default marker is ANCHORED like the
   // approval one (a bare "REQUEST_CHANGES" substring would misread an approval whose
   // prose mentions the earlier requested changes — e.g. a fix-loop re-approval).
-  const rejectRe = new RegExp(policy.rejectionBodyRegex ?? DEFAULT_REJECTION_BODY_REGEX);
+  const rejectRe = markers.rejection;
 
   // Collect verdict-bearing events (reviews + marker comments) in time order, then
   // apply the integrity rule: latest verdict wins, approval must match the head SHA
@@ -275,7 +295,7 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
     pr.head.sha,
     policy,
-    { approval: bodyRe, rejection: rejectRe, escalation: new RegExp(policy.escalationBodyRegex ?? DEFAULT_ESCALATION_BODY_REGEX) },
+    markers,
   );
 
   return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, escalated };
@@ -564,6 +584,9 @@ export async function run(): Promise<void> {
     // The compiler passes these from foundry.config.yaml / the graph, so a
     // consumer's identity and human-gate wiring don't have to be restated in the
     // policy file. Inputs win over the policy file, same as branch-prefix.
+    // The verdict words the compiler passes from foundry.config.yaml (`verdicts:`).
+    const verdictsInput = core.getInput("verdicts").trim();
+    if (verdictsInput) policy.verdictWords = parseVerdictWords(verdictsInput);
     const botLoginInput = core.getInput("bot-login").trim();
     if (botLoginInput) policy.botLogin = botLoginInput;
     const requiredChecksInput = core.getInput("required-checks").trim();

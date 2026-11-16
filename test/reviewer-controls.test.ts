@@ -707,15 +707,26 @@ describe('select="sweep" on pr-review', () => {
       expect(plain).not.toContain('endswith("[bot]")');
     });
 
-    it("reads a verdict only from the last line of the review's visible text", () => {
-      // The behaviour is pinned by execution in "sweep: what counts as a verdict";
-      // here, only that both jobs use the anchored test and never a substring match.
+    it("reads a verdict only from the review's last non-empty line, matched exactly", () => {
       for (const job of ["approver_select", "approver_mark"]) {
         const run: string = wf().jobs[job].steps[0].run;
-        expect(run, job).toContain("| (last // \"\") | startswith(env.VERDICT_MARKER)");
+        expect(run, job).toContain('(last // "")) as $line | env.VERDICT_LINES | split("\\n") | any(.[]; . == $line)');
         expect(run, job).toContain('gsub("<!--[\\\\s\\\\S]*?-->"; "")');
-        expect(run, job).not.toContain("contains(env.VERDICT_MARKER)");
+        expect(run, job).not.toContain("startswith(env.VERDICT");
       }
+      const step = wf().jobs.approver_select.steps[0];
+      expect(step.env.VERDICT_LINES).toBe("**Verdict:** APPROVE\n**Verdict:** REQUEST_CHANGES\n**Verdict:** ESCALATE");
+      // The words are configurable, and the same list reaches the mark job and the gate.
+      const cfg = { verdicts: ["SHIP", "FIX", "HUMAN"] } as Partial<FoundryConfig>;
+      const custom = workflow(SWEEP, "approver", cfg);
+      expect(custom.jobs.approver_select.steps[0].env.VERDICT_LINES).toBe("**Verdict:** SHIP\n**Verdict:** FIX\n**Verdict:** HUMAN");
+      expect(custom.jobs.approver_mark.steps[0].env.VERDICT_LINES).toBe("**Verdict:** SHIP\n**Verdict:** FIX\n**Verdict:** HUMAN");
+    });
+
+    it("validate rejects a malformed verdicts list", () => {
+      expect(codes(diags(SWEEP, { verdicts: ["APPROVE", "APPROVE", "ESCALATE"] } as Partial<FoundryConfig>), "error")).toContain("config.bad-verdicts");
+      expect(codes(diags(SWEEP, { verdicts: ["APPROVE"] } as Partial<FoundryConfig>), "error")).toContain("config.bad-verdicts");
+      expect(codes(diags(SWEEP, { verdicts: ["SHIP", "FIX", "HUMAN"] } as Partial<FoundryConfig>), "error")).toEqual([]);
     });
   });
 
@@ -797,6 +808,18 @@ describe('select="sweep" on pr-review', () => {
         // A bot review with no verdict is commentary, not a decision.
         ...head(4, { reviews: [{ user: { login: BOT }, commit_id: "sha4", body: "nit: typo" }] }),
       });
+      // Exact lines only: a qualified verdict is not one (the gate would never approve it),
+      // while surrounding whitespace and trailing blank lines are fine.
+      const exact = select({
+        [LIST]: [open(5), open(6), open(7)],
+        ...head(5, { reviews: [{ user: { login: BOT }, commit_id: "sha5", body: "Ok.\n\n**Verdict:** APPROVE (once gates pass)" }] }),
+        ...head(6, { reviews: [{ user: { login: BOT }, commit_id: "sha6", body: "Ok.\n\n  **Verdict:** REQUEST_CHANGES  \r\n\n" }] }),
+        ...head(7, { reviews: [{ user: { login: BOT }, commit_id: "sha7", body: "**Verdict:** MAYBE" }] }),
+      });
+      expect(exact.prs).toEqual([
+        { number: 5, sha: "sha5" },
+        { number: 7, sha: "sha7" },
+      ]);
       expect(r.prs).toEqual([
         { number: 2, sha: "sha2" },
         { number: 3, sha: "sha3" },
@@ -1112,6 +1135,8 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
         { "repos/o/r/pulls/1/reviews?per_page=100": [] },
         { "repos/o/r/pulls/1/reviews?per_page=100": [{ user: { login: BOT }, commit_id: "older", body: "**Verdict:** APPROVE" }] },
         reviews(1, "Quoting `**Verdict:**` from the role file.\nNo decision yet."),
+        // Not an exact verdict line: the gate would never read it, so it is no decision.
+        reviews(1, "Ship it.\n\n**Verdict:** APPROVE (once gates pass)"),
       ]) {
         const r = run({ ...jobs, ...fx }, one);
         expect(r.status).toBe(0);

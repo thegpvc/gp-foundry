@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 import { describe, expect, it } from "vitest";
 import { normalizePolicyKeys } from "./gate.js";
+import { verdictMarkers } from "./index.js";
+import { parseVerdictWords, verdictRegexSource } from "../../../src/shared/verdicts.js";
 
 // The shipped default policy must use the FLAT keys the merge-gate action reads
 // (normalized to camelCase). A nested approval:/ci:/on_block: schema parses to keys
@@ -17,7 +19,7 @@ describe("default policy-merge.yaml matches the merge-gate schema", () => {
   ) as Record<string, unknown>;
 
   it("exposes the flat keys the gate consumes", () => {
-    expect(typeof p.approvalBodyRegex).toBe("string"); // else approval is never detected
+    // The verdict markers are derived from the verdict words, not set here (see below).
     expect(typeof p.maxAdditions).toBe("number");
     expect(Array.isArray(p.protectedPaths)).toBe(true);
     expect(Array.isArray(p.blockingLabels)).toBe(true);
@@ -42,31 +44,43 @@ describe("policy-merge.yaml verdict markers and evaluate-mode keys", () => {
   const raw = readFileSync(templatePath, "utf8");
   const p = normalizePolicyKeys(yaml.load(raw)) as Record<string, string>;
 
-  it("anchors the approval marker to the verdict line", () => {
-    const approve = new RegExp(p.approvalBodyRegex!);
-    expect(approve.test("Looks good.\n\n**Verdict:** APPROVE")).toBe(true);
-    expect(approve.test("I would write `**Verdict:** APPROVE` once fixed.\n\n**Verdict:** REQUEST_CHANGES")).toBe(false);
-    // An approval that mentions the earlier request is still an approval: the
-    // gate tests the approval marker FIRST, so the loose rejection never sees it.
-    expect(approve.test("Earlier: **Verdict:** REQUEST_CHANGES. Fixed now.\n\n**Verdict:** APPROVE")).toBe(true);
+  it("derives the verdict markers from the shared grammar (approval exact, rejection loose)", () => {
+    expect(p.approvalBodyRegex).toBeUndefined();
+    expect(p.rejectionBodyRegex).toBeUndefined();
+    expect(p.escalationBodyRegex).toBeUndefined();
+    const m = verdictMarkers(p);
+    expect(m.approval.test("Looks good.\n\n**Verdict:** APPROVE")).toBe(true);
+    expect(m.approval.test("Looks good.\n\n  **Verdict:** APPROVE  ")).toBe(true);
+    expect(m.approval.test("Looks good.\n\n**Verdict:** APPROVE (once gates pass)")).toBe(false);
+    expect(m.approval.test("I would write `**Verdict:** APPROVE` once fixed.\n\n**Verdict:** REQUEST_CHANGES")).toBe(false);
+    // An approval that mentions the earlier request is still an approval (tested first).
+    expect(m.approval.test("Earlier: **Verdict:** REQUEST_CHANGES. Fixed now.\n\n**Verdict:** APPROVE")).toBe(true);
+    // A missed rejection is the one that merges, so it stays loose.
+    expect(m.rejection.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES (see the three items above)")).toBe(true);
+    expect(m.rejection.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES\n\n— the reviewer")).toBe(true);
+    expect(m.escalation.test("**Verdict:** ESCALATE")).toBe(true);
+    expect(m.escalation.test("**Verdict:** ESCALATE (maybe)")).toBe(false);
+    // Custom words reach all three markers.
+    const custom = verdictMarkers({ ...p, verdictWords: parseVerdictWords("SHIP,FIX,HUMAN") });
+    expect(custom.approval.test("**Verdict:** SHIP")).toBe(true);
+    expect(custom.approval.test("**Verdict:** APPROVE")).toBe(false);
+    expect(custom.rejection.test("**Verdict:** FIX")).toBe(true);
+    expect(custom.escalation.test("**Verdict:** HUMAN")).toBe(true);
   });
 
-  it("keeps the rejection marker loose: a missed rejection is the one that merges", () => {
-    const reject = new RegExp(p.rejectionBodyRegex!);
-    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES")).toBe(true);
-    // Visible text after the verdict line must not make the rejection disappear.
-    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES\n\n— the reviewer")).toBe(true);
-    expect(reject.test("Needs work.\n\n**Verdict:** REQUEST_CHANGES (see the three items above)")).toBe(true);
-    expect(reject.source).toBe("Verdict.*REQUEST_CHANGES"); // same as the built-in default
+  it("documents overrides equal to the derived defaults", () => {
+    const on = normalizePolicyKeys(yaml.load(raw.replace(/^# ((?:approval|rejection|escalation)_body_regex:)/gm, "$1"))) as Record<string, string>;
+    expect(on.approvalBodyRegex).toBe(verdictRegexSource("APPROVE"));
+    expect(on.rejectionBodyRegex).toBe(verdictMarkers({}).rejection.source);
+    expect(on.escalationBodyRegex).toBe(verdictRegexSource("ESCALATE"));
   });
 
   it("ships the evaluate-mode keys commented out, and they parse when uncommented", () => {
     expect(p.requireNoOpenThreads).toBeUndefined();
-    const on = normalizePolicyKeys(yaml.load(raw.replace(/^# ((?:require_no_open_threads|bot_logins|bot_thread_blocking_regex|require_no_review_requests|escalation_body_regex):)/gm, "$1"))) as Record<string, unknown>;
+    const on = normalizePolicyKeys(yaml.load(raw.replace(/^# ((?:require_no_open_threads|bot_logins|bot_thread_blocking_regex|require_no_review_requests):)/gm, "$1"))) as Record<string, unknown>;
     expect(on.requireNoOpenThreads).toBe(true);
     expect(on.requireNoReviewRequests).toBe(true);
     expect(on.botLogins).toEqual(["greptile-apps[bot]", "cursor[bot]"]);
-    expect(new RegExp(on.escalationBodyRegex as string).test("**Verdict:** ESCALATE")).toBe(true);
     expect(new RegExp(on.botThreadBlockingRegex as string).test("**P1** bug")).toBe(true);
   });
 });

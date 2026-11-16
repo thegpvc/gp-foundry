@@ -6,6 +6,7 @@
  * it and fall back to "attribute absent" so assemble stays non-throwing.
  */
 import type { FoundryConfig, HarnessNode } from "../ir/types.js";
+import { parseVerdictWords, verdictLinesEnv } from "../shared/verdicts.js";
 
 // ── the attribute vocabulary ─────────────────────────────────────────────────
 
@@ -405,17 +406,31 @@ export function alsoHeadMarkerPrefix(node: HarnessNode): string {
   return `<!-- gp-foundry:also-head:${node.id}:`;
 }
 
-/** The marker every verdict review carries; a sweep reads it as "decided". */
-export const VERDICT_MARKER = "**Verdict:**";
-
 /**
  * jq predicate over one review: is it a verdict? A verdict is a review whose LAST
- * visible line (HTML comments removed, lines trimmed, blanks dropped — see the
- * notes on VERDICT_REVIEWS_JQ in prejob.ts) is the verdict line — a substring match would let a lane posting
- * as the same bot decide a head just by quoting the marker. Shared by the sweep's
- * select and mark jobs and by every step that edits a review (the diff stamp, the
- * also-head marker), which must never touch a verdict. Reads `env.VERDICT_MARKER`.
+ * VISIBLE line — HTML comments removed (the harness's own stamps), lines trimmed,
+ * blanks dropped — is exactly one of the verdict lines (src/shared/verdicts.ts)
+ * — a substring match would let a lane posting as the same bot decide a head just by
+ * quoting the marker, and a prefix match would accept `**Verdict:** APPROVE (once
+ * gates pass)`, which the merge gate never reads as an approval. Shared by the
+ * sweep's select and mark jobs and by every step that edits a review (the diff
+ * stamp, the also-head marker). Reads
+ * `env.VERDICT_LINES` (newline-separated; see verdictLinesOf).
  */
 export const IS_VERDICT_JQ =
-  `((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
-  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
+  `(((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
+  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line` +
+  ` | env.VERDICT_LINES | split("\\n") | any(.[]; . == $line))`;
+
+/**
+ * The exact verdict lines for `env.VERDICT_LINES`, from `verdicts:` in
+ * foundry.config.yaml. A malformed list is validate()'s to report and compiles
+ * to the defaults.
+ */
+export function verdictLinesOf(cfg: FoundryConfig): string {
+  try {
+    return verdictLinesEnv(parseVerdictWords(cfg.verdicts));
+  } catch {
+    return verdictLinesEnv(parseVerdictWords(undefined));
+  }
+}

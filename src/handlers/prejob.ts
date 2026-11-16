@@ -15,7 +15,6 @@ import type { EmitContext, WorkflowJobFragment } from "../ir/types.js";
 import {
   ALSO_HEAD_ANY_NODE_PATTERN,
   IS_VERDICT_JQ,
-  VERDICT_MARKER,
   alsoHeadMarkerPrefix,
   authorsOf,
   diffMarkerPrefix,
@@ -29,6 +28,7 @@ import {
   sweepRequiresReview,
   sweepJobNamePrefix,
   sweptCheckName,
+  verdictLinesOf,
 } from "./attrs.js";
 import { appTokenStep, runStep, tokenExpr } from "./steps.js";
 
@@ -395,7 +395,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           GH_TOKEN: "${{ github.token }}",
           PREFIX: ctx.config.repo.branch_prefix,
           BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
-          VERDICT_MARKER,
+          VERDICT_LINES: verdictLinesOf(ctx.config),
           REQUIRES_REVIEW: String(sweepRequiresReview(node)),
           ALSO_HEAD_PATTERN: ALSO_HEAD_ANY_NODE_PATTERN,
           SWEPT_CHECK: sweptCheckName(node),
@@ -453,7 +453,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           PRS: `\${{ needs.${select}.outputs.prs }}`,
           NODE: node.id,
           BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
-          VERDICT_MARKER,
+          VERDICT_LINES: verdictLinesOf(ctx.config),
           JOB_PREFIX: sweepJobNamePrefix(node),
           SWEPT_CHECK: sweptCheckName(node),
           FAILED_CHECK: sweepFailedCheckName(node),

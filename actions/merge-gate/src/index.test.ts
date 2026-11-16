@@ -37,6 +37,7 @@ interface World {
   approved: boolean;
   /** When set, the PR's reviews verbatim (overrides `approved`). */
   reviews?: unknown[];
+  verdictBody?: string;
   threads: unknown[];
   existing: { id: number; name: string; status: string; conclusion: string; app: { slug: string }; output: { summary: string; text: string } }[];
 }
@@ -77,7 +78,7 @@ function makeOctokit(world: World) {
           "pulls.listReviews",
           world.reviews ??
             (world.approved
-              ? [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "Looks right.\n\n**Verdict:** APPROVE\n" }]
+              ? [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: world.verdictBody ?? "Looks right.\n\n**Verdict:** APPROVE\n" }]
               : []),
         ),
         listFiles: rec("pulls.listFiles", [{ filename: "src/w.ts", additions: 10, deletions: 0 }]),
@@ -114,7 +115,7 @@ function setup(world: Partial<World>, policyYaml = "") {
   const policyPath = join(dir, "merge.yaml");
   writeFileSync(
     policyPath,
-    `branch_prefix: "agent/"\napproval_body_regex: '\\*\\*Verdict:\\*\\* APPROVE$'\nrequire_no_open_threads: true\n${policyYaml}`,
+    `branch_prefix: "agent/"\nrequire_no_open_threads: true\n${policyYaml}`,
   );
   for (const k of Object.keys(inputs)) delete inputs[k];
   for (const k of Object.keys(outputs)) delete outputs[k];
@@ -189,6 +190,22 @@ describe("merge-gate evaluate mode", () => {
     await run();
     expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
     expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("failure");
+  });
+
+  it("approves only on an exact verdict line, in the configured words", async () => {
+    setup({ verdictBody: "Looks right.\n\n**Verdict:** APPROVE (once gates pass)" });
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.output.summary).toContain("not-approved");
+
+    setup({ verdictBody: "Looks right.\n\n**Verdict:** SHIP" });
+    inputs.verdicts = "SHIP,FIX,HUMAN";
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("success");
+
+    setup({ verdictBody: "Needs a person.\n\n**Verdict:** HUMAN" });
+    inputs.verdicts = "SHIP,FIX,HUMAN";
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("action_required");
   });
 
   it("merge mode is unchanged: the same head is merged", async () => {

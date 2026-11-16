@@ -63,6 +63,15 @@ inputs:
       unset, the action infers it from the PR's mergeable state.
     required: false
     default: ""
+  verdicts:
+    description: >
+      The verdict words, comma-separated, in order: approve, request changes,
+      escalate (default "APPROVE,REQUEST_CHANGES,ESCALATE"). A review is a verdict
+      when its last non-empty line, trimmed, is exactly "**Verdict:** <word>"; the
+      approval, rejection and escalation markers default to those lines. The
+      compiler passes foundry.config.yaml's `verdicts:` here.
+    required: false
+    default: ""
   mode:
     description: >
       "merge" (default): merge the first qualifying PR, or label/skip. "evaluate":

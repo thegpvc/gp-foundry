@@ -25,6 +25,7 @@ import {
   takesAuthors,
 } from "../handlers/attrs.js";
 import { detectDiamonds } from "../wiring/diamond.js";
+import { parseVerdictWords } from "../shared/verdicts.js";
 
 export interface ValidateDeps {
   /** returns true if a consumer-repo-relative path exists. Omit to skip file checks. */
@@ -85,6 +86,17 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         unknownAttr(k, KNOWN_EDGE_ATTRS, `edge '${e.from} -> ${e.to}'`, { edge: [e.from, e.to], line: e.line });
       }
     }
+  }
+
+  try {
+    parseVerdictWords(ir.config.verdicts);
+  } catch (e) {
+    diags.push({
+      level: "error",
+      code: "config.bad-verdicts",
+      message: (e as Error).message,
+      hint: "verdicts: [APPROVE, REQUEST_CHANGES, ESCALATE] — approve, request changes, escalate, in that order",
+    });
   }
 
   // repo.authors (config-wide allowlist) is checked once, not per node.

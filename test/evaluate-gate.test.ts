@@ -78,6 +78,13 @@ describe("merge-gate mode=evaluate compiles", () => {
     expect(gateStep(j).with.authors).toBe("dpup");
   });
 
+  it("passes configured verdict words to both gate modes, and nothing at the defaults", () => {
+    const cfg = { verdicts: ["SHIP", "FIX", "HUMAN"] } as Partial<FoundryConfig>;
+    expect(gateStep(job(EVAL, "gate", cfg)).with.verdicts).toBe("SHIP,FIX,HUMAN");
+    expect(gateStep(job(MERGE, "ship", cfg)).with.verdicts).toBe("SHIP,FIX,HUMAN");
+    expect(gateStep(job(EVAL, "gate")).with.verdicts).toBeUndefined();
+  });
+
   it("leaves merge mode unchanged", () => {
     const j = job(MERGE, "ship");
     expect(j.permissions).toEqual({ contents: "write", "pull-requests": "write", issues: "write", checks: "read" });

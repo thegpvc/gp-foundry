@@ -13,6 +13,7 @@ import type {
   WorkflowJobFragment,
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
+import { parseVerdictWords } from "../shared/verdicts.js";
 import {
   authorsOf,
   diffMarkerPrefix,
@@ -538,6 +539,21 @@ export function humanGateRequiredCheck(node: HarnessNode): string {
   return `${humanGateCheckName(node)}@${HUMAN_GATE_CHECK_APP}`;
 }
 
+/**
+ * The configured verdict words for the merge gate's `verdicts` input, so the
+ * gate's approval / rejection / escalation markers come from the same list the
+ * sweep reads. Omitted at the defaults (and when malformed: validate reports it).
+ */
+function verdictsInput(ctx: EmitContext): string | undefined {
+  if (ctx.config.verdicts === undefined) return undefined;
+  try {
+    const w = parseVerdictWords(ctx.config.verdicts);
+    return [w.approve, w.requestChanges, w.escalate].join(",");
+  } catch {
+    return undefined;
+  }
+}
+
 // ── merge-gate: policy decision (no agent) ──
 function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
@@ -569,6 +585,7 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
       "base-branch": ctx.config.repo.base_branch,
       "branch-prefix": ctx.config.repo.branch_prefix,
       ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
       ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
     },
   });
@@ -630,6 +647,7 @@ function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJ
           "base-branch": ctx.config.repo.base_branch,
           "branch-prefix": ctx.config.repo.branch_prefix,
           ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+          ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
           ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
           ...(authors ? { authors: authors.join(",") } : {}),
           ...(authors && optIn ? { "opt-in-label": optIn } : {}),

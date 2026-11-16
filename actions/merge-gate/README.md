@@ -108,7 +108,7 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | conclusion | when |
 | --- | --- |
 | `success` | the gate's decision is `merge` |
-| `action_required` | the trusted reviewer's latest verdict on the head matches `escalationBodyRegex` (default `\*\*Verdict:\*\* ESCALATE$`) |
+| `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`) |
 | `failure` | anything else; `output.summary` carries the gate's `code` and `reason` |
 
 `output.text` lists the open threads, the checks not passing and the pending
@@ -129,15 +129,23 @@ never makes. The token needs only `checks: write`, `pull-requests: read` and
 
 Review bodies are matched as a reader sees them: HTML comments removed (the
 harness appends its own after the verdict line — the unchanged-diff stamp, the
-also-head marker) and trailing whitespace trimmed. An anchored marker therefore
-matches a verdict line that ends the *visible* body. The shipped policy template
-uses `\*\*Verdict:\*\* APPROVE$` for `approvalBodyRegex`.
+also-head marker) and trailing whitespace trimmed.
 
-`rejectionBodyRegex` defaults to the loose `Verdict.*REQUEST_CHANGES`, on purpose:
-a rejection the gate fails to recognize leaves an earlier approval standing and
-the PR merges, while one it recognizes too eagerly only holds a merge back. The
-approval marker is tested first, so an approval that mentions the earlier request
-in prose is still an approval.
+A review is a verdict when that visible body's last non-empty line, trimmed, is
+exactly `**Verdict:** <word>`, with the words given by the `verdicts` input
+(default `APPROVE,REQUEST_CHANGES,ESCALATE`: approve, request changes, escalate).
+The approval and escalation markers default to those exact lines, which is the
+grammar the sweep's select and mark jobs use (`src/shared/verdicts.ts`), so a head
+the sweep counts as decided is one the gate can read.
+`**Verdict:** APPROVE (once gates pass)` is not a verdict.
+
+The rejection marker defaults to the loose `Verdict.*<request-changes word>`, on
+purpose: a rejection the gate fails to recognize leaves an earlier approval
+standing and the PR merges, while one it recognizes too eagerly only holds a merge
+back. The approval marker is tested first, so an approval that mentions the
+earlier request in prose is still an approval. `approvalBodyRegex`,
+`rejectionBodyRegex` and `escalationBodyRegex` override a marker, but an override
+can drift from the sweep; leave them unset.
 
 ## Inputs
 
@@ -150,6 +158,7 @@ in prose is still an approval.
 | `required-checks` | no   | Comma/newline-separated check-run names that must be present and green on the head SHA; overrides the policy's `required_checks`. |
 | `clean-rebase`| no       | Override the rebase check with `"true"`/`"false"`; inferred from mergeable state otherwise. |
 | `checks-token` | no      | Token for reading (and, in evaluate mode, writing) check runs; pass GITHUB_TOKEN. |
+| `verdicts`    | no       | The verdict words, approve / request changes / escalate (default `APPROVE,REQUEST_CHANGES,ESCALATE`). |
 | `mode`        | no       | `merge` (default) or `evaluate` (publish a check run per head, never merge). |
 | `check-name`  | evaluate | The check run evaluate mode publishes. |
 | `authors`, `opt-in-label`, `skip-labels`, `skip-bot-authors` | no | Evaluate-mode PR selection (comma-separated logins / labels; `"true"`). |
@@ -206,15 +215,14 @@ trustedAuthorAssociations: ["OWNER", "MEMBER", "COLLABORATOR"]
 allowCommentApprovals: false             # plain issue comments are NOT approvals
 
 # wrapper-only (I/O) knobs:
-approvalBodyRegex: '\*\*Verdict:\*\* APPROVE$'   # count a COMMENTED review as approval
-rejectionBodyRegex: 'Verdict.*REQUEST_CHANGES'   # the default (loose on purpose)
+# approvalBodyRegex / rejectionBodyRegex / escalationBodyRegex: overrides only;
+# by default each is the exact verdict line (see "Verdict markers").
 
 # evaluate-mode clauses (off by default; also apply in merge mode when set):
 requireNoOpenThreads: true
 botLogins: ["greptile-apps[bot]", "cursor[bot]"]
 botThreadBlockingRegex: "P1|High Severity"
 requireNoReviewRequests: true
-escalationBodyRegex: '\*\*Verdict:\*\* ESCALATE$'   # the default
 ciIgnoreCheckNames: ["review", "fix", "sweep", "merge"]
 mergeMethod: "rebase"                    # merge | squash | rebase
 deleteBranchOnMerge: true
