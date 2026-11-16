@@ -12,12 +12,15 @@ import {
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
   hasPrContext,
+  isEvaluateGate,
   isSweep,
   parseOptInLabel,
   nearestAttr,
   parseAuthors,
   parseConfigAuthors,
+  parseEvaluateCheckName,
   parseGates,
+  parseMergeGateMode,
   parseSkip,
   takesAuthors,
 } from "../handlers/attrs.js";
@@ -96,6 +99,31 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     });
   }
 
+  // Two evaluate gates publishing under one check name would overwrite each
+  // other's result on every tick (each PATCHes the run it finds by name).
+  const evalGateByCheck = new Map<string, string>();
+  for (const n of ir.nodes) {
+    if (!isEvaluateGate(n)) continue;
+    let name: string;
+    try {
+      name = parseEvaluateCheckName(n);
+    } catch {
+      continue; // reported per node below
+    }
+    const other = evalGateByCheck.get(name);
+    if (other) {
+      diags.push({
+        level: "error",
+        code: "node.duplicate-check-name",
+        message: `merge gates '${other}' and '${n.id}' both publish the check '${name}'`,
+        where: { node: n.id, line: n.line },
+        hint: "give each evaluate gate its own check_name=",
+      });
+    } else {
+      evalGateByCheck.set(name, n.id);
+    }
+  }
+
   // Per-node requirements.
   for (const n of ir.nodes) {
     if (n.attrs.authors !== undefined) {
@@ -105,7 +133,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         diags.push({
           level: "error",
           code: "node.authors-unsupported",
-          message: `authors= on '${n.id}' is not supported here — it binds a standalone pr-review / pr-fix node, or an analyst with context="pr-diff" or "pr-review"`,
+          message: `authors= on '${n.id}' is not supported here — it binds a standalone pr-review / pr-fix node, an analyst with context="pr-diff" or "pr-review", or a merge-gate with mode="evaluate"`,
           where: { node: n.id, line: n.line },
           hint: diamondMembers.has(n.id)
             ? "a diamond is bound by repo.authors in foundry.config.yaml"
@@ -130,7 +158,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         diags.push({
           level: "error",
           code: "node.opt-in-label-unsupported",
-          message: `opt_in_label= on '${n.id}' is not supported here — it widens the allowlist of a standalone pr-review / pr-fix node, or an analyst with context="pr-diff" or "pr-review"`,
+          message: `opt_in_label= on '${n.id}' is not supported here — it widens the allowlist of a standalone pr-review / pr-fix node, an analyst with context="pr-diff" or "pr-review", or a merge-gate with mode="evaluate"`,
           where: { node: n.id, line: n.line },
         });
       } else {
@@ -364,16 +392,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         hasPrContext(n) &&
         n.attrs.schedule === undefined &&
         !diamondMembers.has(n.id);
-      if (isSweep(n) && !diamondMembers.has(n.id)) {
-        // A sweep's select job applies draft (always), bot-author and label:<key>.
+      if ((isSweep(n) && !diamondMembers.has(n.id)) || isEvaluateGate(n)) {
+        // A sweep's select job (and an evaluate gate's PR selection) applies
+        // draft (always), bot-author and label:<key>.
         // unchanged-diff compares a push against the last review — a sweep has no push.
         if (conds.some((c) => c.kind === "unchanged-diff")) {
           diags.push({
             level: "error",
             code: "node.skip-unsupported",
-            message: `skip="unchanged-diff" on '${n.id}' is not supported on a sweep — it compares a push against the last review, and a sweep reacts to no push`,
+            message: `skip="unchanged-diff" on '${n.id}' is not supported on a ${isEvaluateGate(n) ? "merge gate" : "sweep"} — it compares a push against the last review, and a ${isEvaluateGate(n) ? "merge gate" : "sweep"} reacts to no push`,
             where: { node: n.id, line: n.line },
-            hint: "a sweep already skips a head it has run on; keep draft, bot-author and label:<key>",
+            hint: isEvaluateGate(n)
+              ? "keep draft, bot-author and label:<key>"
+              : "a sweep already skips a head it has run on; keep draft, bot-author and label:<key>",
           });
         }
       } else if (!eventDrivenPrLane) {
@@ -442,6 +473,52 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         message: `human-gate '${n.id}' must set environment=<name> (maps to a protected GitHub Environment)`,
         where: { node: n.id, line: n.line },
       });
+    }
+    if (n.attrs.mode !== undefined) {
+      if (n.type !== "merge-gate") {
+        diags.push({
+          level: "error",
+          code: "node.mode-unsupported",
+          message: `mode= on '${n.id}' is not supported here — it selects a merge-gate's mode ("merge" or "evaluate")`,
+          where: { node: n.id, line: n.line },
+        });
+      } else {
+        try {
+          parseMergeGateMode(n);
+        } catch (e) {
+          diags.push({
+            level: "error",
+            code: "node.bad-mode",
+            message: (e as Error).message,
+            where: { node: n.id, line: n.line },
+            hint: `mode="evaluate" publishes the gate's result as a check run and never merges`,
+          });
+        }
+      }
+    }
+    if (n.attrs.check_name !== undefined) {
+      if (!isEvaluateGate(n)) {
+        // An error, not a no-op warning: the name only exists for the check an
+        // evaluate gate publishes, and a merge gate publishes none.
+        diags.push({
+          level: "error",
+          code: "node.check-name-without-evaluate",
+          message: `check_name= on '${n.id}' needs a merge-gate with mode="evaluate" — only that mode publishes a check run`,
+          where: { node: n.id, line: n.line },
+          hint: `add mode="evaluate" to the merge-gate, or drop check_name=`,
+        });
+      } else {
+        try {
+          parseEvaluateCheckName(n);
+        } catch (e) {
+          diags.push({
+            level: "error",
+            code: "node.bad-check-name",
+            message: (e as Error).message,
+            where: { node: n.id, line: n.line },
+          });
+        }
+      }
     }
     if (n.type === "merge-gate" && !n.files.policy) {
       diags.push({

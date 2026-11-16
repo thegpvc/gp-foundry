@@ -37,11 +37,15 @@ disqualifying first:
    block does *not* constrain — can publish its own approval. `gp-foundry build`
    emits the human-gate's check pinned to `@github-actions`, the app GITHUB_TOKEN
    writes as. Leave third-party CI checks unpinned.
-7. **Hand-written additions** — additions of non-`excludeGlobs` files must be
+7. **Review requests** (opt-in, `requireNoReviewRequests: true`) — no pending
+   requested reviewer or team, else `review-requested`.
+8. **Open review threads** (opt-in, `requireNoOpenThreads: true`) — no open
+   thread, else `open-threads`. See [Open threads](#open-threads).
+9. **Hand-written additions** — additions of non-`excludeGlobs` files must be
    `<= maxAdditions`, else apply `labels.needsHuman`.
-8. **Protected paths** — no changed file may match `protectedPaths`, else apply
+10. **Protected paths** — no changed file may match `protectedPaths`, else apply
    `labels.needsHuman`.
-9. **Clean rebase** — the branch must rebase cleanly onto the base branch
+11. **Clean rebase** — the branch must rebase cleanly onto the base branch
    (unless `requireCleanRebase: false`), else apply `labels.rebaseNeeded`.
 
 If all pass, the action is `merge` — of the **exact head SHA that was scored**,
@@ -74,6 +78,60 @@ counts verdicts it can attribute:
 
 The latest verdict wins: a newer rejection invalidates an earlier approval.
 
+## Open threads
+
+With `requireNoOpenThreads: true` the wrapper reads the PR's review threads
+(GraphQL `reviewThreads`: resolution, every comment's author, reactions on the
+first comment). A thread is **open** when all of these hold:
+
+- it is unresolved;
+- its first comment is not by the PR author (a note to self never blocks);
+- no later comment is by the PR author, and the author has not reacted to the
+  first comment — a reply or a reaction is the author's answer, and the next
+  review judges it;
+- if a login in `botLogins` (e.g. `greptile-apps[bot]`, `cursor[bot]`) opened
+  it, its first comment matches `botThreadBlockingRegex` (default
+  `P1|High Severity`). A review bot's lower-severity thread never blocks.
+
+Logins compare case-insensitively and with or without the `[bot]` suffix
+(GraphQL drops it). A failed thread read fails closed: the PR is not evaluated
+that run.
+
+## Evaluate mode
+
+`mode: evaluate` never merges, labels or comments. It evaluates the policy for
+every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
+`opt-in-label`, `skip-labels` and `skip-bot-authors` when given; or just
+`pr-number`) and publishes the result as one check run per head, named
+`check-name`:
+
+| conclusion | when |
+| --- | --- |
+| `success` | the gate's decision is `merge` |
+| `action_required` | the trusted reviewer's latest verdict on the head matches `escalationBodyRegex` (default `\*\*Verdict:\*\* ESCALATE$`) |
+| `failure` | anything else; `output.summary` carries the gate's `code` and `reason` |
+
+`output.text` lists the open threads, the checks not passing and the pending
+review requests. The run is written with `checks-token` (GITHUB_TOKEN) and is
+idempotent per head: an existing run of that name from `github-actions` is
+updated in place, and when its conclusion, summary and text already match,
+nothing is written. Gate state that changes without a push (a thread answered,
+CI finished, a review request dropped) therefore flips the check on the next
+run, at no model cost, and the check can be made required.
+
+In this mode the gate leaves its own check out of the CI rollup (a failing
+verdict would otherwise hold itself failing), and `requireCleanRebase` defaults
+to `false` — mergeability is only settled by a merge attempt, which this mode
+never makes. The token needs only `checks: write`, `pull-requests: read` and
+`contents: read`.
+
+## Verdict markers
+
+Review bodies are matched with trailing whitespace trimmed, so an anchored
+marker matches a verdict line that ends the body. The shipped policy template
+uses `\*\*Verdict:\*\* APPROVE$` for `approvalBodyRegex`;
+`rejectionBodyRegex` defaults to `\*\*Verdict:\*\* REQUEST_CHANGES$`.
+
 ## Inputs
 
 | input         | required | description |
@@ -84,12 +142,16 @@ The latest verdict wins: a newer rejection invalidates an earlier approval.
 | `bot-login`   | no       | Login of the reviewer bot whose verdicts are trusted; overrides the policy's `bot_login`. |
 | `required-checks` | no   | Comma/newline-separated check-run names that must be present and green on the head SHA; overrides the policy's `required_checks`. |
 | `clean-rebase`| no       | Override the rebase check with `"true"`/`"false"`; inferred from mergeable state otherwise. |
+| `checks-token` | no      | Token for reading (and, in evaluate mode, writing) check runs; pass GITHUB_TOKEN. |
+| `mode`        | no       | `merge` (default) or `evaluate` (publish a check run per head, never merge). |
+| `check-name`  | evaluate | The check run evaluate mode publishes. |
+| `authors`, `opt-in-label`, `skip-labels`, `skip-bot-authors` | no | Evaluate-mode PR selection (comma-separated logins / labels; `"true"`). |
 | `dry-run`     | no       | `"true"` to evaluate + emit outputs without mutating. |
 
 ## Outputs
 
 `action`, `code`, `reason`, `label` (when labeling), and `merged` (`"true"` if
-this run merged the PR).
+this run merged the PR). Evaluate mode sets `evaluated` and `checks-written`.
 
 ## Policy file
 
@@ -137,7 +199,15 @@ trustedAuthorAssociations: ["OWNER", "MEMBER", "COLLABORATOR"]
 allowCommentApprovals: false             # plain issue comments are NOT approvals
 
 # wrapper-only (I/O) knobs:
-approvalBodyRegex: "Verdict.*APPROVE"   # count a COMMENTED review as approval
+approvalBodyRegex: '\*\*Verdict:\*\* APPROVE$'   # count a COMMENTED review as approval
+rejectionBodyRegex: '\*\*Verdict:\*\* REQUEST_CHANGES$'   # the default
+
+# evaluate-mode clauses (off by default; also apply in merge mode when set):
+requireNoOpenThreads: true
+botLogins: ["greptile-apps[bot]", "cursor[bot]"]
+botThreadBlockingRegex: "P1|High Severity"
+requireNoReviewRequests: true
+escalationBodyRegex: '\*\*Verdict:\*\* ESCALATE$'   # the default
 ciIgnoreCheckNames: ["review", "fix", "sweep", "merge"]
 mergeMethod: "rebase"                    # merge | squash | rebase
 deleteBranchOnMerge: true

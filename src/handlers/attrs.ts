@@ -22,6 +22,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
+  "mode", "check_name",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -173,9 +174,16 @@ function normalizeAuthors(list: unknown[], where: string): string[] {
   return out;
 }
 
-/** The node types an author allowlist can bind: lanes handed one pull request. */
+/**
+ * The node types an author allowlist can bind: lanes handed one pull request,
+ * and an evaluate-mode merge gate, which picks the PRs it publishes a check on.
+ */
 export function takesAuthors(node: HarnessNode): boolean {
-  return node.type === "pr-fix" || ((node.type === "pr-review" || node.type === "analyst") && hasPrContext(node));
+  return (
+    node.type === "pr-fix" ||
+    ((node.type === "pr-review" || node.type === "analyst") && hasPrContext(node)) ||
+    isEvaluateGate(node)
+  );
 }
 
 /**
@@ -260,6 +268,43 @@ export function optInLabelOf(node: HarnessNode, cfg: FoundryConfig): string | un
   } catch {
     return undefined;
   }
+}
+
+// ── merge-gate mode= / check_name= ───────────────────────────────────────────
+
+export type MergeGateMode = "merge" | "evaluate";
+
+/**
+ * `mode="merge"` (the default) merges or labels; `mode="evaluate"` never does
+ * either — it publishes the gate's result as a check run on each PR head.
+ * Throws on any other value.
+ */
+export function parseMergeGateMode(node: HarnessNode): MergeGateMode {
+  const raw = node.attrs.mode;
+  if (raw === undefined) return "merge";
+  if (raw === "merge" || raw === "evaluate") return raw;
+  throw new Error(`node '${node.id}': mode= must be "merge" or "evaluate", got ${JSON.stringify(raw)}`);
+}
+
+/** A merge-gate node with `mode="evaluate"`. A malformed mode is validate()'s to report and reads as merge. */
+export function isEvaluateGate(node: HarnessNode): boolean {
+  if (node.type !== "merge-gate") return false;
+  try {
+    return parseMergeGateMode(node) === "evaluate";
+  } catch {
+    return false;
+  }
+}
+
+/** The check run an evaluate gate publishes: `check_name=`, else `gp-foundry/approval (<node>)`. Throws on a malformed value. */
+export function parseEvaluateCheckName(node: HarnessNode): string {
+  const raw = node.attrs.check_name;
+  if (raw === undefined) return `gp-foundry/approval (${node.id})`;
+  // Passed to the action as an input and compared against check-run names, so one line of printable text.
+  if (typeof raw !== "string" || !raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new Error(`node '${node.id}': check_name= must be a non-empty, single-line check-run name like "fletch/approval"`);
+  }
+  return raw.trim();
 }
 
 // ── context / select= / checkout= ────────────────────────────────────────────

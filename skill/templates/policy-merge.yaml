@@ -9,7 +9,9 @@ branch_prefix: "agent/"
 
 # Approval — the Reviewer posts its verdict in a review BODY; count a body matching
 # this regex as approval (a bot can't formally APPROVE its own PR).
-approval_body_regex: "Verdict.*APPROVE"
+# Anchored: the verdict is the body's LAST line (trailing whitespace is ignored), so a
+# review that merely quotes the marker in its prose is not an approval.
+approval_body_regex: '\*\*Verdict:\*\* APPROVE$'
 # WHO may approve. An approval is an instruction to push to the base branch, so the
 # gate only counts verdicts it can attribute: the reviewer bot itself (bot_login —
 # the compiler passes identity.bot_login for you), or a review from someone with
@@ -27,7 +29,7 @@ required_checks: []
 # A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
 # to the verdict line — a bare substring would misread approvals that mention the
 # earlier requested changes in prose.
-rejection_body_regex: "Verdict.*REQUEST_CHANGES"
+rejection_body_regex: '\*\*Verdict:\*\* REQUEST_CHANGES$'
 approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)
 
 # CI — require the check rollup to be passing; optionally ignore named checks.
@@ -66,3 +68,23 @@ blocking_labels:
 labels:
   needs_human: needs-human       # too-large / protected-path
   rebase_needed: needs-rebase    # proactive rebase label (used if require_clean_rebase: true)
+
+# ── Evaluate-mode clauses (all off by default) ─────────────────────────────────
+# Useful with a merge-gate node carrying mode="evaluate", which publishes this
+# policy's result as a check run on every head each tick instead of merging. They
+# apply in merge mode too when set.
+#
+# Fail (`open-threads`) while a review thread is open: unresolved, the PR author has
+# not replied in it or reacted to its first comment, and it was not opened by the
+# author. A thread opened by one of bot_logins blocks only when its first comment
+# matches bot_thread_blocking_regex (a bot's P2 nit never blocks).
+# require_no_open_threads: true
+# bot_logins: ["greptile-apps[bot]", "cursor[bot]"]
+# bot_thread_blocking_regex: "P1|High Severity"
+#
+# Fail (`review-requested`) while a reviewer or team is still requested.
+# require_no_review_requests: true
+#
+# The trusted reviewer's latest verdict on the head matching this turns the check
+# `action_required` (a human decides).
+# escalation_body_regex: '\*\*Verdict:\*\* ESCALATE$'

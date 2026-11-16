@@ -13,7 +13,19 @@ import type {
   WorkflowJobFragment,
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
-import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf, sweepJobNamePrefix } from "./attrs.js";
+import {
+  authorsOf,
+  diffMarkerPrefix,
+  gatesOf,
+  hasSkipGuard,
+  isEvaluateGate,
+  isSweep,
+  optInLabelOf,
+  parseEvaluateCheckName,
+  preJobId,
+  skipOf,
+  sweepJobNamePrefix,
+} from "./attrs.js";
 import {
   analystPersistsCredentials,
   appTokenStep,
@@ -523,7 +535,6 @@ export function humanGateRequiredCheck(node: HarnessNode): string {
 // ── merge-gate: policy decision (no agent) ──
 function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
-  const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
   // A human-gate feeding this gate is a PRECONDITION, not a suggestion: require
   // its approval check on the exact head SHA. Before this, the human-gate job ran
   // on its own and the merge gate never looked at it — approval blocked a merge
@@ -535,6 +546,8 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   // `<name>@<app>` — the check must also have been WRITTEN by the app the
   // human-gate publishes as, or a name is all an impostor needs.
   const requiredChecks = humanGates.map(humanGateRequiredCheck);
+  if (isEvaluateGate(node)) return emitEvaluateGate(ctx, requiredChecks);
+  const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
   steps.push({
     uses: ctx.actionRef("merge-gate"),
     name: "Evaluate merge gate",
@@ -560,6 +573,65 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
     permissions: { contents: "write", "pull-requests": "write", issues: "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
+  };
+}
+
+/**
+ * mode="evaluate": the same policy, evaluated every tick for every open PR in
+ * scope, published as one check run per head — never a merge, never a label.
+ * Gate state (CI, open threads, review requests) changes without a push, so a
+ * verdict posted once per head goes stale; this check is re-derived each tick
+ * at no model cost, and can be made a required check.
+ *
+ * Everything runs on GITHUB_TOKEN: it is the token the Checks API accepts for a
+ * write, and the one a job's `permissions:` block bounds, so this job can read
+ * the PRs and write checks but cannot push or merge. No harness token, no App
+ * token, no git identity: nothing here commits.
+ */
+function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJobFragment {
+  const node = ctx.node;
+  const checkout = checkoutStep(ctx, { persistCredentials: false });
+  checkout.with = { ...checkout.with, token: "${{ github.token }}" };
+  let checkName: string;
+  try {
+    checkName = parseEvaluateCheckName(node);
+  } catch {
+    checkName = `gp-foundry/approval (${node.id})`; // malformed: validate() reports it
+  }
+  // PR selection beyond branch prefix + not-draft: the same author allowlist,
+  // opt-in label and skip= exclusions a PR lane honours.
+  const authors = authorsOf(node, ctx.config);
+  const optIn = optInLabelOf(node, ctx.config);
+  const conds = skipOf(node);
+  const skipLabels = conds.flatMap((c) => (c.kind === "label" ? [ctx.config.labels?.[c.label] ?? c.label] : []));
+  const skipBots = conds.some((c) => c.kind === "bot-author");
+  return {
+    jobId: node.id,
+    name: node.id,
+    permissions: { contents: "read", "pull-requests": "read", checks: "write" },
+    timeoutMinutes: timeoutOf(node, 10),
+    steps: [
+      checkout,
+      {
+        uses: ctx.actionRef("merge-gate"),
+        name: "Evaluate merge gate (publish check, never merge)",
+        with: {
+          mode: "evaluate",
+          "check-name": checkName,
+          token: "${{ github.token }}",
+          "checks-token": "${{ github.token }}",
+          "policy-path": resolveFile(ctx, node.files.policy),
+          "base-branch": ctx.config.repo.base_branch,
+          "branch-prefix": ctx.config.repo.branch_prefix,
+          ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+          ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
+          ...(authors ? { authors: authors.join(",") } : {}),
+          ...(authors && optIn ? { "opt-in-label": optIn } : {}),
+          ...(skipLabels.length ? { "skip-labels": skipLabels.join(",") } : {}),
+          ...(skipBots ? { "skip-bot-authors": "true" } : {}),
+        },
+      },
+    ],
   };
 }
 

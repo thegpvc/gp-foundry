@@ -87,6 +87,29 @@ export interface PullRequestFacts {
    * blocker so the caller performs the rebase check before merging).
    */
   cleanRebase?: boolean | null;
+  /**
+   * Review threads, for `requireNoOpenThreads`. The wrapper fetches them (GraphQL)
+   * only when that clause is on; undefined means "not gathered".
+   */
+  reviewThreads?: ReviewThreadFact[];
+  /** Pending review requests: user logins and `team:<slug>` entries. */
+  requestedReviewers?: string[];
+  /**
+   * Whether the trusted reviewer's LATEST verdict on the head is an escalation
+   * (see latestHeadVerdictIsEscalation). Read only by `checkConclusion`.
+   */
+  escalated?: boolean;
+}
+
+/** One review thread, as the wrapper summarizes it from GraphQL `reviewThreads`. */
+export interface ReviewThreadFact {
+  isResolved: boolean;
+  path?: string | null;
+  line?: number | null;
+  /** Every comment in order; `[0]` is the comment that opened the thread. */
+  comments: { author?: string | null; body?: string | null }[];
+  /** Reactions on the FIRST comment. */
+  firstCommentReactions?: { content?: string | null; user?: string | null }[];
 }
 
 export interface MergePolicy {
@@ -134,6 +157,20 @@ export interface MergePolicy {
   requiredChecks?: string[];
   /** Whether a clean rebase is required before merge. Default true. */
   requireCleanRebase?: boolean;
+  /**
+   * Block while any review thread is open (see `isOpenThread`). Default false.
+   * Needs `reviewThreads` in the facts; a missing list is treated as none open.
+   */
+  requireNoOpenThreads?: boolean;
+  /**
+   * Review bots (e.g. `greptile-apps[bot]`, `cursor[bot]`). A thread one of these
+   * opened blocks only when its first comment matches `botThreadBlockingRegex`.
+   */
+  botLogins?: string[];
+  /** Severity marker that makes a review bot's thread blocking. Default `P1|High Severity`. */
+  botThreadBlockingRegex?: string;
+  /** Block while the PR has pending requested reviewers or teams. Default false. */
+  requireNoReviewRequests?: boolean;
   /**
    * Labels to apply for a given skip outcome. Lets a consumer route skips to
    * the right agent (e.g. needsHuman -> "needs-human", rebase -> "rebase-needed").
@@ -228,6 +265,8 @@ export type MergeReasonCode =
   | "too-large"
   | "protected-path"
   | "rebase-needed"
+  | "open-threads"
+  | "review-requested"
   // dependabot lane
   | "dependabot-ready"
   | "dependabot-review"
@@ -250,6 +289,10 @@ export interface MergeDecision {
     requiredCheck?: string;
     /** For the dependabot lane: the parsed semver level of the bump. */
     updateType?: DependabotBump;
+    /** For `open-threads`: how many threads block. */
+    openThreads?: number;
+    /** For `review-requested`: who is still asked to review. */
+    requestedReviewers?: string[];
   };
 }
 
@@ -455,6 +498,60 @@ export function filterCandidateNumbers(
     .map((p) => p.number);
 }
 
+/** What an evaluate-mode sweep needs to know about an open PR to select it. */
+export interface CandidatePr {
+  number: number;
+  headRefName: string;
+  draft?: boolean;
+  authorLogin?: string | null;
+  authorType?: string | null;
+  labels: string[];
+}
+
+/** The evaluate-mode PR selection beyond the branch prefix (all optional). */
+export interface CandidateSelection {
+  /** Only PRs by these logins (lower-cased)… */
+  authors?: string[];
+  /** …or carrying this label. */
+  optInLabel?: string;
+  /** Never PRs carrying any of these. */
+  skipLabels?: string[];
+  /** Never PRs opened by a bot, except `botLogin`'s own. */
+  skipBotAuthors?: boolean;
+  botLogin?: string;
+}
+
+/**
+ * Evaluate-mode candidates: the merge sweep's selection (open — the caller lists
+ * only open PRs — on a branch-prefix branch, plus dependabot's when its lane is
+ * on), minus drafts, narrowed by the node's author allowlist, opt-in label and
+ * skip= exclusions. Order preserved.
+ */
+export function filterEvaluateCandidates(
+  prs: CandidatePr[],
+  branchPrefix: string | undefined,
+  includeDependabot: boolean,
+  sel: CandidateSelection = {},
+): number[] {
+  const inPrefix = new Set(filterCandidateNumbers(prs, branchPrefix, includeDependabot));
+  return prs
+    .filter((p) => inPrefix.has(p.number) && !p.draft)
+    .filter(
+      (p) =>
+        !sel.authors ||
+        sel.authors.some((a) => sameLogin(a, p.authorLogin)) ||
+        (!!sel.optInLabel && p.labels.includes(sel.optInLabel)),
+    )
+    .filter((p) => !(sel.skipLabels ?? []).some((l) => p.labels.includes(l)))
+    .filter(
+      (p) =>
+        !sel.skipBotAuthors ||
+        sameLogin(p.authorLogin, sel.botLogin) ||
+        !(p.authorType === "Bot" || (p.authorLogin ?? "").endsWith("[bot]")),
+    )
+    .map((p) => p.number);
+}
+
 /** Does a review/comment body match the approval regex (e.g. "Verdict.*APPROVE")? */
 export function isApprovalBody(body: string | null | undefined, regexSource?: string): boolean {
   if (!regexSource || !body) return false;
@@ -551,6 +648,98 @@ export function latestValidApproval(
     return parseTimestamp(last.at) > parseTimestamp(headCommittedAt) ? last.at : null;
   }
   return last.at;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Review threads, verdicts and the evaluate-mode check (pure)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Default for `botThreadBlockingRegex`: the severities the review bots mark as must-fix. */
+export const DEFAULT_BOT_THREAD_BLOCKING_REGEX = "P1|High Severity";
+
+/**
+ * Same account? GraphQL names a GitHub App's account `my-app` where REST says
+ * `my-app[bot]`, and logins are case-insensitive, so compare without either.
+ */
+export function sameLogin(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const norm = (s: string) => s.toLowerCase().replace(/\[bot\]$/, "");
+  return norm(a) === norm(b);
+}
+
+/**
+ * Is this review thread still waiting on the PR author?
+ *
+ * Not when it is resolved, or the author opened it (a note to self), replied in
+ * it, or reacted to its first comment — a reply or a reaction is the author's
+ * answer, and the reviewer's next pass judges it. A thread a review bot opened
+ * (`botLogins`) blocks only at the severity `botThreadBlockingRegex` names: a
+ * bot's P2 nit never holds a PR.
+ */
+export function isOpenThread(thread: ReviewThreadFact, prAuthor: string | undefined, policy: MergePolicy = {}): boolean {
+  if (thread.isResolved) return false;
+  const first = thread.comments[0];
+  if (!first) return false;
+  if (sameLogin(first.author, prAuthor)) return false;
+  if (thread.comments.slice(1).some((c) => sameLogin(c.author, prAuthor))) return false;
+  if ((thread.firstCommentReactions ?? []).some((r) => sameLogin(r.user, prAuthor))) return false;
+  if ((policy.botLogins ?? []).some((b) => sameLogin(b, first.author))) {
+    const re = new RegExp(policy.botThreadBlockingRegex ?? DEFAULT_BOT_THREAD_BLOCKING_REGEX);
+    return re.test(first.body ?? "");
+  }
+  return true;
+}
+
+/** The threads that hold this PR under `requireNoOpenThreads`. */
+export function openThreads(pr: PullRequestFacts, policy: MergePolicy = {}): ReviewThreadFact[] {
+  return (pr.reviewThreads ?? []).filter((t) => isOpenThread(t, pr.authorLogin, policy));
+}
+
+/** A formal review, reduced to what the escalation test reads. */
+export interface ReviewFact {
+  at: string;
+  sha?: string | null;
+  author?: string | null;
+  authorAssociation?: string | null;
+  body?: string | null;
+}
+
+/**
+ * Is the trusted reviewer's LATEST verdict on this head an escalation?
+ *
+ * Only reviews on the exact head count, only from an author trusted to approve
+ * (an escalation stands in for the reviewer's decision, so an outsider must not
+ * be able to post one), and only reviews whose body is a verdict: approval,
+ * rejection or escalation. Bodies are tested with trailing whitespace trimmed,
+ * so an anchored `…$` marker matches a verdict line followed by a newline.
+ */
+export function latestHeadVerdictIsEscalation(
+  reviews: ReviewFact[],
+  headSha: string | undefined,
+  trust: VerdictTrustPolicy,
+  markers: { approval?: RegExp; rejection?: RegExp; escalation: RegExp },
+): boolean {
+  if (!headSha) return false;
+  const verdicts = reviews
+    .filter((r) => r.sha === headSha && r.body)
+    .filter((r) => isCountableVerdict({ at: r.at, kind: "approve", author: r.author, authorAssociation: r.authorAssociation, source: "review" }, trust))
+    .map((r) => ({ at: r.at, body: r.body!.trimEnd() }))
+    .filter((r) => [markers.approval, markers.rejection, markers.escalation].some((re) => re?.test(r.body)))
+    .sort((a, b) => parseTimestamp(a.at) - parseTimestamp(b.at));
+  const last = verdicts[verdicts.length - 1];
+  return !!last && markers.escalation.test(last.body);
+}
+
+export type CheckConclusion = "success" | "failure" | "action_required";
+
+/**
+ * The evaluate-mode check run's conclusion: `action_required` when the reviewer
+ * escalated this head (a human decides, whatever else holds), `success` when the
+ * gate would merge, `failure` otherwise.
+ */
+export function checkConclusion(decision: MergeDecision, facts: Pick<PullRequestFacts, "escalated">): CheckConclusion {
+  if (facts.escalated) return "action_required";
+  return decision.action === "merge" ? "success" : "failure";
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -662,7 +851,8 @@ function evaluateDependabotLane(
 /**
  * Ordering mirrors the original Shipper (cheapest / most-disqualifying checks
  * first): blocking labels → branch → approval → approval delay → CI → required
- * checks → size → protected paths → rebase → merge. Returns the FIRST failing
+ * checks → review requests → open threads → size → protected paths → rebase →
+ * merge. Review requests and open threads apply only when the policy opts in. Returns the FIRST failing
  * gate. Callers
  * that want the merge to actually happen should treat `action === "merge"` as
  * the go-ahead and everything else as a no-merge (with `label` carrying a label
@@ -764,6 +954,30 @@ export function evaluateMergeGate(
             : `required check \`${unsatisfied.name}\` is not successful`,
       detail: { requiredCheck: unsatisfied.name },
     };
+  }
+
+  // 5c) No pending review requests (opt-in).
+  if (policy.requireNoReviewRequests && (pr.requestedReviewers?.length ?? 0) > 0) {
+    const who = pr.requestedReviewers!;
+    return {
+      action: "skip",
+      code: "review-requested",
+      reason: `review requested from ${who.map((w) => `\`${w}\``).join(", ")}`,
+      detail: { requestedReviewers: who },
+    };
+  }
+
+  // 5d) No open review threads (opt-in).
+  if (policy.requireNoOpenThreads) {
+    const open = openThreads(pr, policy);
+    if (open.length > 0) {
+      return {
+        action: "skip",
+        code: "open-threads",
+        reason: `${open.length} open review thread${open.length === 1 ? "" : "s"} awaiting the author`,
+        detail: { openThreads: open.length },
+      };
+    }
   }
 
   // 6) Hand-written additions under the limit
