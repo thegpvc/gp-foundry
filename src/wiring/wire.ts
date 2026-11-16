@@ -246,7 +246,18 @@ function cancelInProgress(node: HarnessNode, dflt: boolean): boolean {
   return typeof v === "boolean" && AGENT.has(node.type) ? v : dflt;
 }
 
-function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress": boolean } {
+/**
+ * `optInLabel` is set when the lane hears `pull_request.labeled` only for its
+ * opt-in label. Every other label event still starts a run (GitHub has no label
+ * filter on `on:`); its jobs are skipped by the `if:`, but a run in the PR's
+ * group would cancel an in-flight review (or replace a pending one) and then do
+ * nothing. Such events get a throwaway per-run group instead; the opt-in label
+ * itself stays in the PR's group like a push.
+ */
+function concurrencyKey(
+  node: HarnessNode,
+  optInLabel?: string,
+): { group: string; "cancel-in-progress": boolean } {
   if (node.attrs.schedule !== undefined) {
     return { group: node.id, "cancel-in-progress": cancelInProgress(node, false) };
   }
@@ -257,7 +268,15 @@ function concurrencyKey(node: HarnessNode): { group: string; "cancel-in-progress
   const num = prScoped
     ? "${{ github.event.pull_request.number }}"
     : "${{ github.event.issue.number }}";
-  return { group: `${node.id}-${num}`, "cancel-in-progress": cancelInProgress(node, node.type === "issue-agent") };
+  const cancel = cancelInProgress(node, node.type === "issue-agent");
+  if (optInLabel !== undefined && prScoped) {
+    const group =
+      `\${{ github.event.action == 'labeled' && github.event.label.name != ${exprString(optInLabel)}` +
+      ` && format(${exprString(`${node.id}-noop-{0}`)}, github.run_id)` +
+      ` || format(${exprString(`${node.id}-{0}`)}, github.event.pull_request.number) }}`;
+    return { group, "cancel-in-progress": cancel };
+  }
+  return { group: `${node.id}-${num}`, "cancel-in-progress": cancel };
 }
 
 export function wire(ir: Harness): WiringPlan {
@@ -396,7 +415,7 @@ export function wire(ir: Harness): WiringPlan {
       dispatches,
     };
     if (guard) nw.guard = guard;
-    if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node);
+    if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? optIn : undefined);
     perNode[node.id] = nw;
   }
 
