@@ -53,6 +53,18 @@ export function emitPostJob(ctx: EmitContext): WorkflowJobFragment | null {
   return isSweep(ctx.node) ? emitSweepMark(ctx) : null;
 }
 
+/**
+ * jq filter over a reviews array: the verdict reviews on head `env.SHA` by the
+ * bot. A verdict is the review's LAST non-empty line — a substring match would
+ * let a lane posting as the same bot decide a head just by quoting the marker.
+ * Shared by the select job ("decided") and the mark job ("the lane delivered").
+ */
+const VERDICT_REVIEWS_JQ = [
+  `[ .[] | select(.commit_id == env.SHA)`,
+  `  | select(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`,
+  `  | select((.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER)) ] | length`,
+];
+
 /** The check-run author a swept marker must have: written with GITHUB_TOKEN. */
 const MARK_APP = "github-actions";
 
@@ -199,18 +211,31 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
   const authors = authorsOf(node, ctx.config);
   const optIn = optInLabelOf(node, ctx.config);
   const authorTest = `((.user.login // "" | ascii_downcase) as $a | env.AUTHORS | split(",") | index($a))`;
+  // skip= on a sweep: the same exclusions the event-driven guard applies.
+  // draft is implicit (drafts are never selected) and validate() rejects unchanged-diff.
+  const conds = skipOf(node);
+  const skipBots = conds.some((c) => c.kind === "bot-author");
+  const skipLabels: Record<string, string> = {};
+  for (const c of conds) {
+    if (c.kind !== "label") continue;
+    // Semantic key -> the repo's actual label, like every other label guard.
+    skipLabels[`SKIP_LABEL_${Object.keys(skipLabels).length + 1}`] = ctx.config.labels?.[c.label] ?? c.label;
+  }
   const run = [
     `# Pick the PR heads that are ready for a decision. Selection is a pure`,
     `# function of repo state — no agent, no randomness — and every read fails`,
     `# CLOSED: a head whose state cannot be read is left for the next sweep.`,
     `#`,
     `#   candidate   open, not a draft, on a harness branch${authors ? ", by an allowlisted author" : ""}${optIn ? " or labelled $OPT_IN_LABEL" : ""}`,
+    ...(skipBots || Object.keys(skipLabels).length
+      ? [`#   not skipped ${[skipBots ? "not opened by a bot (the harness's own is exempt)" : "", Object.keys(skipLabels).length ? "no skip= label" : ""].filter(Boolean).join(", ")}`]
+      : []),
     `#   reviews in  no review is still being waited on (no pending review request)`,
     `#   checks in   every check-run on the head is completed, no commit status`,
     `#               pending — and at least one check-run exists, unless the PR has`,
     `#               been quiet for $SETTLE_SECONDS s (a repo with no CI still gets swept)`,
     `#   undecided   no verdict review on this exact head yet, and no earlier`,
-    `#               sweep has already run the lane on it (the swept check)`,
+    `#               sweep has marked it delivered (the swept check)`,
     `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head`,
     `LIST=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&sort=created&direction=asc&per_page=100" --paginate --jq '`,
     `  .[] | select(.draft | not)`,
@@ -222,6 +247,10 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
             : `  | select(${authorTest})`,
         ]
       : []),
+    ...(skipBots
+      ? [`  | select((.user.login // "") == env.BOT_LOGIN or (((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not)))`]
+      : []),
+    ...Object.keys(skipLabels).map((k) => `  | select((.labels // []) | any(.name == env.${k}) | not)`),
     `  | "\\(.number) \\(.head.sha) \\((.requested_reviewers | length) + (.requested_teams | length)) \\(now - (.updated_at | fromdateiso8601) | floor) \\(.base.ref)"') || {`,
     `  echo "::error::could not list open pull requests"`,
     `  exit 1`,
@@ -232,7 +261,10 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`,
     `  # One read of the head's check-runs answers four questions: how many exist,`,
     `  # how many are still running, has the lane already run here, how often has it failed.`,
-    `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100" --paginate --jq '`,
+    `  # filter=all: the default (latest) keeps only the newest run per check name, which`,
+    `  # hides all but one sweep-failed record and lets a newer skipped run of a job mask`,
+    `  # an older one still in progress.`,
+    `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
     `    .check_runs | [ length,`,
     `      ([.[] | select(.status != "completed")] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP)] | length),`,
@@ -244,9 +276,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `    echo "#$NUM: no check-run on $SHA yet and the PR changed \${QUIET}s ago — waiting for CI to register"`,
     `    continue`,
     `  fi`,
-    `  # The lane's own record that it ran here. A role that posts nothing (a`,
-    `  # shadow run, an abstention) leaves no verdict, and without this the same`,
-    `  # head would be handed to the agent again on every tick, forever.`,
+    `  # The lane's own record that it ran here and delivered a verdict (the mark`,
+    `  # job publishes it only then). Normally redundant with the verdict test below;`,
+    `  # it still holds if the verdict review's body is later edited.`,
     `  if [ "$SWEPT" != "0" ]; then echo "#$NUM: already swept at $SHA"; continue; fi`,
     `  # …and a lane that keeps FAILING on a head is not retried forever either.`,
     `  if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi`,
@@ -254,9 +286,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `    if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }`,
     `  if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi`,
     `  DECIDED=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
-    `    [ .[] | select(.commit_id == env.SHA)`,
-    `      | select(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`,
-    `      | select((.body // "") | contains(env.VERDICT_MARKER)) ] | length' | awk '{s+=$1} END {print s+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
+    ...VERDICT_REVIEWS_JQ.map((l) => `    ${l}`),
+    `  ' | awk '{s+=$1} END {print s+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
     `  if [ "$DECIDED" != "0" ]; then echo "#$NUM: already decided at $SHA"; continue; fi`,
     `  echo "#$NUM: selected at $SHA"`,
     `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" '. + [{number: $n, sha: $s, base: $b}]' <<< "$SELECTED")`,
@@ -295,6 +326,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),
+          ...skipLabels,
         },
         run,
       }),
@@ -312,8 +344,12 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
  * the human-gate's approval check is written with, and the merge gate trusts a
  * check by the app that wrote it. This job runs no agent and reads no untrusted
  * input; it asks the Actions API which of this run's lane jobs concluded
- * `success` and marks exactly those. A failed or cancelled lane leaves its head
- * unmarked, so the next sweep picks it up again.
+ * `success`, and marks those whose head now carries the bot's verdict review.
+ * A lane that succeeded without posting a verdict had nothing to decide yet
+ * (the agent cannot fail its job on purpose), so that head is left unmarked
+ * and uncounted — a holding state. A failed lane is counted toward the cap; a
+ * cancelled one is neither marked nor counted. Either way the next sweep picks
+ * the head up again.
  */
 function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
@@ -325,7 +361,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
     needs: [select, node.id],
     // always(): the lanes that succeeded are marked even when a sibling failed.
     if: `\${{ always() && needs.${select}.result == 'success' && needs.${select}.outputs.count != '0' }}`,
-    permissions: { checks: "write", actions: "read" },
+    permissions: { checks: "write", actions: "read", "pull-requests": "read" },
     timeoutMinutes: 5,
     steps: [
       runStep({
@@ -334,6 +370,8 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           GH_TOKEN: "${{ github.token }}",
           PRS: `\${{ needs.${select}.outputs.prs }}`,
           NODE: node.id,
+          BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
+          VERDICT_MARKER,
           JOB_PREFIX: sweepJobNamePrefix(node),
           SWEPT_CHECK: sweptCheckName(node),
           FAILED_CHECK: sweepFailedCheckName(node),
@@ -358,7 +396,17 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `  RESULT=$(awk -F'\\t' -v n="$JOB_PREFIX$NUM" '$2 == n {print $1}' <<< "$JOBS" | tail -n 1)`,
           `  case "$RESULT" in`,
           `    success)`,
-          `      if publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA. This is a record that it ran, not a verdict."; then`,
+          `      # The lane's post-condition: the bot's verdict on this head. A run that`,
+          `      # posted none had nothing to decide yet — leave it for the next sweep,`,
+          `      # and do not count it as a failure.`,
+          `      VERDICTS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
+          ...VERDICT_REVIEWS_JQ.map((l) => `        ${l}`),
+          `      ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""`,
+          `      if [ -z "$VERDICTS" ]; then`,
+          `        echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"`,
+          `      elif [ "$VERDICTS" = "0" ]; then`,
+          `        echo "::notice::#$NUM: no verdict posted on $SHA; left for the next sweep"`,
+          `      elif publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA and posted its verdict."; then`,
           `        echo "#$NUM: marked $SHA"`,
           `      else`,
           `        echo "::error::#$NUM: could not publish the swept check on $SHA — the next sweep will repeat it"`,
@@ -366,7 +414,8 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `      fi ;;`,
           `    failure|timed_out)`,
           `      # One check-run per failed attempt; the selector counts them and stops at $MAX_FAILURES.`,
-          `      PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100" --paginate --jq '`,
+          `      # filter=all, or GitHub returns only the newest one and the count never passes 1.`,
+          `      PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
           `        [.check_runs[] | select(.name == env.FAILED_CHECK)] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
           `      N=$((PRIOR + 1))`,
           `      if [ "$N" -ge "$MAX_FAILURES" ]; then`,

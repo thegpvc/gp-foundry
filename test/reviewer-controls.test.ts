@@ -596,14 +596,47 @@ describe('select="sweep" on pr-review', () => {
       expect(w.on.pull_request.types).toContain("opened");
     });
 
-    it("does not combine with skip=", () => {
-      const dot = SWEEP.replace('select="sweep"', 'select="sweep", skip="draft"');
-      expect(codes(diags(dot), "error")).toContain("node.skip-unsupported");
-      expect(Object.keys(workflow(dot, "approver").jobs)).toEqual(["approver_select", "approver", "approver_mark"]);
+    it("takes skip= draft, bot-author and label:<key>, but not unchanged-diff", () => {
+      const ok = SWEEP.replace('select="sweep"', 'select="sweep", skip="draft,bot-author,label:hold"');
+      expect(codes(diags(ok), "error")).toEqual([]);
+      expect(Object.keys(workflow(ok, "approver").jobs)).toEqual(["approver_select", "approver", "approver_mark"]);
+      const bad = SWEEP.replace('select="sweep"', 'select="sweep", skip="label:hold,unchanged-diff"');
+      expect(codes(diags(bad), "error")).toContain("node.skip-unsupported");
     });
 
     it("warns when no bot login pins who may decide", () => {
       expect(codes(diags(SWEEP, { identity: {} }), "warning")).toContain("node.sweep-no-bot-login");
+    });
+  });
+
+  describe("the selector script text", () => {
+    it("lists every check run, not GitHub's default latest-per-name", () => {
+      const run: string = wf().jobs.approver_select.steps[0].run;
+      expect(run).toContain('commits/$SHA/check-runs?per_page=100&filter=all"');
+      expect(run).not.toMatch(/check-runs\?per_page=100"/);
+    });
+
+    it("excludes skip= labels (resolved through config.labels) and bot authors", () => {
+      const dot = SWEEP.replace('select="sweep"', 'select="sweep", skip="bot-author,label:hold,label:raw-label"');
+      const step = workflow(dot, "approver", { labels: { hold: "do-not-approve" } } as any).jobs.approver_select.steps[0];
+      expect(step.env.SKIP_LABEL_1).toBe("do-not-approve");
+      expect(step.env.SKIP_LABEL_2).toBe("raw-label");
+      expect(step.run).toContain("| select((.labels // []) | any(.name == env.SKIP_LABEL_1) | not)");
+      expect(step.run).toContain("| select((.labels // []) | any(.name == env.SKIP_LABEL_2) | not)");
+      expect(step.run).toContain(
+        '| select((.user.login // "") == env.BOT_LOGIN or (((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not)))',
+      );
+      const plain: string = wf().jobs.approver_select.steps[0].run;
+      expect(plain).not.toContain("SKIP_LABEL");
+      expect(plain).not.toContain('endswith("[bot]")');
+    });
+
+    it("reads a verdict only from the review's last non-empty line", () => {
+      const run: string = wf().jobs.approver_select.steps[0].run;
+      expect(run).toContain(
+        '(.body // "") | split("\\n") | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER)',
+      );
+      expect(run).not.toContain("contains(env.VERDICT_MARKER)");
     });
   });
 
@@ -624,7 +657,7 @@ describe('select="sweep" on pr-review', () => {
       n: number,
       o: { checks?: unknown[]; status?: unknown; reviews?: unknown[] } = {},
     ): Record<string, unknown> => ({
-      [`repos/o/r/commits/sha${n}/check-runs?per_page=100`]: { check_runs: o.checks ?? [{ status: "completed" }] },
+      [`repos/o/r/commits/sha${n}/check-runs?per_page=100&filter=all`]: { check_runs: o.checks ?? [{ status: "completed" }] },
       [`repos/o/r/commits/sha${n}/status`]: o.status ?? { total_count: 0, state: "pending" },
       [`repos/o/r/pulls/${n}/reviews?per_page=100`]: o.reviews ?? [],
     });
@@ -710,6 +743,63 @@ describe('select="sweep" on pr-review', () => {
       });
       expect(r.prs).toEqual([
         { number: 2, sha: "sha2" },
+        { number: 3, sha: "sha3" },
+      ]);
+    });
+
+    it("counts every check run, not only the newest per name", () => {
+      const failed = { status: "completed", name: "gp-foundry/sweep-failed (approver)", app: { slug: "github-actions" } };
+      // GitHub's default (filter=latest) view: one run per name. Served too, so a
+      // script that drops filter=all reads it and gets both heads wrong.
+      const latest = (n: number, checks: unknown[]) => ({ [`repos/o/r/commits/sha${n}/check-runs?per_page=100`]: { check_runs: checks } });
+      const r = select({
+        [LIST]: [open(1), open(2)],
+        // Three failed lane runs: the cap is reached.
+        ...head(1, { checks: [failed, failed, failed] }),
+        ...latest(1, [failed]),
+        // A real run still in progress, hidden in the latest view by a newer skipped run of the same job.
+        ...head(2, {
+          checks: [
+            { status: "in_progress", name: "reviewer" },
+            { status: "completed", conclusion: "skipped", name: "reviewer" },
+          ],
+        }),
+        ...latest(2, [{ status: "completed", conclusion: "skipped", name: "reviewer" }]),
+      });
+      expect(r.prs).toEqual([]);
+      expect(r.stdout).toContain("#1: gave up on sha1 after 3 failed runs");
+      expect(r.stdout).toContain("#2: 1 check-run(s) still running");
+    });
+
+    it("leaves out PRs with a skip= label or by a bot, but not the harness's own", () => {
+      const dot = SWEEP.replace('select="sweep"', 'select="sweep", skip="bot-author,label:hold"');
+      const st = workflow(dot, "approver", { labels: { hold: "do-not-approve" } } as any).jobs.approver_select.steps[0];
+      const fx: Record<string, unknown> = {
+        [LIST]: [
+          open(1, { labels: [{ name: "do-not-approve" }] }),
+          open(2, { labels: [{ name: "hold" }] }), // the key, not the resolved label
+          open(3, { user: { login: "dependabot[bot]", type: "Bot" } }),
+          open(4, { user: { login: "renovate[bot]" } }),
+          open(5, { user: { login: BOT, type: "Bot" } }),
+          open(6, { user: { login: "dpup", type: "User" } }),
+        ],
+      };
+      for (const n of [1, 2, 3, 4, 5, 6]) Object.assign(fx, head(n));
+      const r = runStepScript(st, fx);
+      expect(r.status).toBe(0);
+      expect(JSON.parse(r.outputs.prs!).map((p: any) => p.number)).toEqual([2, 5, 6]);
+    });
+
+    it("does not read a quoted verdict marker as a decision", () => {
+      const review = (n: number, body: string) => ({ user: { login: BOT }, commit_id: `sha${n}`, body });
+      const r = select({
+        [LIST]: [open(1), open(2), open(3)],
+        ...head(1, { reviews: [review(1, "The role file says to end with `**Verdict:**` and a decision.\n\nLooks fine otherwise.")] }),
+        ...head(2, { reviews: [review(2, "Ship it.\n\n**Verdict:** APPROVE\n\n")] }),
+        ...head(3, { reviews: [review(3, "**Verdict:** quoted at the top\nthen more text")] }),
+      });
+      expect(r.prs).toEqual([
+        { number: 1, sha: "sha1" },
         { number: 3, sha: "sha3" },
       ]);
     });
@@ -852,7 +942,7 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
     const mark = w.jobs.approver_mark;
     expect(mark.needs).toEqual(["approver_select", "approver"]);
     expect(mark.if).toContain("always()");
-    expect(mark.permissions).toEqual({ checks: "write", actions: "read" });
+    expect(mark.permissions).toEqual({ checks: "write", actions: "read", "pull-requests": "read" });
     expect(mark.steps).toHaveLength(1);
     expect(mark.steps[0].env.GH_TOKEN).toBe("${{ github.token }}");
     expect(mark.steps[0].run).not.toContain("${{");
@@ -875,9 +965,14 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
       ]),
     };
     const run = (fx: Record<string, unknown>, e = env) => runStepScript(wf().jobs.approver_mark.steps[0], fx, e);
+    const reviews = (n: number, body = "Ship it.\n\n**Verdict:** APPROVE") => ({
+      [`repos/o/r/pulls/${n}/reviews?per_page=100`]: [{ user: { login: BOT }, commit_id: `sha${n}`, body }],
+    });
 
     it("marks exactly the heads whose lane job succeeded", () => {
       const r = run({
+        ...reviews(1),
+        ...reviews(12),
         [JOBS]: {
           jobs: [
             { name: "approver_select", conclusion: "success" },
@@ -896,8 +991,35 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
       expect(r.stdout).toContain("#2: lane failure — recorded failed run 1 of 3 on sha2");
     });
 
+    it("marks a successful head only once the bot's verdict is on it", () => {
+      const jobs = { [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } };
+      const one = { ...env, PRS: JSON.stringify([{ number: 1, sha: "sha1" }]) };
+      // Nothing to decide yet: no review, a review on an older head, a quoted marker.
+      for (const fx of [
+        { "repos/o/r/pulls/1/reviews?per_page=100": [] },
+        { "repos/o/r/pulls/1/reviews?per_page=100": [{ user: { login: BOT }, commit_id: "older", body: "**Verdict:** APPROVE" }] },
+        reviews(1, "Quoting `**Verdict:**` from the role file.\nNo decision yet."),
+      ]) {
+        const r = run({ ...jobs, ...fx }, one);
+        expect(r.status).toBe(0);
+        expect(r.writes).toBe(""); // neither swept nor counted as a failure
+        expect(r.stdout).toContain("#1: no verdict posted on sha1; left for the next sweep");
+      }
+      const r = run({ ...jobs, ...reviews(1) }, one);
+      expect(r.writes).toContain("POST repos/o/r/check-runs");
+      expect(r.writes).toContain("name=gp-foundry/swept (approver)");
+      expect(r.stdout).toContain("#1: marked sha1");
+    });
+
+    it("leaves a successful head unmarked when its reviews cannot be read", () => {
+      const r = run({ [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } }, { ...env, PRS: JSON.stringify([{ number: 1, sha: "sha1" }]) });
+      expect(r.status).toBe(0);
+      expect(r.writes).toBe("");
+      expect(r.stdout).toContain("could not read reviews on sha1");
+    });
+
     it("matches the job name exactly: #1 succeeding does not mark #12", () => {
-      const r = run({ [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } });
+      const r = run({ ...reviews(1), [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } });
       expect(r.stdout).toContain("#1: marked sha1");
       expect(r.stdout).toContain("#12: lane did not finish");
     });
@@ -994,7 +1116,7 @@ describe("authors= restricts a PR lane to an allowlist", () => {
       "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100": [pr(1, "someone-else"), pr(2, "DPup"), pr(3, "dpup-impostor")],
     };
     for (const n of [1, 2, 3]) {
-      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100`] = { check_runs: [] };
+      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100&filter=all`] = { check_runs: [] };
       fx[`repos/o/r/commits/sha${n}/status`] = { total_count: 0 };
       fx[`repos/o/r/pulls/${n}/reviews?per_page=100`] = [];
     }
@@ -1224,7 +1346,7 @@ describe("opt_in_label= widens an allowlist by a PR label", () => {
       ],
     };
     for (const n of [1, 2, 3, 4]) {
-      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100`] = { check_runs: [] };
+      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100&filter=all`] = { check_runs: [] };
       fx[`repos/o/r/commits/sha${n}/status`] = { total_count: 0 };
       fx[`repos/o/r/pulls/${n}/reviews?per_page=100`] = [];
     }
@@ -1686,7 +1808,7 @@ describe("sweep: settle window and bounded retries", () => {
     updated_at: updated,
   });
   const head = (n: number, checks: unknown[]) => ({
-    [`repos/o/r/commits/sha${n}/check-runs?per_page=100`]: { check_runs: checks },
+    [`repos/o/r/commits/sha${n}/check-runs?per_page=100&filter=all`]: { check_runs: checks },
     [`repos/o/r/commits/sha${n}/status`]: { total_count: 0 },
     [`repos/o/r/pulls/${n}/reviews?per_page=100`]: [],
   });
@@ -1735,7 +1857,11 @@ describe("sweep: settle window and bounded retries", () => {
         wf().jobs.approver_mark.steps[0],
         {
           [JOBS]: { jobs: [{ name: "approver #1", conclusion }] },
-          "repos/o/r/commits/sha1/check-runs?per_page=100": { check_runs: prior },
+          "repos/o/r/commits/sha1/check-runs?per_page=100&filter=all": { check_runs: prior },
+          // GitHub's default view keeps only the newest run per name: a script that
+          // drops filter=all reads this and never counts past one.
+          "repos/o/r/commits/sha1/check-runs?per_page=100": { check_runs: prior.slice(-1) },
+          "repos/o/r/pulls/1/reviews?per_page=100": [{ user: { login: BOT }, commit_id: "sha1", body: "**Verdict:** APPROVE" }],
         },
         env,
       );
@@ -1747,6 +1873,10 @@ describe("sweep: settle window and bounded retries", () => {
       expect(r.writes).toContain("conclusion=neutral");
       expect(r.writes).toContain("output[title]=approver run 1 of 3 failed");
       expect(r.writes).not.toContain("gp-foundry/swept");
+    });
+
+    it("lists every prior failed run (filter=all) when counting", () => {
+      expect(wf().jobs.approver_mark.steps[0].run).toContain('commits/$SHA/check-runs?per_page=100&filter=all"');
     });
 
     it("says so when the last retry is spent", () => {

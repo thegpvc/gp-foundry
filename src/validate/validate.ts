@@ -12,6 +12,7 @@ import {
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
   hasPrContext,
+  isSweep,
   parseOptInLabel,
   nearestAttr,
   parseAuthors,
@@ -363,7 +364,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         hasPrContext(n) &&
         n.attrs.schedule === undefined &&
         !diamondMembers.has(n.id);
-      if (!eventDrivenPrLane) {
+      if (isSweep(n) && !diamondMembers.has(n.id)) {
+        // A sweep's select job applies draft (always), bot-author and label:<key>.
+        // unchanged-diff compares a push against the last review — a sweep has no push.
+        if (conds.some((c) => c.kind === "unchanged-diff")) {
+          diags.push({
+            level: "error",
+            code: "node.skip-unsupported",
+            message: `skip="unchanged-diff" on '${n.id}' is not supported on a sweep — it compares a push against the last review, and a sweep reacts to no push`,
+            where: { node: n.id, line: n.line },
+            hint: "a sweep already skips a head it has run on; keep draft, bot-author and label:<key>",
+          });
+        }
+      } else if (!eventDrivenPrLane) {
         // An error, not an "ignored" warning: skip= is a promise that some PRs
         // are NOT reviewed, and silently reviewing them anyway breaks it.
         diags.push({
