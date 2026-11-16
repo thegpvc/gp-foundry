@@ -85,6 +85,11 @@ labels:
 # bot_logins: ["greptile-apps[bot]", "cursor[bot]"]
 # bot_thread_blocking_regex: "P1|High Severity"
 #
+# What the check says for a head with no verdict yet whose ONLY failing clause is the
+# missing approval: failure (default) or neutral ("awaiting the approver"), which keeps a
+# red X off every PR between its review and the approver's verdict.
+# no_verdict_conclusion: neutral
+#
 # Fail (`review-requested`) while a reviewer or team is still requested.
 # require_no_review_requests: true
 #

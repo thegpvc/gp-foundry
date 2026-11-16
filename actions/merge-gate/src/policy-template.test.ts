@@ -77,9 +77,10 @@ describe("policy-merge.yaml verdict markers and evaluate-mode keys", () => {
 
   it("ships the evaluate-mode keys commented out, and they parse when uncommented", () => {
     expect(p.requireNoOpenThreads).toBeUndefined();
-    const on = normalizePolicyKeys(yaml.load(raw.replace(/^# ((?:require_no_open_threads|bot_logins|bot_thread_blocking_regex|require_no_review_requests):)/gm, "$1"))) as Record<string, unknown>;
+    const on = normalizePolicyKeys(yaml.load(raw.replace(/^# ((?:require_no_open_threads|bot_logins|bot_thread_blocking_regex|require_no_review_requests|no_verdict_conclusion):)/gm, "$1"))) as Record<string, unknown>;
     expect(on.requireNoOpenThreads).toBe(true);
     expect(on.requireNoReviewRequests).toBe(true);
+    expect(on.noVerdictConclusion).toBe("neutral");
     expect(on.botLogins).toEqual(["greptile-apps[bot]", "cursor[bot]"]);
     expect(new RegExp(on.botThreadBlockingRegex as string).test("**P1** bug")).toBe(true);
   });

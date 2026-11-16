@@ -23,7 +23,8 @@ import {
   evaluateMergeGate,
   filterCandidateNumbers,
   filterEvaluateCandidates,
-  latestHeadVerdictIsEscalation,
+  awaitingApproverOnly,
+  latestHeadVerdict,
   openThreads,
   filterCountableVerdicts,
   latestAttemptPerCheck,
@@ -291,14 +292,14 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     ...(pr.requested_reviewers ?? []).map((u) => u.login),
     ...(pr.requested_teams ?? []).map((t) => `team:${t.slug}`),
   ];
-  const escalated = latestHeadVerdictIsEscalation(
+  const headVerdict = latestHeadVerdict(
     reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
     pr.head.sha,
     policy,
     markers,
   );
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, escalated };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, escalated: headVerdict === "escalate", headVerdict };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -417,16 +418,25 @@ const CHECK_TEXT_LIMIT = 60000; // GitHub caps output.text at 65535 characters
  * ready-to-merge reason carries "approved Nm ago", so success gets fixed text.)
  */
 export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
-  const conclusion = checkConclusion(decision, facts);
+  const awaitingApprover = policy.noVerdictConclusion === "neutral" && awaitingApproverOnly(facts, decision, policy);
+  const conclusion = checkConclusion(decision, facts, { awaitingApprover });
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
   const title =
-    conclusion === "action_required" ? "Escalated: a human decides" : conclusion === "success" ? "Ready to merge" : `Not ready: ${decision.code}`;
+    conclusion === "action_required"
+      ? "Escalated: a human decides"
+      : conclusion === "success"
+        ? "Ready to merge"
+        : conclusion === "neutral"
+          ? "Awaiting the approver"
+          : `Not ready: ${decision.code}`;
   const summary =
     conclusion === "action_required"
       ? `The reviewer escalated this head to a human.\n\nGate: ${gateLine}`
-      : gateLine;
+      : conclusion === "neutral"
+        ? "awaiting the approver — every other clause of the merge policy passes on this head."
+        : gateLine;
 
   const sections: string[] = [];
   const threads = openThreads(facts, policy);
@@ -527,6 +537,9 @@ export async function runEvaluate(opts: {
   // The gate's own check sits on the head it judges: left in the CI rollup, a
   // failing verdict would read as failing CI and hold itself failing forever.
   const policy: PolicyFile = { ...opts.policy, ciIgnoreCheckNames: [...(opts.policy.ciIgnoreCheckNames ?? []), checkName] };
+  if (policy.noVerdictConclusion !== undefined && policy.noVerdictConclusion !== "failure" && policy.noVerdictConclusion !== "neutral") {
+    throw new Error(`no_verdict_conclusion must be "failure" or "neutral", got ${JSON.stringify(policy.noVerdictConclusion)}`);
+  }
   // mergeable_state is computed lazily and only a merge attempt settles it; an
   // evaluate gate makes no attempt, so the rebase clause is off unless set.
   if (policy.requireCleanRebase === undefined) policy.requireCleanRebase = false;

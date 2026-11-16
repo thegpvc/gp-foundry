@@ -109,6 +109,7 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | --- | --- |
 | `success` | the gate's decision is `merge` |
 | `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`) |
+| `neutral` | `noVerdictConclusion: neutral` and the head has no verdict yet, with the missing approval as its only failing clause ("awaiting the approver") |
 | `failure` | anything else; `output.summary` carries the gate's `code` and `reason` |
 
 `output.text` lists the open threads, the checks not passing and the pending

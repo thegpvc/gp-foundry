@@ -1170,6 +1170,10 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
       const third = run({ ...jobs, ...noVerdict, ...prior(2) }, one);
       expect(third.status).toBe(0);
       expect(third.writes).toContain("output[title]=approver stopped after 3 runs without a verdict");
+      // …and the same sweep-failed record a failed head gets, so it shows where failures show.
+      expect(third.writes).toContain("name=gp-foundry/sweep-failed (approver)");
+      expect(third.writes).toContain("output[title]=approver gave up after 3 runs without a verdict");
+      expect(second.writes).not.toContain("sweep-failed");
       expect(third.writes).not.toContain("gp-foundry/swept");
 
       // A verdict on a later run still marks the head, whatever came before.

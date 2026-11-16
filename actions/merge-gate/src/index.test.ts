@@ -208,6 +208,22 @@ describe("merge-gate evaluate mode", () => {
     expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("action_required");
   });
 
+  it("no_verdict_conclusion: neutral publishes neutral for a head only awaiting the approver", async () => {
+    setup({ approved: false }, "no_verdict_conclusion: neutral\n");
+    await run();
+    const create = stub.calls.find((c) => c.method === "checks.create")?.params;
+    expect(create).toMatchObject({ conclusion: "neutral", output: { title: "Awaiting the approver" } });
+    expect(create.output.summary).toContain("awaiting the approver");
+    // An open thread is a second failing clause: a real failure, not a wait.
+    setup({ approved: false, threads: [openThread] }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("failure");
+    // A bad value fails the run rather than silently meaning failure.
+    setup({ approved: false }, "no_verdict_conclusion: grey\n");
+    await run();
+    expect(failures.join("")).toContain("no_verdict_conclusion");
+  });
+
   it("merge mode is unchanged: the same head is merged", async () => {
     setup({});
     inputs.mode = "";

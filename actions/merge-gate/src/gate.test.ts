@@ -24,6 +24,7 @@ import {
   filterEvaluateCandidates,
   isOpenThread,
   latestHeadVerdictIsEscalation,
+  awaitingApproverOnly,
   type ReviewThreadFact,
 } from "./gate.js";
 
@@ -1004,6 +1005,49 @@ describe("evaluate-mode check conclusion", () => {
     expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE", { sha: "old" })], "head", trust, markers)).toBe(false);
     expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE", { author: "mallory", authorAssociation: "NONE" })], "head", trust, markers)).toBe(false);
     expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "quoting `**Verdict:** ESCALATE` here\nbut no")], "head", trust, markers)).toBe(false);
+  });
+});
+
+describe("no_verdict_conclusion: neutral", () => {
+  const waiting = readyPr({ approvedAt: null });
+  const neutral = (pr: PullRequestFacts, p: MergePolicy = policy) => {
+    const d = evaluateMergeGate(pr, p, NOW);
+    return checkConclusion(d, pr, { awaitingApprover: awaitingApproverOnly(pr, d, p, NOW) });
+  };
+  it("is neutral when the missing approval is the only failing clause", () => {
+    expect(neutral(waiting)).toBe("neutral");
+    // Also with an approval delay: a missing approval is not "approved too recently".
+    expect(neutral(waiting, { ...policy, approvalDelayMinutes: 600 })).toBe("neutral");
+  });
+  it("is failure when anything else fails too, or the reviewer rejected the head", () => {
+    expect(neutral(readyPr({ approvedAt: null, ciStatus: "failing" }))).toBe("failure");
+    expect(neutral(readyPr({ approvedAt: null, files: [{ path: "db/migrations/1.sql", additions: 1 }] }))).toBe("failure");
+    expect(neutral(readyPr({ approvedAt: null, headVerdict: "reject" }))).toBe("failure");
+  });
+  it("leaves success and escalation alone", () => {
+    expect(neutral(readyPr())).toBe("success");
+    expect(neutral(readyPr({ approvedAt: null, escalated: true, headVerdict: "escalate" }))).toBe("action_required");
+  });
+  it("is off unless asked for", () => {
+    const d = evaluateMergeGate(waiting, policy, NOW);
+    expect(checkConclusion(d, waiting)).toBe("failure");
+  });
+});
+
+describe("trusted_author_associations: [] — only the bot's verdicts count", () => {
+  const trust = { botLogin: "fletch-bot[bot]", trustedAuthorAssociations: [] as string[] };
+  const approve = (author: string, authorAssociation: string): VerdictEvent => ({ at: "2026-01-01T00:00:00Z", kind: "approve", sha: "head", author, authorAssociation, source: "review" });
+  it("drops an OWNER's approval and keeps the bot's", () => {
+    expect(isCountableVerdict(approve("dpup", "OWNER"), trust)).toBe(false);
+    expect(isCountableVerdict(approve("Fletch-Bot[bot]", "NONE"), trust)).toBe(true);
+    expect(latestValidApproval(filterCountableVerdicts([approve("dpup", "OWNER")], trust), "head")).toBeNull();
+    expect(latestValidApproval(filterCountableVerdicts([approve("fletch-bot[bot]", "NONE")], trust), "head")).not.toBeNull();
+  });
+  it("drops every non-bot approval when no bot login is set either", () => {
+    expect(isCountableVerdict(approve("dpup", "OWNER"), { trustedAuthorAssociations: [] })).toBe(false);
+  });
+  it("still counts rejections from anyone (they can only hold a merge back)", () => {
+    expect(isCountableVerdict({ ...approve("dpup", "OWNER"), kind: "reject" }, trust)).toBe(true);
   });
 });
 

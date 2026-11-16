@@ -99,7 +99,11 @@ export interface PullRequestFacts {
    * (see latestHeadVerdictIsEscalation). Read only by `checkConclusion`.
    */
   escalated?: boolean;
+  /** The trusted reviewer's latest verdict on the head, if any (see latestHeadVerdict). */
+  headVerdict?: HeadVerdict;
 }
+
+export type HeadVerdict = "approve" | "reject" | "escalate";
 
 /** One review thread, as the wrapper summarizes it from GraphQL `reviewThreads`. */
 export interface ReviewThreadFact {
@@ -171,6 +175,13 @@ export interface MergePolicy {
   botThreadBlockingRegex?: string;
   /** Block while the PR has pending requested reviewers or teams. Default false. */
   requireNoReviewRequests?: boolean;
+  /**
+   * Evaluate mode: the check's conclusion for a head with no verdict yet whose
+   * only failing clause is the missing approval. `failure` (default) or
+   * `neutral` ("awaiting the approver"), which keeps a red X off every PR
+   * between its review and the approver's verdict.
+   */
+  noVerdictConclusion?: "failure" | "neutral";
   /**
    * Labels to apply for a given skip outcome. Lets a consumer route skips to
    * the right agent (e.g. needsHuman -> "needs-human", rebase -> "rebase-needed").
@@ -705,7 +716,7 @@ export interface ReviewFact {
 }
 
 /**
- * Is the trusted reviewer's LATEST verdict on this head an escalation?
+ * The trusted reviewer's LATEST verdict on this head: approve, reject or escalate.
  *
  * Only reviews on the exact head count, only from an author trusted to approve
  * (an escalation stands in for the reviewer's decision, so an outsider must not
@@ -730,13 +741,13 @@ export function visibleBody(body: string | null | undefined): string {
   return (body ?? "").replace(/<!--[\s\S]*?-->/g, "").trimEnd();
 }
 
-export function latestHeadVerdictIsEscalation(
+export function latestHeadVerdict(
   reviews: ReviewFact[],
   headSha: string | undefined,
   trust: VerdictTrustPolicy,
   markers: { approval?: RegExp; rejection?: RegExp; escalation: RegExp },
-): boolean {
-  if (!headSha) return false;
+): HeadVerdict | undefined {
+  if (!headSha) return undefined;
   const verdicts = reviews
     .filter((r) => r.sha === headSha && r.body)
     .filter((r) => isCountableVerdict({ at: r.at, kind: "approve", author: r.author, authorAssociation: r.authorAssociation, source: "review" }, trust))
@@ -744,19 +755,50 @@ export function latestHeadVerdictIsEscalation(
     .filter((r) => [markers.approval, markers.rejection, markers.escalation].some((re) => re?.test(r.body)))
     .sort((a, b) => parseTimestamp(a.at) - parseTimestamp(b.at));
   const last = verdicts[verdicts.length - 1];
-  return !!last && markers.escalation.test(last.body);
+  if (!last) return undefined;
+  if (markers.escalation.test(last.body)) return "escalate";
+  if (markers.approval?.test(last.body)) return "approve";
+  return "reject";
 }
 
-export type CheckConclusion = "success" | "failure" | "action_required";
+/** Is the trusted reviewer's latest verdict on this head an escalation? */
+export function latestHeadVerdictIsEscalation(...args: Parameters<typeof latestHeadVerdict>): boolean {
+  return latestHeadVerdict(...args) === "escalate";
+}
+
+/**
+ * Is this head only waiting for the approver? No verdict on it yet, and the
+ * missing approval is the ONLY clause holding it: re-scored as if approved long
+ * ago, the gate would merge. A head the reviewer rejected, or one also failing CI,
+ * a thread or a size limit, is not merely waiting.
+ */
+export function awaitingApproverOnly(
+  pr: PullRequestFacts,
+  decision: MergeDecision,
+  policy: MergePolicy = {},
+  nowMs: number = Date.now(),
+): boolean {
+  if (decision.code !== "not-approved" || pr.headVerdict) return false;
+  return evaluateMergeGate({ ...pr, approvedAt: 0 }, policy, nowMs).action === "merge";
+}
+
+export type CheckConclusion = "success" | "failure" | "action_required" | "neutral";
 
 /**
  * The evaluate-mode check run's conclusion: `action_required` when the reviewer
  * escalated this head (a human decides, whatever else holds), `success` when the
- * gate would merge, `failure` otherwise.
+ * gate would merge, `neutral` for a head only awaiting the approver when the
+ * policy asks for it (`awaitingApprover`, see awaitingApproverOnly), `failure`
+ * otherwise.
  */
-export function checkConclusion(decision: MergeDecision, facts: Pick<PullRequestFacts, "escalated">): CheckConclusion {
+export function checkConclusion(
+  decision: MergeDecision,
+  facts: Pick<PullRequestFacts, "escalated">,
+  opts: { awaitingApprover?: boolean } = {},
+): CheckConclusion {
   if (facts.escalated) return "action_required";
-  return decision.action === "merge" ? "success" : "failure";
+  if (decision.action === "merge") return "success";
+  return opts.awaitingApprover ? "neutral" : "failure";
 }
 
 // ────────────────────────────────────────────────────────────────────────────
