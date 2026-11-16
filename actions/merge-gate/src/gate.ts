@@ -176,10 +176,10 @@ export interface MergePolicy {
   /** Block while the PR has pending requested reviewers or teams. Default false. */
   requireNoReviewRequests?: boolean;
   /**
-   * Evaluate mode: the check's conclusion for a head with no verdict yet whose
-   * only failing clause is the missing approval. `failure` (default) or
-   * `neutral` ("awaiting the approver"), which keeps a red X off every PR
-   * between its review and the approver's verdict.
+   * Evaluate mode: the check's conclusion for a head the approver has given no
+   * verdict on yet. `failure` (default) or `neutral` ("awaiting the approver"),
+   * which keeps a red X off every PR the approver has not decided, whatever else
+   * still fails on it (the check's text lists those clauses).
    */
   noVerdictConclusion?: "failure" | "neutral";
   /**
@@ -767,19 +767,26 @@ export function latestHeadVerdictIsEscalation(...args: Parameters<typeof latestH
 }
 
 /**
- * Is this head only waiting for the approver? No verdict on it yet, and the
- * missing approval is the ONLY clause holding it: re-scored as if approved long
- * ago, the gate would merge. A head the reviewer rejected, or one also failing CI,
- * a thread or a size limit, is not merely waiting.
+ * Is this head awaiting the approver, and what else holds it?
+ *
+ * Awaiting means the trusted approver has given no verdict on this head (no
+ * approve, reject or escalate) and the approval clause is failing. Then the
+ * answer is the OTHER failing clauses, in gate order (empty when the missing
+ * approval is all that holds it), so the check can say "awaiting the approver"
+ * and still name the CI run, the thread or the size limit the author will need
+ * to clear. `undefined` when the head is not awaiting: the reviewer rejected or
+ * escalated it, or it is approved (through a channel the verdict markers do not
+ * cover) and something else fails.
  */
-export function awaitingApproverOnly(
+export function awaitingApprover(
   pr: PullRequestFacts,
-  decision: MergeDecision,
   policy: MergePolicy = {},
   nowMs: number = Date.now(),
-): boolean {
-  if (decision.code !== "not-approved" || pr.headVerdict) return false;
-  return evaluateMergeGate({ ...pr, approvedAt: 0 }, policy, nowMs).action === "merge";
+): MergeDecision[] | undefined {
+  if (pr.headVerdict || pr.escalated) return undefined;
+  const failing = failingClauses(pr, policy, nowMs);
+  if (!failing.some((d) => d.code === "not-approved")) return undefined;
+  return failing.filter((d) => d.code !== "not-approved");
 }
 
 export type CheckConclusion = "success" | "failure" | "action_required" | "neutral";
@@ -787,9 +794,9 @@ export type CheckConclusion = "success" | "failure" | "action_required" | "neutr
 /**
  * The evaluate-mode check run's conclusion: `action_required` when the reviewer
  * escalated this head (a human decides, whatever else holds), `success` when the
- * gate would merge, `neutral` for a head only awaiting the approver when the
- * policy asks for it (`awaitingApprover`, see awaitingApproverOnly), `failure`
- * otherwise.
+ * gate would merge, `neutral` for a head awaiting the approver's verdict when
+ * the policy asks for it (`awaitingApprover`, see awaitingApprover) whatever
+ * else fails, `failure` otherwise.
  */
 export function checkConclusion(
   decision: MergeDecision,
@@ -907,101 +914,91 @@ function evaluateDependabotLane(
   };
 }
 
+/** One clause of the agent lane: its failing decision, or undefined when it passes. */
+type Clause = (pr: PullRequestFacts, policy: MergePolicy, nowMs: number) => MergeDecision | undefined;
+
+const hasApproval = (pr: PullRequestFacts) =>
+  !(pr.approvedAt === undefined || pr.approvedAt === null || pr.approvedAt === "");
+
+function minutesSince(approvedAt: string | number, nowMs: number): number {
+  return Math.floor((nowMs - parseTimestamp(approvedAt)) / 60000);
+}
+
 /**
- * Ordering mirrors the original Shipper (cheapest / most-disqualifying checks
- * first): blocking labels → branch → approval → approval delay → CI → required
- * checks → review requests → open threads → size → protected paths → rebase →
- * merge. Review requests and open threads apply only when the policy opts in. Returns the FIRST failing
- * gate. Callers
- * that want the merge to actually happen should treat `action === "merge"` as
- * the go-ahead and everything else as a no-merge (with `label` carrying a label
- * to apply and `skip` being a pure no-op).
- *
- * @param nowMs current time in epoch ms; injected for deterministic tests.
+ * The agent lane's clauses, in gate order. Each one is independent of the
+ * others, so `failingClauses` can run them all; `evaluateMergeGate` stops at the
+ * first one that fails.
  */
-export function evaluateMergeGate(
-  pr: PullRequestFacts,
-  policy: MergePolicy = {},
-  nowMs: number = Date.now(),
-): MergeDecision {
-  const blockingLabels = policy.blockingLabels ?? [];
-  const requireCi = policy.requireCi ?? true;
-  const requireCleanRebase = policy.requireCleanRebase ?? true;
-  const approvalDelayMinutes = policy.approvalDelayMinutes ?? 0;
-  const maxAdditions = policy.maxAdditions ?? Number.POSITIVE_INFINITY;
-  const needsHumanLabel = policy.labels?.needsHuman;
-  const rebaseNeededLabel = policy.labels?.rebaseNeeded;
-  const awaitingApprovalLabel = policy.labels?.awaitingApproval;
-
-  // 1) Blocking labels (needs-human / rebase-needed / …) — shared by both lanes.
-  const offendingLabel = blockingLabels.find((l) => pr.labels.includes(l));
-  if (offendingLabel) {
-    return {
-      action: "skip",
-      code: "blocking-label",
-      reason: `PR #${pr.number} carries blocking label \`${offendingLabel}\``,
-    };
-  }
-
-  // Lane split: a genuine dependabot PR is scored on its own track (no human
-  // approval, but only safe semver bumps). Author, not branch name, is the gate.
-  if (pr.authorLogin === DEPENDABOT_LOGIN) {
-    return evaluateDependabotLane(pr, policy, needsHumanLabel, rebaseNeededLabel);
-  }
-
+const AGENT_LANE_CLAUSES: Clause[] = [
   // 2) Branch prefix
-  if (policy.branchPrefix && !pr.headRefName.startsWith(policy.branchPrefix)) {
-    return {
-      action: "skip",
-      code: "wrong-branch",
-      reason: `branch \`${pr.headRefName}\` does not start with \`${policy.branchPrefix}\``,
-    };
-  }
+  (pr, policy) => {
+    if (policy.branchPrefix && !pr.headRefName.startsWith(policy.branchPrefix)) {
+      return {
+        action: "skip",
+        code: "wrong-branch",
+        reason: `branch \`${pr.headRefName}\` does not start with \`${policy.branchPrefix}\``,
+      };
+    }
+    return undefined;
+  },
 
   // 3) Bot-approval present. A ready-but-unapproved PR becomes a visible
   //    `awaiting-approval` label when one is configured (else a silent skip, as
   //    before) so it can be found and approved instead of sitting unseen (#12559).
-  if (pr.approvedAt === undefined || pr.approvedAt === null || pr.approvedAt === "") {
-    return {
-      action: awaitingApprovalLabel ? "label" : "skip",
-      code: "not-approved",
-      label: awaitingApprovalLabel,
-      reason: `PR #${pr.number} has no qualifying approval`,
-    };
-  }
+  (pr, policy) => {
+    const awaitingApprovalLabel = policy.labels?.awaitingApproval;
+    if (!hasApproval(pr)) {
+      return {
+        action: awaitingApprovalLabel ? "label" : "skip",
+        code: "not-approved",
+        label: awaitingApprovalLabel,
+        reason: `PR #${pr.number} has no qualifying approval`,
+      };
+    }
+    if (Number.isNaN(parseTimestamp(pr.approvedAt!))) {
+      return {
+        action: awaitingApprovalLabel ? "label" : "skip",
+        code: "not-approved",
+        label: awaitingApprovalLabel,
+        reason: `PR #${pr.number} has an unparseable approval timestamp`,
+      };
+    }
+    return undefined;
+  },
 
-  // 4) Approval delay
-  const approvedMs = parseTimestamp(pr.approvedAt);
-  if (Number.isNaN(approvedMs)) {
-    return {
-      action: awaitingApprovalLabel ? "label" : "skip",
-      code: "not-approved",
-      label: awaitingApprovalLabel,
-      reason: `PR #${pr.number} has an unparseable approval timestamp`,
-    };
-  }
-  const minutesSinceApproval = Math.floor((nowMs - approvedMs) / 60000);
-  if (minutesSinceApproval < approvalDelayMinutes) {
-    return {
-      action: "skip",
-      code: "approval-delay",
-      reason: `approved ${minutesSinceApproval}m ago (need ${approvalDelayMinutes}m)`,
-      detail: { minutesSinceApproval },
-    };
-  }
+  // 4) Approval delay. Only meaningful once there is a valid approval; a missing
+  //    one is the clause above, never "approved too recently".
+  (pr, policy, nowMs) => {
+    const approvalDelayMinutes = policy.approvalDelayMinutes ?? 0;
+    if (!hasApproval(pr) || Number.isNaN(parseTimestamp(pr.approvedAt!))) return undefined;
+    const minutesSinceApproval = minutesSince(pr.approvedAt!, nowMs);
+    if (minutesSinceApproval < approvalDelayMinutes) {
+      return {
+        action: "skip",
+        code: "approval-delay",
+        reason: `approved ${minutesSinceApproval}m ago (need ${approvalDelayMinutes}m)`,
+        detail: { minutesSinceApproval },
+      };
+    }
+    return undefined;
+  },
 
   // 5) CI passing
-  if (requireCi && pr.ciStatus !== "passing") {
-    return {
-      action: "skip",
-      code: "ci-not-passing",
-      reason: `CI status is \`${pr.ciStatus}\` (need \`passing\`)`,
-    };
-  }
+  (pr, policy) => {
+    if ((policy.requireCi ?? true) && pr.ciStatus !== "passing") {
+      return {
+        action: "skip",
+        code: "ci-not-passing",
+        reason: `CI status is \`${pr.ciStatus}\` (need \`passing\`)`,
+      };
+    }
+    return undefined;
+  },
 
   // 5b) Required checks present AND green on the head SHA.
-  const unsatisfied = firstUnsatisfiedCheck(pr.checkRuns, policy.requiredChecks);
-  if (unsatisfied) {
+  (pr, policy) => {
+    const unsatisfied = firstUnsatisfiedCheck(pr.checkRuns, policy.requiredChecks);
+    if (!unsatisfied) return undefined;
     return {
       action: "skip",
       code: "required-check-missing",
@@ -1013,35 +1010,41 @@ export function evaluateMergeGate(
             : `required check \`${unsatisfied.name}\` is not successful`,
       detail: { requiredCheck: unsatisfied.name },
     };
-  }
+  },
 
   // 5c) No pending review requests (opt-in).
-  if (policy.requireNoReviewRequests && (pr.requestedReviewers?.length ?? 0) > 0) {
-    const who = pr.requestedReviewers!;
-    return {
-      action: "skip",
-      code: "review-requested",
-      reason: `review requested from ${who.map((w) => `\`${w}\``).join(", ")}`,
-      detail: { requestedReviewers: who },
-    };
-  }
-
-  // 5d) No open review threads (opt-in).
-  if (policy.requireNoOpenThreads) {
-    const open = openThreads(pr, policy);
-    if (open.length > 0) {
+  (pr, policy) => {
+    if (policy.requireNoReviewRequests && (pr.requestedReviewers?.length ?? 0) > 0) {
+      const who = pr.requestedReviewers!;
       return {
         action: "skip",
-        code: "open-threads",
-        reason: `${open.length} open review thread${open.length === 1 ? "" : "s"} awaiting the author`,
-        detail: { openThreads: open.length },
+        code: "review-requested",
+        reason: `review requested from ${who.map((w) => `\`${w}\``).join(", ")}`,
+        detail: { requestedReviewers: who },
       };
     }
-  }
+    return undefined;
+  },
+
+  // 5d) No open review threads (opt-in).
+  (pr, policy) => {
+    if (!policy.requireNoOpenThreads) return undefined;
+    const open = openThreads(pr, policy);
+    if (open.length === 0) return undefined;
+    return {
+      action: "skip",
+      code: "open-threads",
+      reason: `${open.length} open review thread${open.length === 1 ? "" : "s"} awaiting the author`,
+      detail: { openThreads: open.length },
+    };
+  },
 
   // 6) Hand-written additions under the limit
-  const handAdditions = handWrittenAdditions(pr.files, policy.excludeGlobs);
-  if (handAdditions > maxAdditions) {
+  (pr, policy) => {
+    const maxAdditions = policy.maxAdditions ?? Number.POSITIVE_INFINITY;
+    const needsHumanLabel = policy.labels?.needsHuman;
+    const handAdditions = handWrittenAdditions(pr.files, policy.excludeGlobs);
+    if (handAdditions <= maxAdditions) return undefined;
     return {
       action: needsHumanLabel ? "label" : "skip",
       code: "too-large",
@@ -1049,11 +1052,13 @@ export function evaluateMergeGate(
       label: needsHumanLabel,
       detail: { handAdditions },
     };
-  }
+  },
 
   // 7) Protected paths untouched
-  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
-  if (protectedPath) {
+  (pr, policy) => {
+    const needsHumanLabel = policy.labels?.needsHuman;
+    const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+    if (!protectedPath) return undefined;
     return {
       action: needsHumanLabel ? "label" : "skip",
       code: "protected-path",
@@ -1061,11 +1066,13 @@ export function evaluateMergeGate(
       label: needsHumanLabel,
       detail: { protectedPath },
     };
-  }
+  },
 
   // 8) Clean rebase
-  if (requireCleanRebase && pr.cleanRebase !== true) {
+  (pr, policy) => {
+    const rebaseNeededLabel = policy.labels?.rebaseNeeded;
     // false or unknown -> not clean.
+    if (!(policy.requireCleanRebase ?? true) || pr.cleanRebase === true) return undefined;
     return {
       action: rebaseNeededLabel ? "label" : "skip",
       code: "rebase-needed",
@@ -1075,13 +1082,85 @@ export function evaluateMergeGate(
           : `rebase status not yet verified`,
       label: rebaseNeededLabel,
     };
+  },
+];
+
+/** 1) Blocking labels (needs-human / rebase-needed / …) — shared by both lanes. */
+function blockingLabelClause(pr: PullRequestFacts, policy: MergePolicy): MergeDecision | undefined {
+  const offendingLabel = (policy.blockingLabels ?? []).find((l) => pr.labels.includes(l));
+  if (!offendingLabel) return undefined;
+  return {
+    action: "skip",
+    code: "blocking-label",
+    reason: `PR #${pr.number} carries blocking label \`${offendingLabel}\``,
+  };
+}
+
+/**
+ * Ordering mirrors the original Shipper (cheapest / most-disqualifying checks
+ * first): blocking labels → branch → approval → approval delay → CI → required
+ * checks → review requests → open threads → size → protected paths → rebase →
+ * merge. Review requests and open threads apply only when the policy opts in. Returns the FIRST failing
+ * gate (see `failingClauses` for all of them). Callers
+ * that want the merge to actually happen should treat `action === "merge"` as
+ * the go-ahead and everything else as a no-merge (with `label` carrying a label
+ * to apply and `skip` being a pure no-op).
+ *
+ * @param nowMs current time in epoch ms; injected for deterministic tests.
+ */
+export function evaluateMergeGate(
+  pr: PullRequestFacts,
+  policy: MergePolicy = {},
+  nowMs: number = Date.now(),
+): MergeDecision {
+  const blocked = blockingLabelClause(pr, policy);
+  if (blocked) return blocked;
+
+  // Lane split: a genuine dependabot PR is scored on its own track (no human
+  // approval, but only safe semver bumps). Author, not branch name, is the gate.
+  if (pr.authorLogin === DEPENDABOT_LOGIN) {
+    return evaluateDependabotLane(pr, policy, policy.labels?.needsHuman, policy.labels?.rebaseNeeded);
+  }
+
+  for (const clause of AGENT_LANE_CLAUSES) {
+    const failed = clause(pr, policy, nowMs);
+    if (failed) return failed;
   }
 
   // All gates passed.
+  const handAdditions = handWrittenAdditions(pr.files, policy.excludeGlobs);
+  const minutesSinceApproval = minutesSince(pr.approvedAt!, nowMs);
   return {
     action: "merge",
     code: "ready-to-merge",
     reason: `all checks passed (+${handAdditions} hand-written, approved ${minutesSinceApproval}m ago, CI passing)`,
     detail: { handAdditions, minutesSinceApproval },
   };
+}
+
+/**
+ * EVERY clause that fails on this head, in gate order — `evaluateMergeGate`
+ * returns only the first. Each clause is judged on its own, so a missing
+ * approval does not hide a running CI or an open thread. Empty when the gate
+ * would merge. The dependabot lane is scored as a unit (its order is part of its
+ * meaning), so it contributes at most its one decision.
+ */
+export function failingClauses(
+  pr: PullRequestFacts,
+  policy: MergePolicy = {},
+  nowMs: number = Date.now(),
+): MergeDecision[] {
+  const failing: MergeDecision[] = [];
+  const blocked = blockingLabelClause(pr, policy);
+  if (blocked) failing.push(blocked);
+  if (pr.authorLogin === DEPENDABOT_LOGIN) {
+    const d = evaluateDependabotLane(pr, policy, policy.labels?.needsHuman, policy.labels?.rebaseNeeded);
+    if (d.action !== "merge") failing.push(d);
+    return failing;
+  }
+  for (const clause of AGENT_LANE_CLAUSES) {
+    const failed = clause(pr, policy, nowMs);
+    if (failed) failing.push(failed);
+  }
+  return failing;
 }

@@ -41,6 +41,8 @@ interface World {
   reviews?: unknown[];
   verdictBody?: string;
   threads: unknown[];
+  /** The head's CI check runs (default: one green `ci`). */
+  ci?: { id: number; name: string; status: string; conclusion: string | null; app: { slug: string } }[];
   existing: { id: number; name: string; status: string; conclusion: string; app: { slug: string }; output: { summary: string; text: string } }[];
 }
 
@@ -97,8 +99,8 @@ function makeOctokit(world: World) {
       checks: {
         listForRef: async (params: any) => {
           calls.push({ method: "checks.listForRef", params });
-          const ci = { id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } };
-          const named = params.check_name ? world.existing.filter((c) => c.name === params.check_name) : [ci, ...world.existing];
+          const ci = world.ci ?? [{ id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } }];
+          const named = params.check_name ? world.existing.filter((c) => c.name === params.check_name) : [...ci, ...world.existing];
           return { data: named };
         },
         create: rec("checks.create", {}),
@@ -216,10 +218,50 @@ describe("merge-gate evaluate mode", () => {
     const create = stub.calls.find((c) => c.method === "checks.create")?.params;
     expect(create).toMatchObject({ conclusion: "neutral", output: { title: "Awaiting the approver" } });
     expect(create.output.summary).toContain("awaiting the approver");
-    // An open thread is a second failing clause: a real failure, not a wait.
+    expect(create.output.summary).toContain("every other clause of the merge policy passes");
+  });
+
+  it("no_verdict_conclusion: neutral stays neutral with other clauses failing, and names each", async () => {
+    const created = () => stub.calls.find((c) => c.method === "checks.create")?.params;
+    // An open thread: neutral, with the thread count in the summary.
     setup({ approved: false, threads: [openThread] }, "no_verdict_conclusion: neutral\n");
     await run();
-    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("failure");
+    expect(created()).toMatchObject({ conclusion: "neutral", output: { title: "Awaiting the approver" } });
+    expect(created().output.summary).toContain("has not given a verdict on this head yet");
+    expect(created().output.summary).toContain("`open-threads` — 1 unanswered review thread");
+    expect(created().output.text).toContain("src/w.ts:4");
+
+    // CI still running: neutral, with the running checks counted.
+    const running = (id: number) => ({ id, name: `test-${id}`, status: "in_progress", conclusion: null, app: { slug: "github-actions" } });
+    setup({ approved: false, ci: [running(1), running(2), running(3)] }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(created().conclusion).toBe("neutral");
+    expect(created().output.summary).toContain("`ci-not-passing` — CI: 3 check runs still running");
+    const summary = created().output.summary;
+    // Deterministic for an unchanged state: a second tick writes nothing.
+    const existing = [{ id: 9, name: CHECK, status: "completed", conclusion: "neutral", app: { slug: "github-actions" }, output: { summary, text: created().output.text } }];
+    setup({ approved: false, ci: [running(1), running(2), running(3)], existing }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(writes()).toEqual([]);
+
+    // A rejection on the head is a decision, not a wait.
+    setup(
+      { approved: false, reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "No.\n\n**Verdict:** REQUEST_CHANGES\n" }] },
+      "no_verdict_conclusion: neutral\n",
+    );
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: not-approved" } });
+
+    // Approved, but CI red: failure naming CI.
+    setup({ ci: [{ id: 1, name: "ci", status: "completed", conclusion: "failure", app: { slug: "github-actions" } }] }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: ci-not-passing" } });
+
+    // Without the setting, unchanged: failure.
+    setup({ approved: false, threads: [openThread] });
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: not-approved" } });
+
     // A bad value fails the run rather than silently meaning failure.
     setup({ approved: false }, "no_verdict_conclusion: grey\n");
     await run();
