@@ -1057,6 +1057,192 @@ describe("authors= restricts a PR lane to an allowlist", () => {
   });
 });
 
+// ── opt_in_label= ────────────────────────────────────────────────────────────
+
+describe("opt_in_label= widens an allowlist by a PR label", () => {
+  const AUTHORS_IF = "github.event.pull_request.user.login == 'dpup'";
+  const LABELS = { agent_review: "fletch:review" };
+  const cfg = { labels: LABELS } as Partial<FoundryConfig>;
+  const optInLane = () => lane('authors="dpup", opt_in_label="agent_review"');
+
+  it("ORs the label into the job-level if:, and admits only that label's labeled event", () => {
+    const cond = workflow(optInLane(), "reviewer", cfg).jobs.reviewer_guard.if;
+    expect(cond).toContain(
+      `(${AUTHORS_IF} || contains(github.event.pull_request.labels.*.name, 'fletch:review'))`,
+    );
+    expect(cond).toContain("(github.event.action != 'labeled' || github.event.label.name == 'fletch:review')");
+    expect(cond).toContain("startsWith(github.event.pull_request.head.ref, 'agent/')");
+    // The key resolves through config.labels; the key itself never reaches the workflow.
+    expect(cond).not.toContain("agent_review");
+  });
+
+  it("listens for pull_request.labeled", () => {
+    const w = workflow(optInLane(), "reviewer", cfg);
+    expect(w.on.pull_request.types).toEqual(["opened", "synchronize", "labeled"]);
+    // Without the attr, no labeled trigger.
+    expect(workflow(lane('authors="dpup"'), "reviewer").on.pull_request.types).not.toContain("labeled");
+  });
+
+  it("uses an unmapped key literally, as skip label: does", () => {
+    const w = workflow(optInLane(), "reviewer");
+    expect(w.jobs.reviewer_guard.if).toContain("contains(github.event.pull_request.labels.*.name, 'agent_review')");
+    expect(w.jobs.reviewer_guard.steps[0].env.OPT_IN_LABEL).toBe("agent_review");
+  });
+
+  it("works with skip=draft: both extra triggers, each passing the if:", () => {
+    const w = workflow(lane('authors="dpup", opt_in_label="agent_review", skip="draft"'), "reviewer", cfg);
+    expect(w.on.pull_request.types).toEqual(["opened", "synchronize", "ready_for_review", "labeled"]);
+  });
+
+  it("lets the labeled event through a lane that also has guarded edges", () => {
+    const dot = `digraph t {
+      start    [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", authors="dpup", opt_in_label="agent_review"]
+      fixer    [type=pr-fix, role="agents/roles/fixer.md"]
+      start    -> reviewer [on="pull_request.opened"]
+      fixer    -> reviewer [on="pull_request_review.submitted", when="verdict=request_changes"]
+    }`;
+    const cond = workflow(dot, "reviewer", cfg).jobs.reviewer_guard.if;
+    // Without its own event clause, the verdict guard would swallow every labeled event.
+    expect(cond).toContain("(github.event_name == 'pull_request' && github.event.action == 'labeled')");
+    expect(cond).toContain("(github.event.action != 'labeled' || github.event.label.name == 'fletch:review')");
+  });
+
+  it("admits the opt-in label beside a label= edge instead of blocking it", () => {
+    const dot = `digraph t {
+      start    [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", authors="dpup", opt_in_label="agent_review"]
+      start    -> reviewer [on="pull_request.opened"]
+      start    -> reviewer [when="label=rereview"]
+    }`;
+    const cond = workflow(dot, "reviewer", cfg).jobs.reviewer_guard.if;
+    expect(cond).toContain("github.event.label.name == 'rereview'");
+    expect(cond).toContain(
+      "((github.event_name == 'pull_request' && github.event.action == 'labeled') && github.event.label.name == 'fletch:review')",
+    );
+    expect(cond).not.toContain("github.event.action != 'labeled'");
+  });
+
+  it("passes OPT_IN_LABEL to the guard, whose script tests it", () => {
+    const step = workflow(optInLane(), "reviewer", cfg).jobs.reviewer_guard.steps[0];
+    expect(step.env.AUTHORS).toBe("dpup");
+    expect(step.env.OPT_IN_LABEL).toBe("fletch:review");
+    expect(step.run).toContain("env.OPT_IN_LABEL");
+    expect(step.run).not.toContain("fletch:review");
+    expect(step.run).not.toContain("agent_review");
+  });
+
+  describe("the guard script, run against a stub gh", () => {
+    const step = () => workflow(optInLane(), "reviewer", cfg).jobs.reviewer_guard.steps[0];
+    const run = (fx: Record<string, unknown>) => runStepScript(step(), fx, { PR: "7" });
+    const pr = (login: string, labels: string[] = []) => ({
+      "repos/o/r/pulls/7": { user: { login }, head: { sha: "h" }, draft: false, labels: labels.map((name) => ({ name })) },
+    });
+
+    it("runs for an allowlisted author with no label", () => {
+      expect(run(pr("dpup")).outputs.run).toBe("true");
+    });
+
+    it("runs for anyone else when the PR carries the opt-in label", () => {
+      expect(run(pr("mallory", ["bug", "fletch:review"])).outputs.run).toBe("true");
+    });
+
+    it("skips anyone else without it — the key or another label does not count", () => {
+      for (const labels of [[], ["agent_review"], ["fletch:review-later"]]) {
+        const r = run(pr("mallory", labels));
+        expect(r.outputs.run, labels.join()).toBe("false");
+        expect(r.outputs.reason).toBe("the author mallory is not in the allowlist and no fletch:review label");
+      }
+    });
+
+    it("still fails CLOSED when the PR cannot be read", () => {
+      expect(run({}).outputs.run).toBe("false");
+    });
+  });
+
+  it("filters the sweep's selection by author OR label", () => {
+    const dot = `digraph t {
+      approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *", authors="dpup", opt_in_label="agent_review"]
+    }`;
+    const step = workflow(dot, "approver", cfg).jobs.approver_select.steps[0];
+    expect(step.env.OPT_IN_LABEL).toBe("fletch:review");
+    expect(step.run).toContain("(.labels // []) | any(.name == env.OPT_IN_LABEL)");
+    const pr = (number: number, login: string, labels: string[] = []) => ({
+      number,
+      draft: false,
+      user: { login },
+      labels: labels.map((name) => ({ name })),
+      head: { ref: `agent/${number}`, sha: `sha${number}` },
+      requested_reviewers: [],
+      requested_teams: [],
+      updated_at: "2020-01-01T00:00:00Z",
+      base: { ref: "main" },
+    });
+    const fx: Record<string, unknown> = {
+      "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100": [
+        pr(1, "someone-else"),
+        pr(2, "dpup"),
+        pr(3, "someone-else", ["fletch:review"]),
+        pr(4, "someone-else", ["agent_review"]),
+      ],
+    };
+    for (const n of [1, 2, 3, 4]) {
+      fx[`repos/o/r/commits/sha${n}/check-runs?per_page=100`] = { check_runs: [] };
+      fx[`repos/o/r/commits/sha${n}/status`] = { total_count: 0 };
+      fx[`repos/o/r/pulls/${n}/reviews?per_page=100`] = [];
+    }
+    const r = runStepScript(step, fx);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.outputs.prs!).map((p: { number: number }) => p.number)).toEqual([2, 3]);
+  });
+
+  it("binds the fixer's if: too (no labeled trigger — a label does not start a fix)", () => {
+    const dot = `digraph t {
+      start    [type=start]
+      builder  [type=producer, role="agents/roles/builder.md"]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", authors="dpup"]
+      fixer    [type=pr-fix, role="agents/roles/fixer.md", authors="dpup", opt_in_label="agent_review"]
+      human    [type=exit]
+      start    -> builder  [on="issues.opened"]
+      builder  -> reviewer [on="pull_request.opened"]
+      reviewer -> fixer    [when="verdict=request_changes"]
+      fixer    -> reviewer [on="push"]
+      fixer    -> human    [when="attempts>=3"]
+    }`;
+    const w = workflow(dot, "fixer", cfg);
+    expect(w.jobs.fixer.if).toContain("contains(github.event.pull_request.labels.*.name, 'fletch:review')");
+    expect(w.on.pull_request).toBeUndefined();
+  });
+
+  describe("validation", () => {
+    it("errors without an allowlist to widen", () => {
+      const ds = diags(lane('opt_in_label="agent_review"'), cfg);
+      expect(codes(ds, "error")).toContain("node.opt-in-without-authors");
+      expect(ds.find((d) => d.code === "node.opt-in-without-authors")!.hint).toBe(
+        "opt_in_label= widens an allowlist; set authors= or repo.authors, or drop the label to run for everyone",
+      );
+      // …and compiles to no change at all.
+      expect(workflow(lane('opt_in_label="agent_review"'), "reviewer", cfg).on.pull_request.types).not.toContain("labeled");
+    });
+
+    it("accepts it with authors= or with repo.authors", () => {
+      expect(codes(diags(optInLane(), cfg), "error")).toEqual([]);
+      const repo = { ...loadConfig(undefined).repo, authors: ["dpup"] };
+      expect(codes(diags(lane('opt_in_label="agent_review"'), { ...cfg, repo }), "error")).toEqual([]);
+    });
+
+    it("rejects an empty value and nodes that take no allowlist", () => {
+      expect(codes(diags(lane('authors="dpup", opt_in_label=""'), cfg), "error")).toContain("node.bad-opt-in-label");
+      const dot = `digraph t {
+        start   [type=start]
+        builder [type=producer, role="agents/roles/builder.md", opt_in_label="agent_review"]
+        start   -> builder [on="issues.opened"]
+      }`;
+      expect(codes(diags(dot, cfg), "error")).toContain("node.opt-in-label-unsupported");
+    });
+  });
+});
+
 // ── unknown attributes ───────────────────────────────────────────────────────
 
 describe("unknown attributes are errors, not silent no-ops", () => {

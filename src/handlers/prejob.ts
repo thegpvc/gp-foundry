@@ -18,6 +18,7 @@ import {
   diffMarkerPrefix,
   hasSkipGuard,
   isSweep,
+  optInLabelOf,
   preJobId,
   skipOf,
   sweepFailedCheckName,
@@ -61,6 +62,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const conds = skipOf(node);
   const authors = authorsOf(node, ctx.config);
+  const optIn = optInLabelOf(node, ctx.config);
   const env: Record<string, string> = {
     GH_TOKEN: "${{ github.token }}",
     PR: PR_NUMBER,
@@ -68,6 +70,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
     BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
   };
   if (authors) env.AUTHORS = authors.join(",");
+  if (optIn) env.OPT_IN_LABEL = optIn;
   const lines = [
     `# Decide whether this lane should run for the PR. The skip= reads fail OPEN:`,
     `# a lane that runs once too often costs a run, one that is wrongly skipped`,
@@ -91,13 +94,22 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
     `HEAD_SHA=$(jq -r '.head.sha // ""' <<< "$PR_JSON")`,
   ];
   if (authors) {
+    const authorTest = `((.user.login // "" | ascii_downcase) as $a | env.AUTHORS | split(",") | index($a))`;
     lines.push(
       ``,
-      `# authors: only these logins' PRs (case-insensitive). The job-level \`if:\``,
-      `# already turned everyone else away from the event payload; this is the`,
-      `# same test against the PR as it is now, and anything but a match skips.`,
-      `if ! jq -e '(.user.login // "" | ascii_downcase) as $a | env.AUTHORS | split(",") | index($a)' <<< "$PR_JSON" >/dev/null; then`,
-      `  skip "the author $(jq -r '.user.login // "?"' <<< "$PR_JSON") is not in the allowlist"`,
+      `# authors: only these logins' PRs (case-insensitive)${optIn ? ", or a PR carrying the opt-in label" : ""}.`,
+      `# The job-level \`if:\` already turned everyone else away from the event`,
+      `# payload; this is the same test against the PR as it is now, and anything`,
+      `# but a match skips.`,
+      ...(optIn
+        ? [
+            `if ! jq -e '${authorTest} or any(.labels[]?; .name == env.OPT_IN_LABEL)' <<< "$PR_JSON" >/dev/null; then`,
+            `  skip "the author $(jq -r '.user.login // "?"' <<< "$PR_JSON") is not in the allowlist and no $OPT_IN_LABEL label"`,
+          ]
+        : [
+            `if ! jq -e '${authorTest}' <<< "$PR_JSON" >/dev/null; then`,
+            `  skip "the author $(jq -r '.user.login // "?"' <<< "$PR_JSON") is not in the allowlist"`,
+          ]),
       `fi`,
     );
   }
@@ -185,12 +197,14 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
 function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const authors = authorsOf(node, ctx.config);
+  const optIn = optInLabelOf(node, ctx.config);
+  const authorTest = `((.user.login // "" | ascii_downcase) as $a | env.AUTHORS | split(",") | index($a))`;
   const run = [
     `# Pick the PR heads that are ready for a decision. Selection is a pure`,
     `# function of repo state — no agent, no randomness — and every read fails`,
     `# CLOSED: a head whose state cannot be read is left for the next sweep.`,
     `#`,
-    `#   candidate   open, not a draft, on a harness branch${authors ? ", by an allowlisted author" : ""}`,
+    `#   candidate   open, not a draft, on a harness branch${authors ? ", by an allowlisted author" : ""}${optIn ? " or labelled $OPT_IN_LABEL" : ""}`,
     `#   reviews in  no review is still being waited on (no pending review request)`,
     `#   checks in   every check-run on the head is completed, no commit status`,
     `#               pending — and at least one check-run exists, unless the PR has`,
@@ -202,7 +216,11 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  .[] | select(.draft | not)`,
     `  | select(.head.ref | startswith(env.PREFIX))`,
     ...(authors
-      ? [`  | select((.user.login // "" | ascii_downcase) as $a | env.AUTHORS | split(",") | index($a))`]
+      ? [
+          optIn
+            ? `  | select(${authorTest} or ((.labels // []) | any(.name == env.OPT_IN_LABEL)))`
+            : `  | select(${authorTest})`,
+        ]
       : []),
     `  | "\\(.number) \\(.head.sha) \\((.requested_reviewers | length) + (.requested_teams | length)) \\(now - (.updated_at | fromdateiso8601) | floor) \\(.base.ref)"') || {`,
     `  echo "::error::could not list open pull requests"`,
@@ -276,6 +294,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
+          ...(optIn ? { OPT_IN_LABEL: optIn } : {}),
         },
         run,
       }),
