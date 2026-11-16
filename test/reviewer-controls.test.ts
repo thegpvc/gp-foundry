@@ -1094,6 +1094,43 @@ describe("opt_in_label= widens an allowlist by a PR label", () => {
     expect(w.on.pull_request.types).toEqual(["opened", "synchronize", "ready_for_review", "labeled"]);
   });
 
+  describe("concurrency: an unrelated label event must not cancel a review", () => {
+    const PR_GROUP = "format('reviewer-{0}', github.event.pull_request.number)";
+    const NOOP =
+      "github.event.action == 'labeled' && github.event.label.name != 'fletch:review'" +
+      " && format('reviewer-noop-{0}', github.run_id)";
+
+    it("sends other labels to a per-run group, everything else to the PR's group", () => {
+      const w = workflow(lane('authors="dpup", opt_in_label="agent_review", cancel_in_progress=true'), "reviewer", cfg);
+      expect(w.concurrency).toEqual({
+        group: `\${{ ${NOOP} || ${PR_GROUP} }}`,
+        "cancel-in-progress": true,
+      });
+      // The resolved label reaches the expression; the key does not.
+      expect(w.concurrency.group).toContain("'fletch:review'");
+      expect(w.concurrency.group).not.toContain("agent_review");
+    });
+
+    it("does the same without cancel_in_progress: a skipped run would still replace a pending one", () => {
+      const w = workflow(optInLane(), "reviewer", cfg);
+      expect(w.concurrency.group).toContain(NOOP);
+      expect(w.concurrency["cancel-in-progress"]).toBe(false);
+    });
+
+    it("leaves the group unchanged without opt_in_label", () => {
+      const w = workflow(lane('authors="dpup", cancel_in_progress=true'), "reviewer", cfg);
+      expect(w.concurrency).toEqual({
+        group: "reviewer-${{ github.event.pull_request.number }}",
+        "cancel-in-progress": true,
+      });
+    });
+
+    it("quotes the label for the expression", () => {
+      const w = workflow(optInLane(), "reviewer", { labels: { agent_review: "it's" } });
+      expect(w.concurrency.group).toContain("github.event.label.name != 'it''s'");
+    });
+  });
+
   it("lets the labeled event through a lane that also has guarded edges", () => {
     const dot = `digraph t {
       start    [type=start]
