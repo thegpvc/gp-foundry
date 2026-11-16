@@ -132,6 +132,138 @@ export function capLength(
 // 3. Injection / role-play override neutralization
 // ────────────────────────────────────────────────────────────────────────────
 
+// Role words that name a privileged conversation turn. `user`/`human`/`tool`
+// are deliberately absent from the INLINE rules below: "USER: root" and
+// "user: the reporter says ..." are everyday text, and a spoofed user turn
+// carries no more authority than the untrusted body already has.
+const ROLE = "(?:system|assistant|developer)";
+
+// What an injected turn says next: an order addressed to the model. Used as a
+// lookahead to tell `system: ignore ...` (a spoof) from `system: true` (config)
+// and "the system: it restarts nightly" (prose) when the role is not all-caps.
+const IMPERATIVE =
+  "(?:please\\s+)?(?:ignore|disregard|forget|override|recommend|approve|you\\s+(?:are|must|should|will)|do\\s+not|from\\s+now\\s+on|new\\s+instructions?)\\b";
+
+/**
+ * "Throw away what came before" phrases.
+ */
+function overridePatterns(): RegExp[] {
+  return [
+    // "ignore/disregard/forget (all) (previous/prior/above) instructions/rules/context"
+    /\b(?:ignore|disregard|forget|discard|override|bypass)\b[^.\n]{0,40}?\b(?:all\s+)?(?:previous|prior|above|earlier|preceding|foregoing|the\s+system|your)\b[^.\n]{0,40}?\b(?:instruction|instructions|prompt|prompts|rule|rules|context|direction|directions|guardrail|guardrails)\b/gi,
+
+    // "disregard the above" / "ignore the findings above" -- the same override
+    // with no instruction-noun, aimed at the trusted text (or the reviewer's own
+    // findings) that precedes the body in the prompt. TRADE-OFF: a human's
+    // "you can ignore the comment above" has the identical shape and loses that
+    // short phrase to the marker; the rest of the sentence is kept. Only
+    // ignore/disregard qualify -- "don't forget to update the constant above" is
+    // too ordinary to touch.
+    /\b(?:ignore|disregard)\b[^.\n]{0,30}?\babove\b/gi,
+  ];
+}
+
+/**
+ * Fake conversation-role / chat markers used to spoof a privileged turn, at
+ * line start AND mid-line. A marker in the middle of a line is as effective as
+ * one at the start: once the body is flattened into a prompt the model does not
+ * care about the newline, and a one-line PR comment has no other place to put it.
+ *
+ * The inline rules trade a little precision for that recall, and each picks a
+ * shape that ordinary prose and config rarely produce:
+ *   - an ALL-CAPS role followed by a colon (`SYSTEM:`), case-sensitively. This
+ *     leaves "the system: it restarts nightly", "operating system: linux",
+ *     `system: true` and `role: "system"` alone. COST: an all-caps form label
+ *     ("SYSTEM: Ubuntu 22.04") loses the label, not the value.
+ *   - a role in any case + colon, only when an imperative aimed at the model
+ *     follows (`System: ignore ...`, `assistant: recommend ...`).
+ *   - a markdown heading that is nothing but the role (`### System`), so
+ *     "## System requirements" / "### Developer guide" stay intact.
+ * A lowercase/title-case `system:` followed by a non-imperative still slips
+ * through by design; the fence + banner are what contain it.
+ */
+function roleMarkerPatterns(): RegExp[] {
+  return [
+    // A bare `user:` opening a line is ordinary prose ("user: the reporter says
+    // ..."), so at line start require a spoofing shape: a bracketed role, or a
+    // role that is the ENTIRE line (the turn separator a real transcript would use).
+    /(?:^|\n)\s*(?:#{0,3}\s*)?[[<{]\s*(?:system|assistant|user|human|developer|tool|function)\s*[\]>}]\s*[:>]?/gi,
+    /(?:^|\n)\s*(?:#{0,3}\s*)?(?:system|assistant|developer)\s*[:>]\s*(?=\n|$)/gi,
+
+    // Inline: ALL-CAPS role + colon. Case-sensitive on purpose (no `i` flag). The
+    // lookbehind keeps `FILE_SYSTEM:` / `SUB-SYSTEM:` identifiers out of it.
+    /(?<![\w-])(?:SYSTEM|ASSISTANT|DEVELOPER)(?:\s+(?:MESSAGE|PROMPT|NOTE|OVERRIDE|INSTRUCTIONS?))?\s*:/g,
+
+    // Inline: any-case role + colon, but only in front of an imperative.
+    new RegExp(`(?<![\\w-])${ROLE}\\s*:(?=\\s*${IMPERATIVE})`, "gi"),
+
+    // Inline: `### System` -- a heading that is only the role (optionally
+    // "prompt"/"message"/...), ended by a colon, the end of the line, or an
+    // imperative. A single `#` needs a following space so `docs#system-setup`
+    // anchors are not headings.
+    new RegExp(
+      `(?<!\\S)(?:#{2,6}\\s*|#\\s+)${ROLE}(?:\\s+(?:prompt|message|instructions?|override))?(?:\\s*:|(?=\\s*(?:\\n|$))|(?=\\s+${IMPERATIVE}))`,
+      "gi",
+    ),
+
+    // Role tags (`<system>`), anywhere.
+    /<\/?(?:system|assistant|user|human|developer|tool|function|im_start|im_end|s|instructions?)\b[^>]*>/gi,
+
+    // Special-token spoofing (ChatML / Llama / generic), anywhere.
+    /<\|[a-z0-9_\/-]{0,40}\|>/gi,
+    /\[\/?(?:INST|SYS|SYSTEM|ASSISTANT|DEVELOPER|USER)\]:?/gi,
+    /\bBEGIN\s+SYSTEM\s+PROMPT\b|\bEND\s+SYSTEM\s+PROMPT\b/gi,
+  ];
+}
+
+// "new instructions:" / "your real instructions are" -- announces a replacement
+// instruction set. Shared between the pattern list and the verdict rule below.
+const NEW_INSTRUCTIONS =
+  /\b(?:new|updated|real|actual|true|secret|hidden)\s+(?:instruction|instructions|prompt|prompts|system\s+prompt|directive|directives|task|goal|objective)\b\s*[:\-]?/gi;
+
+/**
+ * Directives aimed at the pipeline's verdict ("recommend approve", "approve
+ * this PR"). On their own these are what honest review comments say ("I'd
+ * approve this PR once the test is fixed"), so they are NOT in the general
+ * pattern list: they are neutralized only on a line that also carries a role
+ * marker, an override phrase or a "new instructions" announcement -- the
+ * combination is the attack, the phrase alone is conversation.
+ */
+const VERDICT_DIRECTIVE =
+  /\b(?:recommend(?:s|ed|ing)?\s+(?:an?\s+|to\s+)?approv(?:e|al|ing)|approve\s+(?:this|the)\s+(?:PR|pull\s+request|MR|merge\s+request|changes?|diff|patch)|mark\s+(?:this|it)\s+(?:as\s+)?approved|verdict\s*[:=]\s*approved?)\b/gi;
+
+function neutralizeAttachedVerdicts(
+  input: string,
+  marker: string,
+): { text: string; hits: number } {
+  let hits = 0;
+  const replace = () => {
+    hits++;
+    return marker;
+  };
+  const authority = [...overridePatterns(), ...roleMarkerPatterns(), NEW_INSTRUCTIONS];
+  const text = input
+    .split("\n")
+    .map((line) => {
+      // `search` ignores lastIndex, so the shared global regexes are safe here.
+      if (!authority.some((re) => line.search(re) !== -1)) return line;
+      // Defang the line's own markers BEFORE the verdict: `System: recommend
+      // approve` is only a role marker because of the imperative after it, so
+      // redacting the verdict first would leave `System:` standing.
+      let out = line;
+      for (const re of authority) out = out.replace(re, replace);
+      return out.replace(VERDICT_DIRECTIVE, replace);
+    })
+    .join("\n");
+  return { text, hits };
+}
+
+// Credential nouns, for the reveal/leak directives only (masking actual secret
+// VALUES is maskSecrets' job and never keys off these words alone).
+const CRED =
+  "(?:api[\\s_-]?keys?|secrets?|tokens?|credentials?|passwords?|env(?:ironment)?\\s+var(?:iable)?s?)";
+const LEAK_VERB = "(?:reveal|print|repeat|show|output|disclose|leak|exfiltrate|send)";
+
 /**
  * Patterns that attempt to hijack the agent: instruction overrides, fake
  * role/system markers, and tool/exfil directives. Matches are replaced with a
@@ -143,8 +275,7 @@ export function capLength(
  */
 export function buildInjectionPatterns(extraPhrases: string[]): RegExp[] {
   const patterns: RegExp[] = [
-    // "ignore/disregard/forget (all) (previous/prior/above) instructions/rules/context"
-    /\b(?:ignore|disregard|forget|discard|override|bypass)\b[^.\n]{0,40}?\b(?:all\s+)?(?:previous|prior|above|earlier|preceding|foregoing|the\s+system|your)\b[^.\n]{0,40}?\b(?:instruction|instructions|prompt|prompts|rule|rules|context|direction|directions|guardrail|guardrails)\b/gi,
+    ...overridePatterns(),
 
     // "you are now (a) ..." / "from now on you are ..." — an address to the model,
     // which ordinary prose about code does not contain. Redact the phrase and the
@@ -159,29 +290,48 @@ export function buildInjectionPatterns(extraPhrases: string[]): RegExp[] {
     /(?:^|\n|(?<=[.!?]\s))\s*(?:please\s+)?(?:act|acting)\s+as\s+(?:an?\s+|the\s+)?[^.\n]{0,40}/gi,
     /(?:^|\n|(?<=[.!?]\s))\s*(?:please\s+)?(?:pretend(?:\s+to\s+be|\s+that\s+you\s+are)?|roleplay\s+as|simulate\s+being)\b[^.\n]{0,40}/gi,
 
-    // Fake conversation-role / chat markers used to spoof a system turn. A bare
-    // `user:` opening a line is ordinary prose ("user: the reporter says ..."),
-    // so require a spoofing shape: a bracketed role, or a role that is the ENTIRE
-    // line (the turn separator a real transcript would use).
-    /(?:^|\n)\s*(?:#{0,3}\s*)?[[<{]\s*(?:system|assistant|user|human|developer|tool|function)\s*[\]>}]\s*[:>]?/gi,
-    /(?:^|\n)\s*(?:#{0,3}\s*)?(?:system|assistant|developer)\s*[:>]\s*(?=\n|$)/gi,
-
     // The harness's own framing: a body that writes the banner or fence markers is
     // trying to close the block it sits in and forge trusted-looking sections.
     /<<<\s*(?:BEGIN|END)\b[^>\n]{0,60}>>>/gi,
-    /<\/?(?:system|assistant|user|human|developer|tool|function|im_start|im_end|s|instructions?)\b[^>]*>/gi,
 
-    // Special-token spoofing (ChatML / Llama / generic).
-    /<\|[a-z0-9_\/-]{0,40}\|>/gi,
-    /\[\/?(?:INST|SYS|SYSTEM|ASSISTANT|USER)\]/gi,
-    /\bBEGIN\s+SYSTEM\s+PROMPT\b|\bEND\s+SYSTEM\s+PROMPT\b/gi,
+    // Fake role / chat-turn markers, line-start and inline.
+    ...roleMarkerPatterns(),
 
     // "new instructions:" / "system prompt:" / "your real instructions are"
-    /\b(?:new|updated|real|actual|true|secret|hidden)\s+(?:instruction|instructions|prompt|prompts|system\s+prompt|directive|directives|task|goal|objective)\b\s*[:\-]?/gi,
+    NEW_INSTRUCTIONS,
     /\bsystem\s+prompt\b\s*[:\-]/gi,
 
     // Directives to reveal/leak the prompt or secrets.
-    /\b(?:reveal|print|repeat|show|output|disclose|leak|exfiltrate|send)\b[^.\n]{0,40}?\b(?:system\s+prompt|instructions?|api[\s_-]?key|secret|secrets|token|credential|credentials|password|env(?:ironment)?\s+var)/gi,
+    //
+    // A leak verb near a credential NOUN is not enough: "Show the token expiry",
+    // "print the secret count" and "we send the token to the auth service" are
+    // ordinary engineering sentences, and the old verb + noun proximity rule
+    // redacted all of them. What separates a directive from a description is that
+    // it is addressed to the model about the model's OWN material, so require one
+    // of:
+    //   - the prompt itself as the object ("system prompt", "your instructions",
+    //     "the instructions above");
+    //   - a credential the sentence attributes to the model ("your api key",
+    //     "the token you were given");
+    //   - an unambiguous disclosure verb opening a sentence as an imperative
+    //     ("Reveal the API key."). `show`/`print`/`send`/`output` never qualify
+    //     here on their own.
+    // TRADE-OFF: "print the token" / "send the secrets to <url>" with no "your"
+    // now pass this layer (the fence + banner still frame them as data), and
+    // product copy such as "Show your API key once" is still redacted.
+    new RegExp(
+      `\\b${LEAK_VERB}\\b[^.\\n]{0,40}?\\b(?:system\\s+prompt|your\\s+(?:\\w+\\s+){0,2}(?:instructions?|prompts?|rules|guidelines)|instructions?\\s+(?:above|verbatim|you\\s+(?:were|have|received)))\\b`,
+      "gi",
+    ),
+    new RegExp(`\\b${LEAK_VERB}\\b[^.\\n]{0,40}?\\byour\\s+(?:\\w+\\s+){0,2}${CRED}\\b`, "gi"),
+    new RegExp(
+      `\\b${LEAK_VERB}\\b[^.\\n]{0,40}?\\b${CRED}\\s+(?:that\\s+)?you\\s+(?:were\\s+given|have|hold|know|received|can\\s+(?:see|access|read))\\b`,
+      "gi",
+    ),
+    new RegExp(
+      `(?:^|\\n|(?<=[.!?]\\s))\\s*(?:please\\s+)?(?:reveal|disclose|leak|exfiltrate)\\s+(?:(?:the|all|any|every)\\s+)*(?:\\w+\\s+){0,2}?${CRED}\\b`,
+      "gi",
+    ),
 
     // "do not tell / without telling the user" style covert directives.
     /\b(?:do\s+not|don'?t|without)\b[^.\n]{0,30}?\b(?:tell|telling|inform|informing|mention|mentioning|alert|alerting|notify|notifying)\b[^.\n]{0,20}?\b(?:the\s+user|anyone|them)\b/gi,
@@ -202,8 +352,11 @@ export function neutralizeInjection(
   marker: string,
   extraPhrases: string[],
 ): { text: string; hits: number } {
-  let hits = 0;
-  let text = input;
+  // Verdict directives first: they only count on a line that carries a
+  // role/override marker, so they are handled line by line together with it.
+  const verdicts = neutralizeAttachedVerdicts(input, marker);
+  let hits = verdicts.hits;
+  let text = verdicts.text;
   for (const re of buildInjectionPatterns(extraPhrases)) {
     text = text.replace(re, (m) => {
       // Preserve a leading newline captured by anchored role-marker patterns so
@@ -220,11 +373,63 @@ export function neutralizeInjection(
 // 4. Secret / credential masking
 // ────────────────────────────────────────────────────────────────────────────
 
+/** Shannon entropy in bits per character. */
+function entropy(s: string): number {
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/**
+ * Does the right-hand side of a `secret-ish-name = value` assignment look like
+ * an actual secret VALUE, as opposed to a word, an identifier or a reference?
+ *
+ * The key name alone proves nothing: "password: required, min 8 chars",
+ * "token: expiresAt" and `token = getToken()` all have a secret-smelling name
+ * and an innocent right-hand side, and the old "any 6 non-space characters"
+ * rule redacted every one of them. So the value has to earn it by shape.
+ *
+ * `strong` is extra evidence that this is a literal being assigned -- an
+ * env-style `UPPER_NAME=value` with no spaces, or a quoted string. With it a
+ * shorter / lower-entropy value is accepted; without it (prose-shaped
+ * `token: something`) the value must be long, mixed and high-entropy.
+ *
+ * TRADE-OFF: a short or all-letter secret (`password: hunter2`,
+ * `PASSWORD=changeme`, an unprefixed 16-char token that happens to contain
+ * fewer than two digits after a lowercase key) is NOT masked by this rule.
+ * Provider-prefixed tokens never depend on it.
+ */
+function looksLikeSecretValue(value: string, strong: boolean): boolean {
+  if (value.length < 8) return false;
+  // Token alphabet only. `$ { ( < [ :` mean an expression, a `${{ secrets.X }}`
+  // reference, a call, a placeholder or a URL -- not a pasted secret.
+  if (!/^[A-Za-z0-9+/=_~.!@#%^&*-]+$/.test(value)) return false;
+  // Property paths: `process.env.API_KEY`, `config.auth.token`.
+  if (/^(?:process\.env|os\.environ|import\.meta|secrets|env|vars|config|settings|self|this)\./.test(value)) {
+    return false;
+  }
+  if (/^[A-Za-z_]+(?:\.[A-Za-z_]+)+$/.test(value)) return false;
+
+  const digits = (value.match(/[0-9]/g) ?? []).length;
+  const hasLetter = /[A-Za-z]/.test(value);
+  const highEntropy = entropy(value) >= 3;
+  if (strong) return (hasLetter && digits > 0) || (value.length >= 16 && highEntropy);
+  return value.length >= 16 && hasLetter && digits >= 2 && highEntropy;
+}
+
 /**
  * Mask strings that look like credentials so a leaked secret pasted by an
  * attacker (or reflected by the agent) is not carried into the prompt/logs.
- * Conservative-but-broad: known token prefixes, high-entropy hex/base64 blobs,
- * private-key blocks, and `KEY=value`-style assignments.
+ *
+ * Every rule keys off the shape of a VALUE -- a provider prefix, a PEM block, a
+ * long opaque token -- never off a keyword. The words token / secret / password
+ * / key / credential in plain prose ("rotate the API key weekly", "Bearer
+ * tokens are validated in middleware") must come through untouched.
  */
 export function maskSecrets(input: string, mask: string): { text: string; hits: number } {
   let hits = 0;
@@ -247,8 +452,6 @@ export function maskSecrets(input: string, mask: string): { text: string; hits: 
     /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
     // Google API key.
     /\bAIza[A-Za-z0-9_-]{35}\b/g,
-    // Bearer tokens in headers.
-    /\bBearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}/g,
     // JWTs (three dot-separated base64url segments).
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
   ];
@@ -261,6 +464,20 @@ export function maskSecrets(input: string, mask: string): { text: string; hits: 
     );
   }
 
+  // Bearer tokens in headers. "Bearer" is also just a word, and a long
+  // hyphenated name can follow it ("Bearer authentication-middleware-v2"), so
+  // the value must look opaque: an unbroken 20+ alphanumeric run, or letters
+  // mixed with at least two digits.
+  count(() =>
+    input.replace(/\bBearer\s+([A-Za-z0-9._~+/-]{20,}={0,2})/g, (m, value: string) => {
+      const digits = (value.match(/[0-9]/g) ?? []).length;
+      const opaque = /[A-Za-z0-9]{20,}/.test(value) || (digits >= 2 && /[A-Za-z]/.test(value));
+      if (!opaque) return m;
+      hits++;
+      return mask;
+    }),
+  );
+
   // Private key PEM blocks.
   count(() =>
     input.replace(
@@ -272,13 +489,18 @@ export function maskSecrets(input: string, mask: string): { text: string; hits: 
     ),
   );
 
-  // KEY=value / KEY: value assignments where the key name smells like a secret.
+  // KEY=value / KEY: value assignments where the key name smells like a secret
+  // AND the value is shaped like one (see looksLikeSecretValue).
   count(() =>
     input.replace(
-      /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)[A-Za-z0-9_]*)\s*[:=]\s*(['"]?)([^\s'"]{6,})\2/gi,
-      (_m, key: string, q: string) => {
+      /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)[A-Za-z0-9_]*)(\s*[:=]\s*)(['"]?)([^\s'"]{8,})\3/gi,
+      (m, key: string, sep: string, q: string, value: string) => {
+        // Sentence punctuation after an unquoted value is not part of it.
+        const core = q ? value : value.replace(/[,;.)\]]+$/, "");
+        const envStyle = sep === "=" && /^[A-Z0-9_]+$/.test(key);
+        if (!looksLikeSecretValue(core, envStyle || q !== "")) return m;
         hits++;
-        return `${key}=${mask}`;
+        return `${key}=${mask}${value.slice(core.length)}`;
       },
     ),
   );

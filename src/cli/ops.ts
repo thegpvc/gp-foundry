@@ -17,7 +17,7 @@ import yaml from "js-yaml";
 import pc from "picocolors";
 import { compile, hasErrors } from "../index.js";
 import { loadConfig, loadHarness } from "../config/load.js";
-import { staleGeneratedWorkflows, emitJson, pkgFile, resolvePaths } from "./common.js";
+import { specFileReader, staleGeneratedWorkflows, emitJson, pkgFile, resolvePaths } from "./common.js";
 import type { Harness } from "../ir/types.js";
 import { relative } from "node:path";
 
@@ -149,7 +149,7 @@ export function runDoctor(opts: { dot?: string; config?: string }): { checks: Ch
   const { harness, parseErrors } = loadHarness(dot, config);
   const fileExists = (rel: string) => existsSync(join(base, rel));
   const specDir = relative(root, base).replace(/\\/g, "/");
-  const { files, diagnostics } = compile(harness, { fileExists }, { specDir });
+  const { files, diagnostics } = compile(harness, { fileExists, readFile: specFileReader(base) }, { specDir });
   const errs = diagnostics.filter((d) => d.level === "error").length + parseErrors.length;
   const warns = diagnostics.filter((d) => d.level === "warning");
   checks.push(
@@ -459,7 +459,7 @@ export function registerOpsCommands(program: Command): void {
       // 3. build
       const fileExists = (rel: string) => existsSync(join(base, rel));
       const specDir = relative(root, base).replace(/\\/g, "/");
-      const { files, diagnostics } = compile(harness, { fileExists }, { specDir });
+      const { files, diagnostics } = compile(harness, { fileExists, readFile: specFileReader(base) }, { specDir });
       if (hasErrors(diagnostics)) {
         if (opts.json) emitJson({ ok: false, diagnostics });
         else process.stderr.write(pc.red("build errors — run `gp-foundry validate` for details\n"));

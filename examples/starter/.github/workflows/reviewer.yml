@@ -18,6 +18,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      checks: read
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -25,9 +26,26 @@ jobs:
         with:
           token: ${{ secrets.AGENT_PAT }}
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
           fetch-depth: 0
+      - name: Checkout harness files (base ref)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: .gp-foundry/harness
+          fetch-depth: 1
+          sparse-checkout: |-
+            .github/agent-setup
+            .github/agents
+          token: ${{ secrets.AGENT_PAT }}
+          persist-credentials: false
+      - name: Keep the harness copy out of the working tree
+        shell: bash
+        run: |-
+          mkdir -p .git/info
+          echo "/.gp-foundry/" >> .git/info/exclude
       - name: Setup agent toolchain
-        uses: ./.github/agent-setup
+        uses: ./.gp-foundry/harness/.github/agent-setup
       - name: Fetch context
         id: ctx
         uses: thegpvc/gp-foundry/actions/agent-context@v1
@@ -35,15 +53,17 @@ jobs:
           type: pr-diff
           number: ${{ github.event.pull_request.number }}
           token: ${{ secrets.AGENT_PAT }}
+          checks-token: ${{ github.token }}
           trusted-authors: agent-bot
+          trusted-framing: baseline
       - name: Run agent
         timeout-minutes: 15
         uses: thegpvc/gp-foundry/actions/run-agent@v1
         with:
-          role-file: .github/agents/roles/reviewer.md
+          role-file: .gp-foundry/harness/.github/agents/roles/reviewer.md
           model: claude-opus-4-8
-          comms-file: .github/agents/communication.md
-          scope-path: .github/agents/scope.yaml
+          comms-file: .gp-foundry/harness/.github/agents/communication.md
+          scope-path: .gp-foundry/harness/.github/agents/scope.yaml
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github-token: ${{ secrets.AGENT_PAT }}
           context-file: ${{ steps.ctx.outputs.context-file }}

@@ -11,6 +11,15 @@ inputs:
   token:
     description: GitHub token for API calls
     required: true
+  checks-token:
+    description: >-
+      Optional token used ONLY to read check-run conclusions on the PR head
+      (latest attempt per check name). Separate from `token` because the Checks
+      permission has no fine-grained-PAT equivalent: the harness PAT cannot read
+      check runs, so pass GITHUB_TOKEN here (the job needs `checks: read`) while
+      `token` stays the harness token. Empty skips the checks section entirely;
+      a failed fetch renders a one-line "unavailable" note instead of failing.
+    default: ""
   include-diff:
     description: Whether to include the full diff (for PR types)
     default: "true"
@@ -25,13 +34,25 @@ inputs:
       Fixer's checklist IS the Reviewer's review, and banning it from acting on
       it is incoherent. Leave empty to treat every body as untrusted.
     default: ""
+  trusted-framing:
+    description: >-
+      How a `trusted-authors` post is framed for the agent reading it.
+      "work-item" (default): the post is the agent's work item, to act on --
+      right for a Fixer handed the Reviewer's review. "baseline": the post is
+      the agent's own previous output, a baseline to compare the current state
+      against -- not instructions to follow and not a conclusion to defer to,
+      since the code may have changed since. Use it for a re-reviewer, which
+      "work-item" would tell to obey its past self. Scrubbing and fencing are
+      identical either way. Any other value fails the step.
+    default: "work-item"
   sanitize:
     description: >-
       Neutralize prompt-injection in attacker-controlled text (issue/PR bodies,
       comments, review bodies, titles) before it is written to the context file:
       strips control/bidi sequences, caps length, neutralizes role-override
       markers, masks secret-looking strings, and wraps each body in a
-      collision-proof fence inside an UNTRUSTED banner. On by default — the
+      collision-proof fence inside an UNTRUSTED banner. The diff is fenced too,
+      but its text is left verbatim. On by default — the
       agent reading this file holds a write token and a shell. Set "false" only
       if the consumer sanitizes some other way.
     default: "true"

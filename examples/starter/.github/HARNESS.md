@@ -25,3 +25,17 @@ flowchart TD
   fixer -->|"push"| reviewer
   fixer -->|"attempts>=3"| needs_human
 ```
+
+## Triggers
+
+| Workflow | Runs on |
+|----------|---------|
+| `scout` | issues: opened |
+| `planner` | issues: labeled |
+| `builder` | issues: labeled |
+| `reviewer` | pull_request: opened, synchronize |
+| `fixer` | pull_request_review: submitted |
+| `merge_gate` | schedule: `*/30 * * * *` · workflow_dispatch |
+| `janitor` | schedule: `*/30 * * * *` · workflow_dispatch |
+| `supervisor` | schedule: `17 * * * *` · workflow_dispatch |
+| `retro` | schedule: `0 7 * * 1-5` · workflow_dispatch |

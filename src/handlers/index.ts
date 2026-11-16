@@ -12,12 +12,16 @@ import type {
   StepSpec,
   WorkflowJobFragment,
 } from "../ir/types.js";
+import type { GateSpec } from "./attrs.js";
 import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf, sweepJobNamePrefix } from "./attrs.js";
 import {
+  analystPersistsCredentials,
   appTokenStep,
   checkoutStep,
   contextStep,
   gitIdentityStep,
+  harnessCheckout,
+  harnessFromBase,
   resolveFile,
   runAgentStep,
   runStep,
@@ -82,6 +86,20 @@ const ISSUE_NUMBER = "${{ github.event.issue.number }}";
 const PR_NUMBER = "${{ github.event.pull_request.number }}";
 const PR_HEAD_SHA = "${{ github.event.pull_request.head.sha }}";
 const PR_HEAD_REF = "${{ github.event.pull_request.head.ref }}";
+const PR_BASE_REF = "${{ github.event.pull_request.base.ref }}";
+
+/**
+ * What a lane's App token is narrowed to: the handler's own needs plus whatever
+ * the node's `permissions=` attr adds (appTokenStep keeps only the names that
+ * are App permissions). A malformed attr adds nothing — validate() reports it.
+ */
+function appScope(node: HarnessNode, base: Perms): Perms {
+  try {
+    return { ...base, ...parsePermissionsAttr(node) };
+  } catch {
+    return base;
+  }
+}
 
 function timeoutOf(node: HarnessNode, dflt: number): number {
   const t = node.attrs.timeout;
@@ -105,9 +123,9 @@ function agentStepTimeout(jobTimeout: number): number {
   return Math.max(1, jobTimeout - AGENT_STEP_FALLBACK_MARGIN);
 }
 
-function preamble(ctx: EmitContext, checkout?: Parameters<typeof checkoutStep>[1]): StepSpec[] {
+function preamble(ctx: EmitContext, checkout?: Parameters<typeof checkoutStep>[1], scope?: Perms): StepSpec[] {
   const steps: StepSpec[] = [];
-  const app = appTokenStep(ctx);
+  const app = appTokenStep(ctx, scope && appScope(ctx.node, scope));
   if (app) steps.push(app);
   steps.push(checkoutStep(ctx, checkout));
   steps.push(gitIdentityStep(ctx));
@@ -115,12 +133,15 @@ function preamble(ctx: EmitContext, checkout?: Parameters<typeof checkoutStep>[1
 }
 
 // ── analyst / issue-agent / pr-review: read-and-advise (no code write) ──
-function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
+function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
+  let ctx = ctxIn;
   const node = ctx.node;
   const context = node.context ?? "issue";
   const isPr = context === "pr-diff" || context === "pr-review";
+  // `checks: read` on a PR lane: the context step reads the head's check-run
+  // conclusions with GITHUB_TOKEN (a fine-grained PAT cannot hold the scope).
   const permissions: Perms = isPr
-    ? { contents: "read", "pull-requests": "write" }
+    ? { contents: "read", "pull-requests": "write", checks: "read" }
     : { contents: "read", issues: "write" };
 
   // select="sweep": the lane is not reacting to one PR's event, so there is no
@@ -133,12 +154,23 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
   const prHeadSha = sweep ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
 
   const steps: StepSpec[] = [];
-  const app = appTokenStep(ctx);
+  const app = appTokenStep(ctx, appScope(node, permissions));
   if (app) steps.push(app);
 
   // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
-  // action (./.github/actions/…) that cannot resolve before checkout.
-  steps.push(checkoutStep(ctx, isPr ? { ref: prHeadSha, fetchDepth: 0 } : undefined));
+  // action (./.github/actions/…) that cannot resolve before checkout. An analyst
+  // never pushes, so the checkout leaves no credential in .git/config.
+  const persistCredentials = analystPersistsCredentials(node);
+  steps.push(
+    checkoutStep(ctx, isPr ? { ref: prHeadSha, fetchDepth: 0, persistCredentials } : { persistCredentials }),
+  );
+  // From here on the harness files (role, scope, setup composite, vendored
+  // actions) come from the base ref, not from the PR under review.
+  if (isPr && harnessFromBase(node)) {
+    const h = harnessCheckout(ctx, sweep ? "${{ matrix.pr.base }}" : PR_BASE_REF);
+    steps.push(...h.steps);
+    ctx = h.ctx;
+  }
 
   // pr-review waits for named CI gates before reviewing. An entry naming a
   // workflow file waits on that workflow's runs; any other entry is a check-run
@@ -166,16 +198,17 @@ function emitAnalyst(ctx: EmitContext): WorkflowJobFragment {
       },
     });
   });
-  if (gateSpecs.some((g) => g.kind === "check")) permissions.checks = "read";
 
-  steps.push(setupStep());
+  steps.push(setupStep(ctx));
   const ctxType = context === "pr-diff" ? "pr-diff" : context === "pr-review" ? "pr-review" : "issue";
-  steps.push(contextStep(ctx, ctxType, isPr ? prNumber : ISSUE_NUMBER));
+  // An analyst re-reading its own earlier review is looking at a baseline, not
+  // at instructions: only the fixer treats the bot's posts as its work item.
+  steps.push(contextStep(ctx, ctxType, isPr ? prNumber : ISSUE_NUMBER, { framing: "baseline", checks: isPr }));
   // Waiting for a gate is not the same as reading it: wait-for-checks never fails
   // the step, so a red or timed-out gate used to be indistinguishable from a green
   // one. Put every conclusion in front of the reviewer and say what a non-success
   // means, so a broken build cannot be reviewed as if CI had passed.
-  if (gates.length) steps.push(gateResultsStep(gates, gateIds));
+  if (gateSpecs.length) steps.push(gateResultsStep(gateSpecs, gateIds));
   // Each wait-for-checks step budgets 15 minutes by default; a job timeout that
   // ignored them would kill the review mid-wait and stall the PR with no verdict.
   // A gate-less analyst defaults to 25 so the step cap below leaves the agent 15
@@ -262,21 +295,40 @@ function stepId(raw: string, index: number, all: string[]): string {
 }
 
 /** Append each gate's conclusion to the context file the reviewer is handed. */
-function gateResultsStep(gates: string[], gateIds: string[]): StepSpec {
+function gateResultsStep(gates: GateSpec[], gateIds: string[]): StepSpec {
   const env: Record<string, string> = { CONTEXT_FILE: "${{ steps.ctx.outputs.context-file }}" };
   const lines = [`{`, `  echo ""`, `  echo "=== CI GATES ==="`];
-  gates.forEach((wf, i) => {
-    env[`GATE_${i + 1}_NAME`] = wf;
+  const line = (i: number) => `  echo "$GATE_${i + 1}_NAME: $GATE_${i + 1}_RESULT"`;
+  gates.forEach((g, i) => {
+    env[`GATE_${i + 1}_NAME`] = g.name;
     env[`GATE_${i + 1}_RESULT`] = `\${{ steps.${gateIds[i]}.outputs.conclusion }}`;
-    lines.push(`  echo "$GATE_${i + 1}_NAME: $GATE_${i + 1}_RESULT"`);
   });
-  lines.push(
-    `  echo ""`,
-    `  echo "A gate whose result is not 'success' is a blocking finding: say which one"`,
-    `  echo "failed and request changes. 'timeout' or 'skipped' means CI never gave an"`,
-    `  echo "answer — treat it as unverified, not as a pass."`,
-    `} >> "$CONTEXT_FILE"`,
-  );
+  // Blocking and informational gates are told apart for the reader: the rule
+  // "anything but success blocks" is right for CI and wrong for an advisory
+  // check (a review bot), where `skipped` just means it had nothing to say.
+  const blocking = gates.map((g, i) => ({ g, i })).filter(({ g }) => !g.info);
+  const info = gates.map((g, i) => ({ g, i })).filter(({ g }) => g.info);
+  if (blocking.length) {
+    blocking.forEach(({ i }) => lines.push(line(i)));
+    lines.push(
+      `  echo ""`,
+      `  echo "A gate whose result is not 'success' is a blocking finding: say which one"`,
+      `  echo "failed and request changes. 'timeout' or 'skipped' means CI never gave an"`,
+      `  echo "answer — treat it as unverified, not as a pass."`,
+    );
+  }
+  if (info.length) {
+    if (blocking.length) lines.push(`  echo ""`);
+    lines.push(`  echo "Informational checks (advisory — never blocking on their own):"`);
+    info.forEach(({ i }) => lines.push(line(i)));
+    lines.push(
+      `  echo ""`,
+      `  echo "'skipped', 'neutral' or 'timeout' here means the check did not run or had"`,
+      `  echo "nothing to report on this head — that is normal and is not a finding. A"`,
+      `  echo "'failure' is input to weigh alongside your own review, not a verdict."`,
+    );
+  }
+  lines.push(`} >> "$CONTEXT_FILE"`);
   return runStep({ name: "Record CI gate results in the context", env, run: lines.join("\n") });
 }
 
@@ -284,7 +336,11 @@ function gateResultsStep(gates: string[], gateIds: string[]): StepSpec {
 function emitProducer(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const cfg = ctx.config;
-  const steps: StepSpec[] = preamble(ctx);
+  const steps: StepSpec[] = preamble(ctx, undefined, {
+    contents: "write",
+    "pull-requests": "write",
+    issues: "write",
+  });
   steps.push(
     runStep({
       id: "branch",
@@ -303,7 +359,7 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
     }),
   );
   const jobTimeout = timeoutOf(node, 35);
-  steps.push(setupStep());
+  steps.push(setupStep(ctx));
   steps.push(contextStep(ctx, "issue", ISSUE_NUMBER));
   steps.push({ ...runAgentStep(ctx, { withContext: true }), timeoutMinutes: agentStepTimeout(jobTimeout) });
   steps.push({
@@ -334,9 +390,20 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
 }
 
 // ── pr-fix: amend an existing PR ──
-function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
+function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
+  let ctx = ctxIn;
   const node = ctx.node;
-  const steps: StepSpec[] = preamble(ctx, { ref: PR_HEAD_REF, fetchDepth: 0 });
+  const steps: StepSpec[] = preamble(
+    ctx,
+    { ref: PR_HEAD_REF, fetchDepth: 0 },
+    { contents: "write", "pull-requests": "write", checks: "read" },
+  );
+  // The Fixer edits the PR head but is briefed from the base ref's harness files.
+  if (harnessFromBase(node)) {
+    const h = harnessCheckout(ctx, PR_BASE_REF);
+    steps.push(...h.steps);
+    ctx = h.ctx;
+  }
   // Make `max_attempts` REAL: count how many times the reviewer has asked for
   // changes on this PR and stop at the limit instead of looping forever. (The
   // graph's `attempts>=N` escape edge is the declaration; this is the mechanism.)
@@ -384,8 +451,9 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
     }),
   );
   const notExhausted = "steps.attempts.outputs.exhausted != 'true'";
-  steps.push({ ...setupStep(), if: notExhausted });
-  steps.push({ ...contextStep(ctx, "pr-review", PR_NUMBER), if: notExhausted }); // the Fixer needs the review feedback
+  steps.push({ ...setupStep(ctx), if: notExhausted });
+  // The Fixer needs the review feedback — and for it the bot's review IS the work item.
+  steps.push({ ...contextStep(ctx, "pr-review", PR_NUMBER, { framing: "work-item", checks: true }), if: notExhausted });
   // Step timeout below the job's keeps the commit/push epilogue reachable when a
   // slow Fixer would otherwise trip the job timeout and be cancelled (#12545).
   steps.push({
@@ -419,7 +487,7 @@ function emitPrFix(ctx: EmitContext): WorkflowJobFragment {
   return {
     jobId: node.id,
     name: node.id,
-    permissions: { contents: "write", "pull-requests": "write" },
+    permissions: { contents: "write", "pull-requests": "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 35),
     steps,
   };
@@ -570,7 +638,7 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
       }),
     );
   }
-  steps.push(setupStep());
+  steps.push(setupStep(ctx));
   // No triggering issue/PR: the role uses gh to gather what it needs (e.g. [learning] issues).
   steps.push({ ...runAgentStep(ctx, { withContext: false }), id: "agent", timeoutMinutes: agentStepTimeout(timeoutOf(node, 20)) });
   if (commit === "pr") {
@@ -651,15 +719,35 @@ function emitScheduledAgent(ctx: EmitContext): WorkflowJobFragment {
 }
 
 // ── fan_in: the join job of a parallel diamond (native `needs:` on the leg jobs) ──
-export function emitFanIn(ctx: EmitContext, legIds: string[], prScoped: boolean): WorkflowJobFragment {
+export function emitFanIn(ctxIn: EmitContext, legIds: string[], prScoped: boolean): WorkflowJobFragment {
+  let ctx = ctxIn;
   const node = ctx.node;
+  const permissions: Perms = prScoped
+    ? { contents: "read", "pull-requests": "write", issues: "write", checks: "read" }
+    : { contents: "read", issues: "write" };
   const steps: StepSpec[] = [];
-  const app = appTokenStep(ctx);
+  const app = appTokenStep(ctx, appScope(node, permissions));
   if (app) steps.push(app);
-  steps.push(checkoutStep(ctx, prScoped ? { ref: PR_HEAD_SHA, fetchDepth: 0 } : undefined));
-  steps.push(setupStep());
+  // The join reads and synthesizes; like an analyst it never pushes.
+  steps.push(
+    checkoutStep(
+      ctx,
+      prScoped ? { ref: PR_HEAD_SHA, fetchDepth: 0, persistCredentials: false } : { persistCredentials: false },
+    ),
+  );
+  if (harnessFromBase(node, prScoped)) {
+    const h = harnessCheckout(ctx, PR_BASE_REF);
+    steps.push(...h.steps);
+    ctx = h.ctx;
+  }
+  steps.push(setupStep(ctx));
   // The thread context contains every lane's posted analysis — that's the join input.
-  steps.push(contextStep(ctx, prScoped ? "pr-review" : "issue", prScoped ? PR_NUMBER : ISSUE_NUMBER));
+  steps.push(
+    contextStep(ctx, prScoped ? "pr-review" : "issue", prScoped ? PR_NUMBER : ISSUE_NUMBER, {
+      framing: "baseline",
+      checks: prScoped,
+    }),
+  );
   if (node.files.role) steps.push(runAgentStep(ctx, { withContext: true }));
   // Optional completion label (resolved through config.labels) — cascades the next
   // stage via the existing label guards.
@@ -678,9 +766,7 @@ export function emitFanIn(ctx: EmitContext, legIds: string[], prScoped: boolean)
     jobId: node.id,
     name: node.id,
     needs: legIds,
-    permissions: prScoped
-      ? { contents: "read", "pull-requests": "write", issues: "write" }
-      : { contents: "read", issues: "write" },
+    permissions,
     timeoutMinutes: timeoutOf(node, 15),
     steps,
   });

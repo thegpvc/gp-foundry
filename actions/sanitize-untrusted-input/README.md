@@ -25,14 +25,33 @@ Applied in order by `sanitize()`:
 2. **Length cap** — truncate the raw input to `maxLength` (default 20k chars) to
    blunt context-stuffing and cost attacks; truncation is annotated.
 3. **Injection neutralization** — replace high-signal hijack markers
-   (`ignore previous instructions`, `you are now…`, fake `system:` role lines,
+   (`ignore previous instructions`, `disregard the above`, `you are now…`,
    ChatML/`[INST]` special tokens, `<system>` tags, `reveal your prompt`,
    covert "without telling the user" directives, …) with a visible redaction
    marker. Callers can add `extraInjectionPhrases`.
-4. **Secret masking** — mask strings that look like credentials: GitHub tokens
-   (`ghp_`/`github_pat_`), `sk-`/`sk-ant-` keys, AWS access-key ids, Slack/Google
-   keys, Bearer tokens, JWTs, PEM private-key blocks, and `*_SECRET=…` style
-   assignments.
+   - **Role markers are neutralized anywhere in a line**, not only at line
+     start: an all-caps role + colon (`SYSTEM:`, `ASSISTANT:`, `DEVELOPER:`), a
+     role in any case + colon followed by an imperative (`System: ignore …`),
+     `[SYSTEM]`, `<system>`, and a heading that is only the role (`### System`).
+     Lowercase prose and config (`the system: it restarts nightly`,
+     `system: true`, `role: "system"`, `## System requirements`) are left alone.
+   - **Verdict directives** (`recommend approve`, `approve this PR`) are
+     neutralized only on a line that also carries a role/override marker; on
+     their own they are ordinary review conversation.
+   - **Reveal/leak directives** must be aimed at the model's own material
+     (`your api key`, `the token you were given`, `system prompt`) or open a
+     sentence with `reveal`/`disclose`/`leak`/`exfiltrate`. A leak verb merely
+     near the word "token" (`Show the token expiry`) is not a hit.
+4. **Secret masking** — mask strings that are *shaped* like credentials: GitHub
+   tokens (`ghp_`/`github_pat_`), `sk-`/`sk-ant-` keys, AWS access-key ids,
+   Slack/Google keys, opaque Bearer tokens, JWTs, PEM private-key blocks, and
+   `*_SECRET=…` style assignments whose value looks like a secret (env-style or
+   quoted: 8+ chars mixing letters and digits, or 16+ high-entropy chars;
+   otherwise 16+ chars, letters plus two or more digits, high entropy). The
+   words token/secret/password/key in prose, and assignments to identifiers or
+   references (`token = getToken()`, `API_KEY: process.env.API_KEY`,
+   `${{ secrets.X }}`), are not masked. Short or all-letter secrets in an
+   unquoted assignment (`password: hunter2`) are therefore not caught.
 5. **Backtick fencing** — wrap the content in a code fence whose length is
    strictly greater than any backtick run inside the body, so the content cannot
    break out of its block.

@@ -31,8 +31,8 @@ function mkHarness(dot: string, cfg: Partial<FoundryConfig> = {}): Harness {
   return { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "test.dot" };
 }
 
-function workflow(dot: string, file: string, cfg: Partial<FoundryConfig> = {}): any {
-  const { files } = compile(mkHarness(dot, cfg));
+function workflow(dot: string, file: string, cfg: Partial<FoundryConfig> = {}, specDir = ""): any {
+  const { files } = compile(mkHarness(dot, cfg), {}, { specDir });
   const f = files.find((x) => x.path.endsWith(`/${file}.yml`));
   expect(f, `${file}.yml should be generated`).toBeTruthy();
   return yaml.load(f!.contents);
@@ -64,7 +64,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --jq) jqexpr="$2"; shift 2 ;;
     --method) method="$2"; shift 2 ;;
-    -f) field="$2"; shift 2 ;;
+    -f) field="$field$2
+"; shift 2 ;;
     -H) shift 2 ;;
     --paginate) shift ;;
     *) path="$1"; shift ;;
@@ -263,8 +264,6 @@ describe("gates= check-run entries and the ?N grace suffix", () => {
     expect(wf.with.token).toBe("${{ secrets.AGENT_PAT }}");
     expect(check.with.token).toBe("${{ github.token }}");
     expect(job.permissions.checks).toBe("read");
-    // Workflow-only gates need no extra scope.
-    expect(workflow(lane('gates="ci.yml"'), "reviewer").jobs.reviewer.permissions.checks).toBeUndefined();
   });
 
   it("puts every gate's conclusion in front of the reviewer, with unique step ids", () => {
@@ -616,6 +615,8 @@ describe('select="sweep" on pr-review', () => {
       head: { ref: `agent/${number}-x`, sha: `sha${number}` },
       requested_reviewers: [],
       requested_teams: [],
+      updated_at: "2020-01-01T00:00:00Z",
+      base: { ref: "main" },
       ...over,
     });
     const LIST = "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100";
@@ -629,7 +630,9 @@ describe('select="sweep" on pr-review', () => {
     });
     const select = (fx: Record<string, unknown>, env: Record<string, string> = {}) => {
       const r = runStepScript(step(), fx, env);
-      return { ...r, prs: r.outputs.prs ? JSON.parse(r.outputs.prs) : undefined };
+      const full: any[] | undefined = r.outputs.prs ? JSON.parse(r.outputs.prs) : undefined;
+      // `base` rides along for the harness checkout; asserted once, below.
+      return { ...r, full, prs: full?.map(({ number, sha }) => ({ number, sha })) };
     };
     const verdict = (n: number, login = BOT, sha = `sha${n}`) => ({
       user: { login },
@@ -641,6 +644,7 @@ describe('select="sweep" on pr-review', () => {
       const r = select({ [LIST]: [open(1)], ...head(1) });
       expect(r.status).toBe(0);
       expect(r.prs).toEqual([{ number: 1, sha: "sha1" }]);
+      expect(r.full).toEqual([{ number: 1, sha: "sha1", base: "main" }]);
       expect(r.outputs.count).toBe("1");
     });
 
@@ -853,7 +857,7 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
     expect(mark.steps[0].env.GH_TOKEN).toBe("${{ github.token }}");
     expect(mark.steps[0].run).not.toContain("${{");
     // The agent lane itself never gains the scope the human-gate approval is written with.
-    expect(w.jobs.approver.permissions.checks).toBeUndefined();
+    expect(w.jobs.approver.permissions.checks).toBe("read");
     // The lane job is named per PR so its result can be read back.
     expect(w.jobs.approver.name).toBe("approver #${{ matrix.pr.number }}");
     expect(mark.steps[0].env.JOB_PREFIX).toBe("approver #");
@@ -885,17 +889,17 @@ describe("sweep mark job: a head the lane ran on is not swept again", () => {
       });
       expect(r.status).toBe(0);
       const posts = r.writes.split("\n").filter((l) => l.startsWith("POST"));
-      expect(posts).toEqual(["POST repos/o/r/check-runs", "POST repos/o/r/check-runs"]);
+      expect(posts).toHaveLength(3); // two swept, one failed-run record
       expect(r.stdout).toContain("#1: marked sha1");
       expect(r.stdout).toContain("#12: marked sha12");
-      // A failed lane is retried by the next sweep.
-      expect(r.stdout).toContain("#2: lane did not succeed");
+      // A failed lane is retried by the next sweep — and the failure is counted.
+      expect(r.stdout).toContain("#2: lane failure — recorded failed run 1 of 3 on sha2");
     });
 
     it("matches the job name exactly: #1 succeeding does not mark #12", () => {
       const r = run({ [JOBS]: { jobs: [{ name: "approver #1", conclusion: "success" }] } });
       expect(r.stdout).toContain("#1: marked sha1");
-      expect(r.stdout).toContain("#12: lane did not succeed");
+      expect(r.stdout).toContain("#12: lane did not finish");
     });
 
     it("fails loudly when it cannot tell which lanes succeeded", () => {
@@ -983,6 +987,8 @@ describe("authors= restricts a PR lane to an allowlist", () => {
       head: { ref: `agent/${number}`, sha: `sha${number}` },
       requested_reviewers: [],
       requested_teams: [],
+      updated_at: "2020-01-01T00:00:00Z",
+      base: { ref: "main" },
     });
     const fx: Record<string, unknown> = {
       "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100": [pr(1, "someone-else"), pr(2, "DPup"), pr(3, "dpup-impostor")],
@@ -994,7 +1000,7 @@ describe("authors= restricts a PR lane to an allowlist", () => {
     }
     const r = runStepScript(step, fx);
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.outputs.prs!)).toEqual([{ number: 2, sha: "sha2" }]);
+    expect(JSON.parse(r.outputs.prs!)).toEqual([{ number: 2, sha: "sha2", base: "main" }]);
   });
 
   describe("the guard script, run against a stub gh", () => {
@@ -1134,5 +1140,584 @@ describe("immutable-paths guard is only generated where a lane writes code", () 
 
     const after = compile(mkHarness(reviewOnly())).files;
     expect(staleGeneratedWorkflows(root, after)).toEqual([".github/workflows/builder.yml", GUARD]);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 0.2.12
+// ═════════════════════════════════════════════════════════════════════════════
+
+const stepNamed = (job: any, name: string) => job.steps.find((s: any) => s.name === name);
+const APP = { auth: { mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>;
+
+const FULL = `digraph t {
+  start    [type=start]
+  scout    [type=issue-agent, role="agents/roles/scout.md"]
+  builder  [type=producer, role="agents/roles/builder.md"]
+  reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+  fixer    [type=pr-fix, role="agents/roles/fixer.md"]
+  janitor  [type=scheduled-agent, role="agents/roles/janitor.md", schedule="0 8 * * *"]
+  gate     [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  human    [type=exit]
+  start    -> scout    [on="issues.opened"]
+  scout    -> builder  [when="label=build"]
+  builder  -> reviewer [on="pull_request.opened"]
+  reviewer -> fixer    [when="verdict=request_changes"]
+  fixer    -> reviewer [on="push"]
+  fixer    -> human    [when="attempts>=3"]
+}`;
+
+describe("harness files come from the base ref, not the PR head", () => {
+  const job = (dot = lane(), cfg: Partial<FoundryConfig> = {}, file = "reviewer") =>
+    workflow(dot, file, cfg, ".github").jobs[file];
+
+  it("checks the base ref's harness directories out beside the PR head", () => {
+    const j = job();
+    const names = j.steps.map((s: any) => s.name);
+    // After the PR-head checkout, before anything that reads a harness file.
+    expect(names.indexOf("Checkout")).toBeLessThan(names.indexOf("Checkout harness files (base ref)"));
+    expect(names.indexOf("Checkout harness files (base ref)")).toBeLessThan(names.indexOf("Setup agent toolchain"));
+    const h = stepNamed(j, "Checkout harness files (base ref)").with;
+    expect(h.ref).toBe("${{ github.event.pull_request.base.ref }}");
+    expect(h.path).toBe(".gp-foundry/harness");
+    expect(h["fetch-depth"]).toBe(1);
+    expect(h["sparse-checkout"].split("\n").sort()).toEqual([".github/agent-setup", ".github/agents"]);
+    expect(h["persist-credentials"]).toBe(false);
+    // The PR head is still what the agent works in.
+    expect(stepNamed(j, "Checkout").with.ref).toBe("${{ github.event.pull_request.head.sha }}");
+  });
+
+  it("points the role, scope, comms and the setup composite at the base-ref copy", () => {
+    const j = job();
+    const agent = stepNamed(j, "Run agent").with;
+    expect(agent["role-file"]).toBe(".gp-foundry/harness/.github/agents/roles/reviewer.md");
+    expect(agent["scope-path"]).toBe(".gp-foundry/harness/.github/agents/scope.yaml");
+    expect(agent["comms-file"]).toBe(".gp-foundry/harness/.github/agents/communication.md");
+    expect(stepNamed(j, "Setup agent toolchain").uses).toBe("./.gp-foundry/harness/.github/agent-setup");
+  });
+
+  it("covers a prompt override and a role kept outside agents/", () => {
+    const dot = lane('prompt="prompts/review.md"').replace('role="agents/roles/reviewer.md"', 'role="roles/reviewer.md"');
+    const j = job(dot);
+    expect(stepNamed(j, "Run agent").with["prompt-override-file"]).toBe(".gp-foundry/harness/.github/prompts/review.md");
+    expect(stepNamed(j, "Checkout harness files (base ref)").with["sparse-checkout"].split("\n").sort()).toEqual([
+      ".github/agent-setup",
+      ".github/agents",
+      ".github/prompts",
+      ".github/roles",
+    ]);
+  });
+
+  it("keeps the copy out of what a lane can commit", () => {
+    const exclude = stepNamed(job(), "Keep the harness copy out of the working tree");
+    expect(exclude.run).toContain('echo "/.gp-foundry/" >> .git/info/exclude');
+    // The fixer runs `git add -A`; the exclude step must come before it.
+    const fixer = workflow(FULL, "fixer", {}, ".github").jobs.fixer;
+    const names = fixer.steps.map((s: any) => s.name);
+    expect(names.indexOf("Keep the harness copy out of the working tree")).toBeGreaterThan(-1);
+    expect(names.indexOf("Keep the harness copy out of the working tree")).toBeLessThan(names.indexOf("Commit and push fixes"));
+    expect(stepNamed(fixer, "Run agent").with["role-file"]).toBe(".gp-foundry/harness/.github/agents/roles/fixer.md");
+  });
+
+  it("takes the vendored runtime actions from the base ref too", () => {
+    const j = job(lane('gates="ci.yml"'), { runtime: { mode: "vendored" } });
+    expect(stepNamed(j, "Checkout harness files (base ref)").with["sparse-checkout"].split("\n")).toContain(".github/actions");
+    for (const s of j.steps.filter((x: any) => /wait-for-checks|agent-context|run-agent/.test(x.uses ?? ""))) {
+      expect(s.uses).toMatch(/^\.\/\.gp-foundry\/harness\/\.github\/actions\//);
+    }
+    // Pinned mode references the release, which a PR cannot edit.
+    expect(stepNamed(job(), "Run agent").uses).toBe("thegpvc/gp-foundry/actions/run-agent@v1");
+  });
+
+  it("a sweep takes the base ref from the selected PR", () => {
+    const dot = `digraph t {
+      approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *"]
+    }`;
+    const j = workflow(dot, "approver", {}, ".github").jobs.approver;
+    expect(stepNamed(j, "Checkout harness files (base ref)").with.ref).toBe("${{ matrix.pr.base }}");
+  });
+
+  it('harness_ref="head" opts out — with a warning', () => {
+    const dot = lane('harness_ref="head"');
+    const j = job(dot);
+    expect(stepNamed(j, "Checkout harness files (base ref)")).toBeUndefined();
+    expect(stepNamed(j, "Run agent").with["role-file"]).toBe(".github/agents/roles/reviewer.md");
+    expect(stepNamed(j, "Setup agent toolchain").uses).toBe("./.github/agent-setup");
+    expect(codes(diags(dot), "warning")).toContain("node.harness-from-head");
+    expect(codes(diags(lane('harness_ref="main"')), "error")).toContain("node.bad-harness-ref");
+  });
+
+  it("leaves issue lanes and code producers on the single checkout", () => {
+    for (const id of ["scout", "builder", "janitor"]) {
+      const j = workflow(FULL, id, {}, ".github").jobs[id];
+      expect(stepNamed(j, "Checkout harness files (base ref)"), id).toBeUndefined();
+      expect(stepNamed(j, "Setup agent toolchain").uses, id).toBe("./.github/agent-setup");
+    }
+    const onProducer = lane().replace('role="agents/roles/builder.md"', 'role="agents/roles/builder.md", harness_ref="base"');
+    expect(codes(diags(onProducer), "error")).toContain("node.harness-ref-unsupported");
+  });
+});
+
+describe("credentials scoped to what the lane can use", () => {
+  const mint = (id: string) => workflow(FULL, id, APP).jobs[id].steps.find((s: any) => s.id === "app-token").with;
+  const perms = (w: Record<string, string>) =>
+    Object.fromEntries(Object.entries(w).filter(([k]) => k.startsWith("permission-")));
+
+  it("narrows the App token by node type", () => {
+    expect(perms(mint("reviewer"))).toEqual({
+      "permission-contents": "read",
+      "permission-pull-requests": "write",
+      "permission-checks": "read",
+    });
+    expect(perms(mint("fixer"))).toEqual({
+      "permission-contents": "write",
+      "permission-pull-requests": "write",
+      "permission-checks": "read",
+    });
+    expect(perms(mint("builder"))).toEqual({
+      "permission-contents": "write",
+      "permission-pull-requests": "write",
+      "permission-issues": "write",
+    });
+    expect(perms(mint("scout"))).toEqual({ "permission-contents": "read", "permission-issues": "write" });
+  });
+
+  it("leaves the open-ended lanes on the App's own permissions", () => {
+    expect(perms(mint("janitor"))).toEqual({});
+    expect(perms(mint("gate"))).toEqual({});
+  });
+
+  it("adds what permissions= asks for, but never a GITHUB_TOKEN-only scope", () => {
+    const dot = lane('permissions="issues: write, id-token: write, checks: none"');
+    const w = workflow(dot, "reviewer", APP).jobs.reviewer.steps.find((s: any) => s.id === "app-token").with;
+    expect(w["permission-issues"]).toBe("write");
+    expect(w["permission-id-token"]).toBeUndefined();
+    expect(w["permission-checks"]).toBeUndefined(); // `none` withdraws it
+  });
+
+  describe("github-token on run-agent", () => {
+    const withTools = (tools: string | undefined, cfg: Partial<FoundryConfig> = {}) => {
+      const readFile = () => (tools === undefined ? undefined : `---\nrole: Reviewer\ntools: "${tools}"\n---\nbody\n`);
+      const { files } = compile(mkHarness(lane(), cfg), { readFile });
+      const wf: any = yaml.load(files.find((f) => f.path.endsWith("/reviewer.yml"))!.contents);
+      return stepNamed(wf.jobs.reviewer, "Run agent").with;
+    };
+
+    it("is withheld from a role whose tools cannot run gh", () => {
+      expect(withTools("Read,Glob,Grep")["github-token"]).toBeUndefined();
+      expect(withTools("Read,Bash(git log:*),Bash(git diff:*)")["github-token"]).toBeUndefined();
+      // "gh" as a substring of something else is not gh.
+      expect(withTools("Read,Bash(right:*),Bash(sigh:*)")["github-token"]).toBeUndefined();
+    });
+
+    it("is passed when the role can run gh, or anything at all", () => {
+      const pat = { auth: { mode: "pat", token_secret: "AGENT_PAT" } } as Partial<FoundryConfig>;
+      expect(withTools("Read,Bash(gh pr view:*)", pat)["github-token"]).toBe("${{ secrets.AGENT_PAT }}");
+      expect(withTools("Read,Bash(gh:*)", pat)["github-token"]).toBe("${{ secrets.AGENT_PAT }}");
+      expect(withTools("Read,Bash", pat)["github-token"]).toBe("${{ secrets.AGENT_PAT }}");
+    });
+
+    it("is passed when the compiler could not read the role (never withheld on a guess)", () => {
+      expect(withTools(undefined)["github-token"]).toBeDefined();
+      expect(stepNamed(workflow(lane(), "reviewer").jobs.reviewer, "Run agent").with["github-token"]).toBeDefined();
+    });
+  });
+
+  describe("checkout credentials", () => {
+    const checkout = (dot: string, id = "reviewer") => stepNamed(workflow(dot, id).jobs[id], "Checkout").with;
+
+    it("are not persisted on a read-and-advise lane", () => {
+      expect(checkout(lane())["persist-credentials"]).toBe(false);
+      expect(checkout(lane())["fetch-depth"]).toBe(0); // a full clone: nothing left to fetch
+      expect(checkout(FULL, "scout")["persist-credentials"]).toBe(false);
+    });
+
+    it("are kept on every lane that pushes", () => {
+      for (const id of ["builder", "fixer", "janitor"]) {
+        expect(checkout(FULL, id)["persist-credentials"], id).toBeUndefined();
+      }
+    });
+
+    it('are kept for checkout="partial", whose lazy blob fetches need them', () => {
+      expect(checkout(lane('checkout="partial"'))["persist-credentials"]).toBeUndefined();
+      const clash = lane('checkout="partial", persist_credentials=false');
+      expect(codes(diags(clash), "error")).toContain("node.partial-needs-credentials");
+      expect(checkout(lane("persist_credentials=true"))["persist-credentials"]).toBeUndefined();
+    });
+
+    it("the attribute is refused on a lane that must push", () => {
+      const dot = lane().replace('role="agents/roles/builder.md"', 'role="agents/roles/builder.md", persist_credentials=false');
+      expect(codes(diags(dot), "error")).toContain("node.persist-credentials-unsupported");
+    });
+  });
+});
+
+describe("display names", () => {
+  it('title= names the workflow, so the check reads "Fletch / reviewer"', () => {
+    const w = workflow(lane('title="Fletch", skip="draft"'), "reviewer");
+    expect(w.name).toBe("Fletch");
+    expect(Object.keys(w.jobs)).toEqual(["reviewer_guard", "reviewer"]);
+    expect(w.jobs.reviewer_guard.name).toBe("reviewer guard");
+    expect(w.jobs.reviewer.name).toBeUndefined(); // the job key is already the node id
+  });
+
+  it("names the sweep's helper jobs the same way", () => {
+    const dot = `digraph t {
+      approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *", title="Fletch"]
+    }`;
+    const w = workflow(dot, "approver");
+    expect(w.name).toBe("Fletch");
+    expect(w.jobs.approver_select.name).toBe("approver select");
+    expect(w.jobs.approver_mark.name).toBe("approver mark");
+  });
+
+  it("defaults to the node id, and still honours the older name=", () => {
+    expect(workflow(lane(), "reviewer").name).toBe("reviewer");
+    expect(workflow(lane('name="Critic"'), "reviewer").name).toBe("Critic");
+  });
+
+  it("rejects an expression in a title", () => {
+    expect(codes(diags(lane('title="${{ secrets.X }}"')), "error")).toContain("node.bad-title");
+  });
+});
+
+describe("agent-context wiring", () => {
+  it("a reviewer reads its own past review as a baseline; the fixer as its work item", () => {
+    const ctxOf = (id: string) => stepNamed(workflow(FULL, id).jobs[id], "Fetch context").with;
+    expect(ctxOf("reviewer")["trusted-framing"]).toBe("baseline");
+    expect(ctxOf("fixer")["trusted-framing"]).toBeUndefined(); // the action's default: work-item
+    expect(ctxOf("fixer")["trusted-authors"]).toBe(BOT);
+  });
+
+  it("PR lanes pass GITHUB_TOKEN for check-run conclusions and declare checks: read", () => {
+    for (const id of ["reviewer", "fixer"]) {
+      const job = workflow(FULL, id).jobs[id];
+      expect(stepNamed(job, "Fetch context").with["checks-token"], id).toBe("${{ github.token }}");
+      expect(job.permissions.checks, id).toBe("read");
+    }
+    const scout = workflow(FULL, "scout").jobs.scout;
+    expect(stepNamed(scout, "Fetch context").with["checks-token"]).toBeUndefined();
+    expect(scout.permissions.checks).toBeUndefined();
+  });
+});
+
+describe("gate text: blocking vs informational", () => {
+  const block = (gates: string) =>
+    stepNamed(workflow(lane(`gates="${gates}"`), "reviewer").jobs.reviewer, "Record CI gate results in the context").run;
+
+  it("parses ?info alone or with a grace", () => {
+    const node = (gates: string): HarnessNode => ({ id: "n", type: "pr-review", attrs: { gates }, files: {}, raw: {} });
+    expect(parseGates(node("bugbot?info, cursor?info?30, e2e?45?info, ci.yml"))).toEqual([
+      { name: "bugbot", kind: "check", info: true },
+      { name: "cursor", kind: "check", info: true, graceSeconds: 30 },
+      { name: "e2e", kind: "check", graceSeconds: 45, info: true },
+      { name: "ci.yml", kind: "workflow" },
+    ]);
+    expect(() => parseGates(node("x?90?120"))).toThrow();
+    expect(() => parseGates(node("x?informational"))).toThrow();
+  });
+
+  it("says a non-success blocks only for the blocking gates", () => {
+    expect(block("ci.yml, bugbot?info")).toBe(
+      [
+        "{",
+        '  echo ""',
+        '  echo "=== CI GATES ==="',
+        '  echo "$GATE_1_NAME: $GATE_1_RESULT"',
+        '  echo ""',
+        "  echo \"A gate whose result is not 'success' is a blocking finding: say which one\"",
+        "  echo \"failed and request changes. 'timeout' or 'skipped' means CI never gave an\"",
+        '  echo "answer — treat it as unverified, not as a pass."',
+        '  echo ""',
+        '  echo "Informational checks (advisory — never blocking on their own):"',
+        '  echo "$GATE_2_NAME: $GATE_2_RESULT"',
+        '  echo ""',
+        "  echo \"'skipped', 'neutral' or 'timeout' here means the check did not run or had\"",
+        '  echo "nothing to report on this head — that is normal and is not a finding. A"',
+        "  echo \"'failure' is input to weigh alongside your own review, not a verdict.\"",
+        '} >> "$CONTEXT_FILE"',
+      ].join("\n"),
+    );
+  });
+
+  it("drops the blocking paragraph when every gate is informational", () => {
+    const text = block("bugbot?info");
+    expect(text).not.toContain("blocking finding");
+    expect(text).toContain("Informational checks");
+  });
+});
+
+describe("sweep: settle window and bounded retries", () => {
+  const SWEEP = `digraph t {
+    approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *"]
+  }`;
+  const wf = () => workflow(SWEEP, "approver");
+  const LIST = "repos/o/r/pulls?state=open&sort=created&direction=asc&per_page=100";
+  const open = (number: number, updated: string) => ({
+    number,
+    draft: false,
+    head: { ref: `agent/${number}`, sha: `sha${number}` },
+    base: { ref: "main" },
+    requested_reviewers: [],
+    requested_teams: [],
+    updated_at: updated,
+  });
+  const head = (n: number, checks: unknown[]) => ({
+    [`repos/o/r/commits/sha${n}/check-runs?per_page=100`]: { check_runs: checks },
+    [`repos/o/r/commits/sha${n}/status`]: { total_count: 0 },
+    [`repos/o/r/pulls/${n}/reviews?per_page=100`]: [],
+  });
+  const select = (fx: Record<string, unknown>) => {
+    const r = runStepScript(wf().jobs.approver_select.steps[0], fx);
+    return { ...r, numbers: (JSON.parse(r.outputs.prs ?? "[]") as any[]).map((p) => p.number) };
+  };
+  const failed = (app = "github-actions") => ({
+    status: "completed",
+    name: "gp-foundry/sweep-failed (approver)",
+    app: { slug: app },
+  });
+  const ci = { status: "completed", name: "ci", app: { slug: "github-actions" } };
+  const justNow = new Date(Date.now() - 30_000).toISOString().replace(/\.\d+Z$/, "Z");
+  const longAgo = "2020-01-01T00:00:00Z";
+
+  it("does not select a fresh head that has no check-run yet", () => {
+    const r = select({
+      [LIST]: [open(1, justNow), open(2, justNow), open(3, longAgo)],
+      ...head(1, []), // pushed seconds ago, CI has not registered: wait
+      ...head(2, [ci]), // same age, but a check exists and has concluded: go
+      ...head(3, []), // no CI at all, and quiet for the settle window: go
+    });
+    expect(r.status).toBe(0);
+    expect(r.numbers).toEqual([2, 3]);
+    expect(r.stdout).toContain("#1: no check-run on sha1 yet");
+  });
+
+  it("stops selecting a head after three failed runs", () => {
+    const r = select({
+      [LIST]: [open(1, longAgo), open(2, longAgo), open(3, longAgo)],
+      ...head(1, [ci, failed(), failed()]), // two failures: one retry left
+      ...head(2, [ci, failed(), failed(), failed()]), // spent
+      // Only GITHUB_TOKEN's records count: the harness token cannot run the budget down.
+      ...head(3, [ci, failed("my-agent-app"), failed("my-agent-app"), failed("my-agent-app")]),
+    });
+    expect(r.numbers).toEqual([1, 3]);
+    expect(r.stdout).toContain("#2: gave up on sha2 after 3 failed runs");
+  });
+
+  describe("the mark job records failed runs", () => {
+    const JOBS = "repos/o/r/actions/runs/99/attempts/1/jobs?per_page=100";
+    const env = { RUN_ID: "99", RUN_ATTEMPT: "1", PRS: JSON.stringify([{ number: 1, sha: "sha1", base: "main" }]) };
+    const run = (conclusion: string | null, prior: unknown[]) =>
+      runStepScript(
+        wf().jobs.approver_mark.steps[0],
+        {
+          [JOBS]: { jobs: [{ name: "approver #1", conclusion }] },
+          "repos/o/r/commits/sha1/check-runs?per_page=100": { check_runs: prior },
+        },
+        env,
+      );
+
+    it("publishes one neutral sweep-failed check per failed run", () => {
+      const r = run("failure", []);
+      expect(r.status).toBe(0);
+      expect(r.writes).toContain("name=gp-foundry/sweep-failed (approver)");
+      expect(r.writes).toContain("conclusion=neutral");
+      expect(r.writes).toContain("output[title]=approver run 1 of 3 failed");
+      expect(r.writes).not.toContain("gp-foundry/swept");
+    });
+
+    it("says so when the last retry is spent", () => {
+      const r = run("timed_out", [failed(), failed()]);
+      expect(r.writes).toContain("output[title]=approver gave up after 3 failed runs");
+    });
+
+    it("does not count a cancelled or skipped lane against the head", () => {
+      for (const c of ["cancelled", "skipped", null]) {
+        const r = run(c, []);
+        expect(r.status, String(c)).toBe(0);
+        expect(r.writes, String(c)).toBe("");
+      }
+    });
+
+    it("still marks a success as swept", () => {
+      const r = run("success", [failed()]);
+      expect(r.writes).toContain("name=gp-foundry/swept (approver)");
+      expect(r.writes).not.toContain("sweep-failed");
+    });
+  });
+});
+
+describe("repo_guides=false", () => {
+  it("compiles to run-agent's repo-guides input", () => {
+    const agent = (attrs: string) => stepNamed(workflow(lane(attrs), "reviewer").jobs.reviewer, "Run agent").with;
+    expect(agent("repo_guides=false")["repo-guides"]).toBe("false");
+    expect(agent("")["repo-guides"]).toBeUndefined();
+    expect(agent("repo_guides=true")["repo-guides"]).toBeUndefined();
+    expect(codes(diags(lane('repo_guides="no"')), "error")).toContain("node.bad-repo-guides");
+  });
+});
+
+describe("HARNESS.md lists the triggers each workflow was compiled with", () => {
+  const harnessMd = (dot: string) => compile(mkHarness(dot)).files.find((f) => f.path.endsWith("HARNESS.md"))!.contents;
+
+  it("includes the ready_for_review that skip=draft adds", () => {
+    const md = harnessMd(lane('skip="draft"'));
+    expect(md).toContain("## Triggers");
+    expect(md).toContain("| `reviewer` | pull_request: opened, synchronize, ready_for_review |");
+    expect(harnessMd(lane())).toContain("| `reviewer` | pull_request: opened, synchronize |");
+  });
+
+  it("shows schedules and the manual dispatch they come with", () => {
+    expect(harnessMd(FULL)).toContain("| `gate` | schedule: `*/30 * * * *` · workflow_dispatch |");
+  });
+});
+
+describe("run-agent: output handling", () => {
+  const action: any = yaml.load(readFileSync(fileURLToPath(new URL("../actions/run-agent/action.yml", import.meta.url)), "utf8"));
+  const script: string = action.runs.steps.find((s: any) => s.name === "Run agent").run;
+
+  /** Run the step with a stub `claude` (a bash script body) and capture stdout + the job summary. */
+  function run(claudeBody: string, env: Record<string, string> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "gpf-run-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "claude"), `#!/usr/bin/env bash\ncat > /dev/null\n${claudeBody}\n`);
+    chmodSync(join(bin, "claude"), 0o755);
+    writeFileSync(join(dir, "prompt"), "hi");
+    const summary = join(dir, "summary.md");
+    writeFileSync(summary, "");
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+        env: {
+          PATH: `${bin}:${process.env.PATH}`,
+          CLAUDE_CODE_OAUTH_TOKEN: "tok",
+          PROMPT_FILE: join(dir, "prompt"),
+          ROLE_FILE: "",
+          MODEL: "m",
+          ALLOWED_TOOLS: "Read",
+          EXTRA_ARGS: "",
+          EXTRA_ENV: "",
+          MAX_ATTEMPTS: "1",
+          RETRY_BASE_DELAY_SECONDS: "0",
+          GITHUB_STEP_SUMMARY: summary,
+          GITHUB_WORKSPACE: "/work/repo",
+          ARGS_FILE: join(dir, "args"),
+          ...env,
+        },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e: any) {
+      status = e.status ?? 1;
+      stdout = (e.stdout ?? "") + (e.stderr ?? "");
+    }
+    const argsFile = join(dir, "args");
+    return {
+      status,
+      stdout,
+      summary: readFileSync(summary, "utf8"),
+      args: existsSync(argsFile) ? readFileSync(argsFile, "utf8").split("\n").filter(Boolean) : [],
+    };
+  }
+
+  describe("job summary", () => {
+    it("writes the agent's output under the heading", () => {
+      const r = run(`echo "KNOWN-OUTPUT-4711"`, { STEP_SUMMARY: "true", STEP_SUMMARY_HEADING: "Fletch review" });
+      expect(r.status).toBe(0);
+      expect(r.summary).toContain("### Fletch review");
+      expect(r.summary).toContain("KNOWN-OUTPUT-4711");
+      expect(r.summary).not.toContain("truncated");
+    });
+
+    it("truncates at the cap and points at the log", () => {
+      const r = run(`head -c 950000 /dev/zero | tr '\\0' 'x'; echo; echo TAIL-MARKER`, { STEP_SUMMARY: "true" });
+      expect(r.status).toBe(0);
+      expect(r.summary).toContain("Output truncated at 900000 bytes");
+      expect(r.summary).not.toContain("TAIL-MARKER");
+      expect(Buffer.byteLength(r.summary)).toBeLessThan(1_000_000); // under GitHub's 1 MiB cap
+      expect(r.stdout).toContain("TAIL-MARKER"); // the log keeps all of it
+    });
+
+    it("can be switched off, and still records a failed agent's output", () => {
+      expect(run(`echo quiet`, { STEP_SUMMARY: "false" }).summary).toBe("");
+      const failed = run(`echo "partial findings"; exit 3`, { STEP_SUMMARY: "true" });
+      expect(failed.status).toBe(3);
+      expect(failed.summary).toContain("partial findings");
+    });
+  });
+
+  describe("workflow commands in agent output", () => {
+    it("suspends command processing around everything the agent prints", () => {
+      const r = run(`echo "::error::x"; echo "::add-mask::y" >&2`);
+      const lines = r.stdout.split("\n");
+      const stops = lines.flatMap((l, i) => (/^::stop-commands::gpf-[0-9a-f]{32}$/.test(l) ? [i] : []));
+      expect(stops).toHaveLength(2); // one window for stdout, one for stderr
+      for (const [n, payload] of [[0, "::error::x"], [1, "::add-mask::y"]] as const) {
+        const token = lines[stops[n]!]!.slice("::stop-commands::".length);
+        const resume = lines.indexOf(`::${token}::`);
+        const at = lines.indexOf(payload);
+        expect(at, payload).toBeGreaterThan(stops[n]!);
+        expect(at, payload).toBeLessThan(resume);
+      }
+      // A fresh, unguessable token per window; our own annotations sit outside them.
+      expect(new Set(stops.map((i) => lines[i])).size).toBe(2);
+      const warn = lines.indexOf("::warning::Claude produced stderr output:");
+      expect(warn).toBeGreaterThan(lines.indexOf(`::${lines[stops[0]!]!.slice("::stop-commands::".length)}::`));
+      expect(warn).toBeLessThan(stops[1]!);
+    });
+
+    it("resumes on its own line even when the output has no trailing newline", () => {
+      const r = run(`printf 'no newline'`);
+      expect(r.stdout).toMatch(/no newline\n\n?::gpf-[0-9a-f]{32}::/);
+    });
+
+    it("never exposes the token to the agent", () => {
+      const r = run(`env | grep -cE 'gpf-[0-9a-f]{32}' || true`);
+      expect(r.stdout).toMatch(/\n0\n/);
+    });
+  });
+
+  describe("repo-guides", () => {
+    const record = `printf '%s\\n' "$@" > "$ARGS_FILE"`;
+
+    it("false excludes the repo's CLAUDE.md / AGENTS.md via one intact --settings argument", () => {
+      const r = run(record, { REPO_GUIDES: "false" });
+      expect(r.status).toBe(0);
+      const i = r.args.indexOf("--settings");
+      expect(i).toBeGreaterThan(-1);
+      expect(JSON.parse(r.args[i + 1]!)).toEqual({
+        claudeMdExcludes: [
+          "/work/repo/CLAUDE.md",
+          "/work/repo/AGENTS.md",
+          "/work/repo/**/CLAUDE.md",
+          "/work/repo/**/AGENTS.md",
+        ],
+      });
+    });
+
+    it("default leaves the CLI alone", () => {
+      expect(run(record).args).not.toContain("--settings");
+      expect(run(record, { REPO_GUIDES: "true" }).args).not.toContain("--settings");
+    });
+  });
+
+  describe("no github-token", () => {
+    it("removes the empty variables from the agent's environment", () => {
+      const r = run(`echo "gh=\${GH_TOKEN-UNSET} github=\${GITHUB_TOKEN-UNSET}"`, { GH_TOKEN: "", GITHUB_TOKEN: "" });
+      expect(r.stdout).toContain("gh=UNSET github=UNSET");
+      expect(r.stdout).not.toContain("unauthenticated");
+    });
+
+    it("warns when the role has gh but was compiled without a token", () => {
+      const r = run(`echo ok`, { GH_TOKEN: "", GITHUB_TOKEN: "", ALLOWED_TOOLS: "Read,Bash(gh pr view:*)" });
+      expect(r.stdout).toContain("its gh calls will be unauthenticated");
+    });
+
+    it("passes a provided token through", () => {
+      const r = run(`echo "gh=\${GH_TOKEN-UNSET}"`, { GH_TOKEN: "t0k", GITHUB_TOKEN: "t0k" });
+      expect(r.stdout).toContain("gh=t0k");
+    });
   });
 });
