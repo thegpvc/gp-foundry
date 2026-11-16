@@ -6,7 +6,7 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 
 const SCRIPT = `set -euo pipefail
@@ -55,31 +55,47 @@ if [ "$REQUIRE_VERDICT" = "true" ] && ! jq -e '__IS_VERDICT_JQ__' <<< "$REVIEW" 
   exit 0
 fi
 
-# Line 1 of the posted body: the heading that makes a re-run idempotent. The
-# check is keyed by verdict-ness, the way the sweep tells decided from reviewed:
-# a verdict lane counts only its own kind (reviews ending in a verdict line), a
-# plain lane only reviews without one. So an event reviewer and a verdict sweep
-# can share a bot login and a marker without one's review silencing the other.
+# Idempotency: has THIS lane already posted on this head? Each review this step
+# posts ends with a hidden marker naming the lane and the head, and that marker
+# is what a re-run looks for. Several lanes post as one bot, often under one
+# heading, so neither the heading nor the shape of the review says whose it is:
+# a reviewer's review must not silence an approver, and a reviewer that posts
+# its own verdict must still recognize its own review on a re-run.
+#
+# A review with no posted marker at all predates the marker. For those the old
+# test stands in: the heading on line 1 — and, on a verdict lane, only a review
+# that is itself a verdict, so a plain review under the same heading cannot
+# stop the verdict being posted.
 MARKER="\${POST_MARKER//<n>/$PR}"
 MARKER="\${MARKER//<sha>/$HEAD_SHA}"
-export MARKER
+POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
+export MARKER POSTED
 if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100" --paginate --jq '
   [.[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)
-   | select((((.body // "") | split("\\n") | .[0]) // "" | gsub("^\\\\s+|\\\\s+$"; "")) == env.MARKER)
-   | select(__IS_VERDICT_JQ__ == (env.REQUIRE_VERDICT == "true"))] | length' \\
+   | (.body // "") as $b
+   | select(($b | contains(env.POSTED))
+       or ((($b | contains(env.POSTED_PREFIX)) | not)
+           and ((($b | split("\\n") | .[0]) // "" | gsub("^\\\\s+|\\\\s+$"; "")) == env.MARKER)
+           and (env.REQUIRE_VERDICT != "true" or __IS_VERDICT_JQ__)))] | length' \\
   | awk '{s+=$1} END {print s+0}'); then
   echo "::error::could not read the PR's reviews — not posting, so a re-run cannot post the review twice"
   exit 1
 fi
 if [ "$EXISTING" != "0" ]; then
-  echo "a $([ "$REQUIRE_VERDICT" = "true" ] && echo "verdict" || echo "non-verdict") review headed '$MARKER' by $BOT_LOGIN is already on $HEAD_SHA — not posting it again"
+  echo "$NODE has already posted its review on $HEAD_SHA — not posting it again"
   exit 0
 fi
 
 PAYLOAD=$(mktemp)
 jq -c --arg sha "$HEAD_SHA" --arg head "$MARKER" \\
   '{commit_id: $sha, event, body: ($head + "\\n\\n" + .body), comments}' <<< "$REVIEW" > "$PAYLOAD"
-post() { gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1" > /dev/null 2> "$ERR"; }
+# The posted marker goes on last, after any reshaping of the body below: it is
+# an HTML comment, which every verdict test ignores, so a verdict line above it
+# is still the review's last visible line.
+post() {
+  jq -c --arg m "$POSTED" '.body += "\\n\\n" + $m' "$1" > "$1.out"
+  gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1.out" > /dev/null 2> "$ERR"
+}
 if post "$PAYLOAD"; then
   echo "posted the review on $HEAD_SHA"
   exit 0
@@ -120,6 +136,8 @@ export function postReviewStep(
     if: "${{ success() }}",
     env: {
       GH_TOKEN: tokenExpr(ctx),
+      NODE: ctx.node.id,
+      POSTED_PREFIX: POSTED_MARKER_PREFIX,
       PR: opts.prNumber,
       HEAD_SHA: opts.headSha,
       STDOUT_FILE: "${{ steps.agent.outputs.stdout-file }}",

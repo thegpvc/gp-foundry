@@ -433,6 +433,19 @@ export function alsoHeadMarkerPrefix(node: HarnessNode): string {
 }
 
 /**
+ * `<!-- gp-foundry:posted:` — the prefix of the marker a post="review" step
+ * appends to the review it posts, completed as `<node>:<head sha> -->`. It is
+ * the lane's own record of "I posted this, for this head", and what makes a
+ * re-run idempotent.
+ *
+ * Idempotency has to be keyed on WHO posted, not on what the review looks like.
+ * Several lanes post as one bot, often under one heading, and neither the
+ * heading nor "does it end in a verdict line" says which lane a review came
+ * from: an event reviewer may post a verdict of its own, exactly like a sweep.
+ */
+export const POSTED_MARKER_PREFIX = "<!-- gp-foundry:posted:";
+
+/**
  * jq predicate over one review: is it a verdict? A verdict is a review whose LAST
  * VISIBLE line — HTML comments removed (the harness's own stamps), lines trimmed,
  * blanks dropped — is exactly one of the verdict lines (src/shared/verdicts.ts)

@@ -187,6 +187,9 @@ function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: R
 const fence = (obj: unknown) => "```json\n" + JSON.stringify(obj) + "\n```\n";
 const REVIEW = { body: "Two findings.\n\nBoth `minor`, with \"quotes\" and $(dollars).", comments: [{ path: "src/a.ts", line: 4, side: "RIGHT", body: "Leaks the handle." }], event: "COMMENT" };
 
+/** The hidden marker a lane's post step appends: its record of "I posted this, for this head". */
+const posted = (node: string, sha = "head1") => `\n\n<!-- gp-foundry:posted:${node}:${sha} -->`;
+
 describe("the post script, run against a stub gh", () => {
   const plain = () => stepNamed(job(lane('post="review"'), "reviewer"), "Post the review");
   const verdictLane = () => stepNamed(job(SWEEP, "approver"), "Post the review");
@@ -199,7 +202,7 @@ describe("the post script, run against a stub gh", () => {
     expect(r.posts[0]).toEqual({
       commit_id: "head1",
       event: "COMMENT",
-      body: `PR #7 head head1\n\n${REVIEW.body}`,
+      body: `PR #7 head head1\n\n${REVIEW.body}${posted("reviewer")}`,
       comments: REVIEW.comments,
     });
   });
@@ -234,45 +237,94 @@ describe("the post script, run against a stub gh", () => {
     const r = runPost(plain(), fence(REVIEW), existing);
     expect(r.status).toBe(0);
     expect(r.posts).toEqual([]);
-    expect(r.stdout).toContain("already on head1");
+    expect(r.stdout).toContain("reviewer has already posted its review on head1");
     // The same heading on another head, or by someone else, does not count.
     expect(runPost(plain(), fence(REVIEW), [{ ...existing[0], commit_id: "old" }]).posts).toHaveLength(1);
     expect(runPost(plain(), fence(REVIEW), [{ ...existing[0], user: { login: "mallory" } }]).posts).toHaveLength(1);
   });
 
-  it("keys the idempotency check by verdict-ness, so two lanes can share a login and a marker", () => {
+  describe("idempotency is keyed on the lane that posted", () => {
     const heading = "PR #7 head head1\n\n";
-    const plainReview = { user: { login: BOT }, commit_id: "head1", body: `${heading}Two findings, both minor.` };
-    const verdictReview = { user: { login: BOT }, commit_id: "head1", body: `${heading}Fine.\n\n**Verdict:** APPROVE\n\n<!-- gp-foundry:diff:approver:abc -->` };
+    const by = (body: string, over: Record<string, unknown> = {}) => ({ user: { login: BOT }, commit_id: "head1", body, ...over });
     const approve = fence({ body: "Ship it.\n\n**Verdict:** APPROVE" });
+    const reject = { body: "One problem.\n\n**Verdict:** REQUEST_CHANGES", comments: [], event: "COMMENT" };
 
-    // The event reviewer's review on the head does not stop the approver's verdict.
-    const approver = runPost(verdictLane(), approve, [plainReview]);
-    expect(approver.status).toBe(0);
-    expect(approver.posts).toHaveLength(1);
-    expect(approver.posts[0].body).toBe(`${heading}Ship it.\n\n**Verdict:** APPROVE`);
-    // A verdict already on the head does.
-    const again = runPost(verdictLane(), approve, [plainReview, verdictReview]);
-    expect(again.posts).toEqual([]);
-    expect(again.stdout).toContain("a verdict review headed 'PR #7 head head1'");
+    it("two lanes sharing a bot login and a heading do not silence each other", () => {
+      const reviewers = by(`${heading}Two findings, both minor.${posted("reviewer")}`);
+      const approvers = by(`${heading}Fine.\n\n**Verdict:** APPROVE${posted("approver")}`);
 
-    // And the other way round: the approver's verdict does not stop the reviewer.
-    expect(runPost(plain(), fence(REVIEW), [verdictReview]).posts).toHaveLength(1);
-    const twice = runPost(plain(), fence(REVIEW), [verdictReview, plainReview]);
-    expect(twice.posts).toEqual([]);
-    expect(twice.stdout).toContain("a non-verdict review headed");
-  });
+      // The reviewer's review on the head does not stop the approver's verdict…
+      const approver = runPost(verdictLane(), approve, [reviewers]);
+      expect(approver.posts).toHaveLength(1);
+      expect(approver.posts[0].body).toBe(`${heading}Ship it.\n\n**Verdict:** APPROVE${posted("approver")}`);
+      // …and the approver's verdict does not stop the reviewer.
+      expect(runPost(plain(), fence(REVIEW), [approvers]).posts).toHaveLength(1);
 
-  it("selects existing reviews with the shared verdict test, by the lane's mode", () => {
-    for (const step of [plain(), verdictLane()]) {
-      const read = step.run.slice(step.run.indexOf("EXISTING=$("), step.run.indexOf("| awk"));
-      expect(read).toContain(`select(${IS_VERDICT_JQ} == (env.REQUIRE_VERDICT == "true"))`);
-    }
-    expect(plain().env.REQUIRE_VERDICT).toBe("false");
-    expect(verdictLane().env.REQUIRE_VERDICT).toBe("true");
-    // Both places the script tests verdict-ness use the one expression.
-    expect(plain().run).not.toContain("__IS_VERDICT_JQ__");
-    expect(plain().run.split(IS_VERDICT_JQ)).toHaveLength(3);
+      // Each is stopped by its own.
+      const again = runPost(verdictLane(), approve, [reviewers, approvers]);
+      expect(again.posts).toEqual([]);
+      expect(again.stdout).toContain("approver has already posted its review on head1");
+      expect(runPost(plain(), fence(REVIEW), [approvers, reviewers]).posts).toEqual([]);
+    });
+
+    it("a reviewer that posts its OWN verdict does not post it twice", () => {
+      // The classic reviewer → fixer lane: not a sweep, but its review ends in a
+      // verdict line. Keyed on "is it a verdict", a re-run on the same head
+      // (labeled, ready_for_review, a workflow re-run) posted a duplicate — and
+      // every duplicate is a new review event that fires the fixer.
+      const first = runPost(plain(), fence(reject));
+      expect(first.posts).toHaveLength(1);
+      expect(first.posts[0].body).toBe(`${heading}${reject.body}${posted("reviewer")}`);
+      const rerun = runPost(plain(), fence(reject), [by(first.posts[0].body)]);
+      expect(rerun.status).toBe(0);
+      expect(rerun.posts).toEqual([]);
+    });
+
+    it("the marker binds to the head: the same lane posts again on a new one", () => {
+      const old = by(`${heading}Earlier.${posted("reviewer", "old")}`, { commit_id: "old" });
+      expect(runPost(plain(), fence(REVIEW), [old]).posts).toHaveLength(1);
+      // A marker for another head quoted into a review on this one is not this head's.
+      const quoted = by(`Something else entirely.${posted("reviewer", "old")}`);
+      expect(runPost(plain(), fence(REVIEW), [quoted]).posts).toHaveLength(1);
+    });
+
+    it("only the bot's own marker counts", () => {
+      const forged = by(`${heading}x${posted("reviewer")}`, { user: { login: "mallory" } });
+      expect(runPost(plain(), fence(REVIEW), [forged]).posts).toHaveLength(1);
+    });
+
+    describe("reviews posted before the marker existed", () => {
+      const legacyPlain = by(`${heading}Two findings, both minor.`);
+      const legacyVerdict = by(`${heading}Fine.\n\n**Verdict:** APPROVE\n\n<!-- gp-foundry:diff:approver:abc -->`);
+      const legacyReject = by(`${heading}One problem.\n\n**Verdict:** REQUEST_CHANGES`);
+
+      it("a verdict lane is stopped by an unmarked verdict under its heading, not by a plain review", () => {
+        expect(runPost(verdictLane(), approve, [legacyPlain]).posts).toHaveLength(1);
+        expect(runPost(verdictLane(), approve, [legacyPlain, legacyVerdict]).posts).toEqual([]);
+      });
+
+      it("a plain lane is stopped by any unmarked review under its heading, verdict or not", () => {
+        expect(runPost(plain(), fence(REVIEW), [legacyPlain]).posts).toEqual([]);
+        expect(runPost(plain(), fence(reject), [legacyReject]).posts).toEqual([]);
+      });
+
+      it("the fallback never applies to a review another lane has marked as its own", () => {
+        // Same heading, but it is the approver's: the reviewer still posts.
+        const approvers = by(`${heading}Fine.\n\n**Verdict:** APPROVE${posted("approver")}`);
+        expect(runPost(plain(), fence(reject), [approvers]).posts).toHaveLength(1);
+      });
+    });
+
+    it("compiles the lane's id and the marker prefix into the step", () => {
+      expect(plain().env.NODE).toBe("reviewer");
+      expect(verdictLane().env.NODE).toBe("approver");
+      expect(plain().env.POSTED_PREFIX).toBe("<!-- gp-foundry:posted:");
+      expect(plain().env.REQUIRE_VERDICT).toBe("false");
+      expect(verdictLane().env.REQUIRE_VERDICT).toBe("true");
+      // Both places the script tests verdict-ness use the one shared expression.
+      expect(plain().run).not.toContain("__IS_VERDICT_JQ__");
+      expect(plain().run.split(IS_VERDICT_JQ)).toHaveLength(3);
+    });
   });
 
   it("on a 422 for an inline comment, retries once with the findings in the body", () => {
@@ -280,7 +332,7 @@ describe("the post script, run against a stub gh", () => {
     expect(r.status).toBe(0);
     expect(r.posts).toHaveLength(2);
     expect(r.posts[1].comments).toEqual([]);
-    expect(r.posts[1].body).toBe(`PR #7 head head1\n\n${REVIEW.body}\n\n### Findings on unchanged lines\n\n- \`src/a.ts:4\` — Leaks the handle.`);
+    expect(r.posts[1].body).toBe(`PR #7 head head1\n\n${REVIEW.body}\n\n### Findings on unchanged lines\n\n- \`src/a.ts:4\` — Leaks the handle.${posted("reviewer")}`);
     expect(r.stdout).toContain("posting the findings in the body instead");
   });
 
@@ -288,7 +340,8 @@ describe("the post script, run against a stub gh", () => {
     const review = { ...REVIEW, body: "Fine.\n\n**Verdict:** APPROVE" };
     const r = runPost(verdictLane(), fence(review), [], { STUB_422_IF_COMMENTS: "1" });
     expect(r.posts).toHaveLength(2);
-    expect(r.posts[1].body.endsWith("\n\n**Verdict:** APPROVE")).toBe(true);
+    // Last VISIBLE line: only the hidden posted marker follows it.
+    expect(r.posts[1].body.endsWith(`\n\n**Verdict:** APPROVE${posted("approver")}`)).toBe(true);
     expect(r.posts[1].body).toContain("### Findings on unchanged lines");
   });
 
