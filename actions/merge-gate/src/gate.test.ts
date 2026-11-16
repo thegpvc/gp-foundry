@@ -24,7 +24,8 @@ import {
   filterEvaluateCandidates,
   isOpenThread,
   latestHeadVerdictIsEscalation,
-  awaitingApproverOnly,
+  awaitingApprover,
+  failingClauses,
   type ReviewThreadFact,
 } from "./gate.js";
 
@@ -1008,25 +1009,94 @@ describe("evaluate-mode check conclusion", () => {
   });
 });
 
+describe("failingClauses", () => {
+  it("is empty when the gate would merge", () => {
+    expect(failingClauses(readyPr(), policy, NOW)).toEqual([]);
+  });
+  it("lists every failing clause in gate order, not just the first", () => {
+    const pr = readyPr({
+      approvedAt: null,
+      ciStatus: "pending",
+      requestedReviewers: ["alice"],
+      files: [{ path: "src/big.ts", additions: 1400 }],
+    });
+    const codes = failingClauses(pr, { ...policy, requireNoReviewRequests: true }, NOW).map((d) => d.code);
+    expect(codes).toEqual(["not-approved", "ci-not-passing", "review-requested", "too-large"]);
+    // evaluateMergeGate still returns only the first.
+    expect(evaluateMergeGate(pr, { ...policy, requireNoReviewRequests: true }, NOW).code).toBe("not-approved");
+  });
+  it("does not report an approval delay for a missing approval", () => {
+    expect(failingClauses(readyPr({ approvedAt: null }), policy, NOW).map((d) => d.code)).toEqual(["not-approved"]);
+    expect(failingClauses(readyPr({ approvedAt: minsAgo(5) }), policy, NOW).map((d) => d.code)).toEqual(["approval-delay"]);
+  });
+  it("agrees with evaluateMergeGate on the first failing clause", () => {
+    const cases: Partial<PullRequestFacts>[] = [
+      { labels: ["needs-human"], approvedAt: null },
+      { headRefName: "feature/x", ciStatus: "failing" },
+      { approvedAt: "not a date" },
+      { ciStatus: "failing", cleanRebase: false },
+      { files: [{ path: "db/migrations/1.sql", additions: 1 }], cleanRebase: null },
+      { cleanRebase: false },
+    ];
+    for (const c of cases) {
+      const pr = readyPr(c);
+      expect(failingClauses(pr, policy, NOW)[0]).toEqual(evaluateMergeGate(pr, policy, NOW));
+    }
+  });
+});
+
 describe("no_verdict_conclusion: neutral", () => {
   const waiting = readyPr({ approvedAt: null });
-  const neutral = (pr: PullRequestFacts, p: MergePolicy = policy) => {
-    const d = evaluateMergeGate(pr, p, NOW);
-    return checkConclusion(d, pr, { awaitingApprover: awaitingApproverOnly(pr, d, p, NOW) });
+  const p: MergePolicy = { ...policy, requireNoOpenThreads: true, requireNoReviewRequests: true };
+  const neutral = (pr: PullRequestFacts, pol: MergePolicy = p) => {
+    const d = evaluateMergeGate(pr, pol, NOW);
+    return checkConclusion(d, pr, { awaitingApprover: awaitingApprover(pr, pol, NOW) !== undefined });
   };
-  it("is neutral when the missing approval is the only failing clause", () => {
+  const thread: ReviewThreadFact = { isResolved: false, comments: [{ author: "alice", body: "This leaks." }] };
+
+  it("is neutral with nothing else failing", () => {
+    expect(awaitingApprover(waiting, p, NOW)).toEqual([]);
     expect(neutral(waiting)).toBe("neutral");
     // Also with an approval delay: a missing approval is not "approved too recently".
-    expect(neutral(waiting, { ...policy, approvalDelayMinutes: 600 })).toBe("neutral");
+    expect(neutral(waiting, { ...p, approvalDelayMinutes: 600 })).toBe("neutral");
   });
-  it("is failure when anything else fails too, or the reviewer rejected the head", () => {
-    expect(neutral(readyPr({ approvedAt: null, ciStatus: "failing" }))).toBe("failure");
-    expect(neutral(readyPr({ approvedAt: null, files: [{ path: "db/migrations/1.sql", additions: 1 }] }))).toBe("failure");
+  it("is neutral while CI runs, naming the CI clause", () => {
+    const pr = readyPr({ approvedAt: null, ciStatus: "pending" });
+    expect(neutral(pr)).toBe("neutral");
+    expect(awaitingApprover(pr, p, NOW)?.map((d) => d.code)).toEqual(["ci-not-passing"]);
+  });
+  it("is neutral with an open thread, carrying the thread count", () => {
+    const pr = readyPr({ approvedAt: null, reviewThreads: [thread, thread] });
+    expect(neutral(pr)).toBe("neutral");
+    expect(awaitingApprover(pr, p, NOW)).toEqual([expect.objectContaining({ code: "open-threads", detail: { openThreads: 2 } })]);
+  });
+  it("lists every other failing clause", () => {
+    const pr = readyPr({
+      approvedAt: null,
+      ciStatus: "failing",
+      reviewThreads: [thread],
+      requestedReviewers: ["team:core"],
+      files: [{ path: "db/migrations/1.sql", additions: 1400 }],
+    });
+    expect(neutral(pr)).toBe("neutral");
+    expect(awaitingApprover(pr, p, NOW)?.map((d) => d.code)).toEqual([
+      "ci-not-passing", "review-requested", "open-threads", "too-large", "protected-path",
+    ]);
+  });
+  it("is failure when the reviewer rejected the head, whatever else holds", () => {
     expect(neutral(readyPr({ approvedAt: null, headVerdict: "reject" }))).toBe("failure");
+    expect(awaitingApprover(readyPr({ approvedAt: null, headVerdict: "reject" }), p, NOW)).toBeUndefined();
+  });
+  it("is failure for an approved head with another clause failing", () => {
+    const pr = readyPr({ headVerdict: "approve", ciStatus: "failing" });
+    const d = evaluateMergeGate(pr, p, NOW);
+    expect(d.code).toBe("ci-not-passing");
+    expect(neutral(pr)).toBe("failure");
   });
   it("leaves success and escalation alone", () => {
-    expect(neutral(readyPr())).toBe("success");
+    expect(neutral(readyPr({ headVerdict: "approve" }))).toBe("success");
     expect(neutral(readyPr({ approvedAt: null, escalated: true, headVerdict: "escalate" }))).toBe("action_required");
+    expect(neutral(readyPr({ approvedAt: null, ciStatus: "pending", escalated: true, headVerdict: "escalate" }))).toBe("action_required");
   });
   it("is off unless asked for", () => {
     const d = evaluateMergeGate(waiting, policy, NOW);

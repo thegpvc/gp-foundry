@@ -24,7 +24,7 @@ import {
   evaluateMergeGate,
   filterCandidateNumbers,
   filterEvaluateCandidates,
-  awaitingApproverOnly,
+  awaitingApprover,
   latestHeadVerdict,
   openThreads,
   filterCountableVerdicts,
@@ -421,14 +421,55 @@ export interface CheckOutput {
 
 const CHECK_TEXT_LIMIT = 60000; // GitHub caps output.text at 65535 characters
 
+/** Check runs on the head that are not (yet) green, minus the ignored ones. */
+function checksNotPassing(facts: PullRequestFacts, ignore: Set<string>): CheckRunFact[] {
+  return (facts.checkRuns ?? []).filter(
+    (c) => !ignore.has(c.name) && !(c.status === "completed" && ["success", "skipped", "neutral"].includes(c.conclusion ?? "")),
+  );
+}
+
+/**
+ * The neutral summary: the approver's verdict is missing, plus every other clause
+ * that fails on the head, so the author sees what else they will need. A failing
+ * CI clause is told as counts of running and failed checks.
+ */
+function awaitingSummary(alsoFailing: MergeDecision[], facts: PullRequestFacts, ignore: Set<string>): string {
+  if (alsoFailing.length === 0) {
+    return "awaiting the approver — every other clause of the merge policy passes on this head.";
+  }
+  const describe = (d: MergeDecision): string => {
+    if (d.code === "ci-not-passing") {
+      const notPassing = checksNotPassing(facts, ignore);
+      const running = notPassing.filter((c) => c.status !== "completed").length;
+      const failed = notPassing.length - running;
+      const parts = [
+        running ? `${running} check run${running === 1 ? "" : "s"} still running` : "",
+        failed ? `${failed} check run${failed === 1 ? "" : "s"} not successful` : "",
+      ].filter(Boolean);
+      if (parts.length) return `CI: ${parts.join(", ")}`;
+    }
+    if (d.code === "open-threads" && d.detail?.openThreads) {
+      const n = d.detail.openThreads;
+      return `${n} unanswered review thread${n === 1 ? "" : "s"}`;
+    }
+    return d.reason;
+  };
+  return [
+    "awaiting the approver — the approver has not given a verdict on this head yet. Also failing:",
+    "",
+    ...alsoFailing.map((d) => `- \`${d.code}\` — ${describe(d)}`),
+  ].join("\n");
+}
+
 /**
  * The check run for one head. Deterministic for an unchanged state — no clock in
  * it — so the next tick can tell nothing changed and skip the write. (The
  * ready-to-merge reason carries "approved Nm ago", so success gets fixed text.)
  */
 export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
-  const awaitingApprover = policy.noVerdictConclusion === "neutral" && awaitingApproverOnly(facts, decision, policy);
-  const conclusion = checkConclusion(decision, facts, { awaitingApprover });
+  const alsoFailing = policy.noVerdictConclusion === "neutral" ? awaitingApprover(facts, policy) : undefined;
+  const conclusion = checkConclusion(decision, facts, { awaitingApprover: alsoFailing !== undefined });
+  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
@@ -444,7 +485,7 @@ export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFac
     conclusion === "action_required"
       ? `The reviewer escalated this head to a human.\n\nGate: ${gateLine}`
       : conclusion === "neutral"
-        ? "awaiting the approver — every other clause of the merge policy passes on this head."
+        ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;
 
   const sections: string[] = [];
@@ -460,10 +501,7 @@ export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFac
       }),
     );
   }
-  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
-  const failing = (facts.checkRuns ?? []).filter(
-    (c) => !ignore.has(c.name) && !(c.status === "completed" && ["success", "skipped", "neutral"].includes(c.conclusion ?? "")),
-  );
+  const failing = checksNotPassing(facts, ignore);
   if (failing.length) {
     sections.push("### Checks not passing", ...failing.map((c) => `- \`${c.name}\`: ${c.status === "completed" ? c.conclusion : c.status ?? "pending"}`));
   }

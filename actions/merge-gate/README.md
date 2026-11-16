@@ -109,8 +109,8 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | --- | --- |
 | `success` | the gate's decision is `merge` |
 | `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`) |
-| `neutral` | `noVerdictConclusion: neutral` and the head has no verdict yet, with the missing approval as its only failing clause ("awaiting the approver") |
-| `failure` | anything else; `output.summary` carries the gate's `code` and `reason` |
+| `neutral` | `noVerdictConclusion: neutral` and the trusted approver has given no verdict (approve, reject or escalate) on the head yet ("Awaiting the approver"), whatever else fails; `output.summary` lists every other clause still failing (CI counts, unanswered threads, review requests, size, protected paths) |
+| `failure` | anything else (a rejected head, an approved head with a clause failing, or any unverdicted head without `noVerdictConclusion: neutral`); `output.summary` carries the gate's first failing `code` and `reason` |
 
 `output.text` lists the open threads, the checks not passing and the pending
 review requests. The run is written with `checks-token` (GITHUB_TOKEN) and is
