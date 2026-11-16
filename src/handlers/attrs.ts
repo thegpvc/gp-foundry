@@ -21,7 +21,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "gates", "skip", "select", "authors", "max_attempts", "agent_attempts",
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
-  "title", "harness_ref", "persist_credentials", "repo_guides",
+  "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -214,10 +214,52 @@ export function authorsOf(node: HarnessNode, cfg: FoundryConfig): string[] | und
 }
 export const NO_AUTHOR = "no author matches a malformed allowlist";
 
-/** `github.event.pull_request.user.login == 'a' || … ` — GitHub compares strings case-insensitively. */
-export function authorClause(authors: string[]): string {
+/**
+ * `github.event.pull_request.user.login == 'a' || … ` — GitHub compares strings
+ * case-insensitively. With an opt-in label, a PR carrying that label passes too.
+ */
+export function authorClause(authors: string[], optInLabel?: string): string {
   const terms = authors.map((a) => `github.event.pull_request.user.login == '${a}'`);
-  return terms.length === 1 ? terms[0]! : `(${terms.join(" || ")})`;
+  const clause = terms.length === 1 ? terms[0]! : `(${terms.join(" || ")})`;
+  if (optInLabel === undefined) return clause;
+  return `(${clause} || contains(github.event.pull_request.labels.*.name, ${exprString(optInLabel)}))`;
+}
+
+/** A string literal for a GitHub expression: single-quoted, `'` doubled. */
+export function exprString(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+// ── opt_in_label= ────────────────────────────────────────────────────────────
+
+/**
+ * `opt_in_label="<key>"` widens an author allowlist: the lane also runs on a PR
+ * that carries this label, whoever opened it. The key resolves through
+ * config.labels like `skip="label:<key>"` (identity when unmapped). Returns the
+ * resolved label, undefined when absent; throws on a malformed value.
+ */
+export function parseOptInLabel(node: HarnessNode, cfg: FoundryConfig): string | undefined {
+  const raw = node.attrs.opt_in_label;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new Error(`node '${node.id}': opt_in_label= must be a label key like "agent_review"`);
+  }
+  const key = raw.trim();
+  return cfg.labels?.[key] ?? key;
+}
+
+/**
+ * parseOptInLabel for emitters: only where an allowlist is in force (the label
+ * widens one; without it the lane already runs for everyone). A malformed value
+ * is validate()'s to report and compiles to no widening — the allowlist alone.
+ */
+export function optInLabelOf(node: HarnessNode, cfg: FoundryConfig): string | undefined {
+  if (authorsOf(node, cfg) === undefined) return undefined;
+  try {
+    return parseOptInLabel(node, cfg);
+  } catch {
+    return undefined;
+  }
 }
 
 // ── context / select= / checkout= ────────────────────────────────────────────

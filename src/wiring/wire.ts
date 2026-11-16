@@ -8,7 +8,16 @@
  */
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
-import { authorClause, authorsOf, hasSkipGuard, parseConfigAuthors, skipOf, NO_AUTHOR } from "../handlers/attrs.js";
+import {
+  authorClause,
+  authorsOf,
+  exprString,
+  hasSkipGuard,
+  optInLabelOf,
+  parseConfigAuthors,
+  skipOf,
+  NO_AUTHOR,
+} from "../handlers/attrs.js";
 import { detectDiamonds } from "./diamond.js";
 
 const AGENT = new Set(AGENT_TYPES);
@@ -206,8 +215,9 @@ function applyAuthors(
   guard: string | undefined,
   events: Set<string>,
   authors: string[] | undefined,
+  optInLabel?: string,
 ): string | undefined {
-  return andForPrEvents(guard, events, authors ? authorClause(authors) : undefined);
+  return andForPrEvents(guard, events, authors ? authorClause(authors, optInLabel) : undefined);
 }
 
 function andForPrEvents(
@@ -309,6 +319,8 @@ export function wire(ir: Harness): WiringPlan {
     const unguardedEvents = new Set<string>();
     const allEvents = new Set<string>();
     const dispatches: { toNode: string; when?: string }[] = [];
+    const optIn = optInLabelOf(node, ir.config);
+    let gateLabelEvents = false;
 
     // scheduled nodes (e.g. merge-gate) are driven by cron + manual dispatch only
     if (node.attrs.schedule !== undefined) {
@@ -335,6 +347,22 @@ export function wire(ir: Harness): WiringPlan {
         allEvents.add("pull_request.ready_for_review");
         unguardedEvents.add("pull_request.ready_for_review");
       }
+      // opt_in_label= lets a PR outside the allowlist in by its label, so the
+      // lane must hear the label being added — but only THAT label: any other
+      // label event is turned away by the action clause ANDed on below.
+      if (optIn && triggers.pull_request && hasSkipGuard(node, ir.config)) {
+        if (!allEvents.has("pull_request.labeled")) {
+          mergeEvent(triggers, "pull_request.labeled", node);
+          allEvents.add("pull_request.labeled");
+          unguardedEvents.add("pull_request.labeled");
+          gateLabelEvents = true;
+        } else if (!unguardedEvents.has("pull_request.labeled")) {
+          // An edge already listens for labels behind its own guard (`label=x`);
+          // an action clause would block that label, so admit the opt-in one
+          // beside it instead. (An unguarded labeled edge already admits it.)
+          guards.add(`(${eventClause("pull_request.labeled")} && github.event.label.name == ${exprString(optIn)})`);
+        }
+      }
       // Mixed guarded + unguarded edges: the unguarded events must still pass the
       // job-level `if`, so they contribute an event-discriminator OR-clause.
       if (guards.size && unguardedEvents.size) {
@@ -349,11 +377,19 @@ export function wire(ir: Harness): WiringPlan {
       }
     }
 
-    const guard = applyAuthors(
+    let guard = applyAuthors(
       applyBranchPrefix(guards.size ? [...guards].join(" || ") : undefined, allEvents, ir.config),
       allEvents,
       authorsOf(node, ir.config),
+      optIn,
     );
+    if (gateLabelEvents && optIn) {
+      guard = andForPrEvents(
+        guard,
+        allEvents,
+        `(github.event.action != 'labeled' || github.event.label.name == ${exprString(optIn)})`,
+      );
+    }
     const nw: NodeWiring = {
       nodeId: node.id,
       triggers,

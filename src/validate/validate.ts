@@ -12,6 +12,7 @@ import {
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
   hasPrContext,
+  parseOptInLabel,
   nearestAttr,
   parseAuthors,
   parseConfigAuthors,
@@ -119,6 +120,43 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
             message: (e as Error).message,
             where: { node: n.id, line: n.line },
             hint: `comma-separated GitHub logins, e.g. authors="dpup, octocat"`,
+          });
+        }
+      }
+    }
+    if (n.attrs.opt_in_label !== undefined) {
+      if (!takesAuthors(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.opt-in-label-unsupported",
+          message: `opt_in_label= on '${n.id}' is not supported here — it widens the allowlist of a standalone pr-review / pr-fix node, or an analyst with context="pr-diff" or "pr-review"`,
+          where: { node: n.id, line: n.line },
+        });
+      } else {
+        try {
+          parseOptInLabel(n, ir.config);
+        } catch (e) {
+          diags.push({
+            level: "error",
+            code: "node.bad-opt-in-label",
+            message: (e as Error).message,
+            where: { node: n.id, line: n.line },
+            hint: `a key into labels: in foundry.config.yaml (or a literal label), e.g. opt_in_label="agent_review"`,
+          });
+        }
+        let allowlist: string[] | undefined;
+        try {
+          allowlist = parseAuthors(n, ir.config);
+        } catch {
+          allowlist = []; // malformed: already reported above (or as config.bad-authors)
+        }
+        if (allowlist === undefined) {
+          diags.push({
+            level: "error",
+            code: "node.opt-in-without-authors",
+            message: `opt_in_label= on '${n.id}' has no allowlist to widen — the lane already runs for every author`,
+            where: { node: n.id, line: n.line },
+            hint: "opt_in_label= widens an allowlist; set authors= or repo.authors, or drop the label to run for everyone",
           });
         }
       }
