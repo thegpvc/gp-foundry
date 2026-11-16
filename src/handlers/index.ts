@@ -13,7 +13,22 @@ import type {
   WorkflowJobFragment,
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
-import { diffMarkerPrefix, gatesOf, hasSkipGuard, isSweep, preJobId, skipOf, sweepJobNamePrefix } from "./attrs.js";
+import { parseVerdictWords } from "../shared/verdicts.js";
+import { postReviewStep, reviewOutputContract } from "./post-review.js";
+import {
+  authorsOf,
+  diffMarkerPrefix,
+  gatesOf,
+  hasSkipGuard,
+  isEvaluateGate,
+  isSweep,
+  postsReview,
+  optInLabelOf,
+  parseEvaluateCheckName,
+  preJobId,
+  skipOf,
+  sweepJobNamePrefix,
+} from "./attrs.js";
 import {
   analystPersistsCredentials,
   appTokenStep,
@@ -214,13 +229,17 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // A gate-less analyst defaults to 25 so the step cap below leaves the agent 15
   // minutes; the old 15-minute job default would have capped it at 5.
   const jobTimeout = timeoutOf(node, gates.length ? 15 + 15 * gates.length : 25);
-  const agent = runAgentStep(ctx, { withContext: true });
+  // post="review": the agent prints its review and the step below posts it.
+  const posts = postsReview(node);
+  const agent = runAgentStep(ctx, { withContext: true, ...(posts ? { outputContract: reviewOutputContract(ctx, sweep) } : {}) });
   // Without gates, the same job − margin step cap as every other agent lane, so an
   // overrun fails its step instead of the job cap cancelling the run mid-turn (a
   // cancelled planner left no plan and no failure to notice). With gates the waits
   // spend an unknown share of the job budget, so a fixed step cap could starve the
   // review; that case stays on the job cap alone.
   steps.push(gates.length ? agent : { ...agent, timeoutMinutes: agentStepTimeout(jobTimeout) });
+  // A sweep lane's review is its verdict, so the post step holds it to the verdict grammar.
+  if (posts) steps.push(postReviewStep(ctx, { prNumber, headSha: prHeadSha, verdictLane: sweep }));
 
   const fragment: WorkflowJobFragment = {
     jobId: node.id,
@@ -268,14 +287,20 @@ function diffStampStep(ctx: EmitContext, guardJob: string): StepSpec {
       DIFF_HASH: `\${{ needs.${guardJob}.outputs.diff_hash }}`,
       BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
       MARKER_PREFIX: diffMarkerPrefix(ctx.node),
+      STARTED_AT: `\${{ needs.${guardJob}.outputs.started_at }}`,
     },
     run: [
       `# Best-effort: a missing stamp only means the next event is reviewed again.`,
+      `# Only a review THIS run posted (submitted after the guard ran): another lane`,
+      `# posting as the same bot — an approver's verdict on this head — is not this`,
+      `# lane's review, and stamping it would make the guard compare against, and`,
+      `# mark, someone else's review.`,
       `ID=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
       `  .[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)`,
+      `  | select((.submitted_at // "") >= env.STARTED_AT)`,
       `  | select((.body // "") | contains(env.MARKER_PREFIX) | not) | .id' 2>/dev/null | tail -n 1) || ID=""`,
       `if [ -z "$ID" ]; then`,
-      `  echo "no unstamped review by $BOT_LOGIN on $HEAD_SHA — nothing to stamp"`,
+      `  echo "no unstamped review by $BOT_LOGIN on $HEAD_SHA posted since $STARTED_AT — nothing to stamp"`,
       `  exit 0`,
       `fi`,
       `BODY=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$ID" --jq '.body // ""') || exit 0`,
@@ -520,10 +545,24 @@ export function humanGateRequiredCheck(node: HarnessNode): string {
   return `${humanGateCheckName(node)}@${HUMAN_GATE_CHECK_APP}`;
 }
 
+/**
+ * The configured verdict words for the merge gate's `verdicts` input, so the
+ * gate's approval / rejection / escalation markers come from the same list the
+ * sweep reads. Omitted at the defaults (and when malformed: validate reports it).
+ */
+function verdictsInput(ctx: EmitContext): string | undefined {
+  if (ctx.config.verdicts === undefined) return undefined;
+  try {
+    const w = parseVerdictWords(ctx.config.verdicts);
+    return [w.approve, w.requestChanges, w.escalate].join(",");
+  } catch {
+    return undefined;
+  }
+}
+
 // ── merge-gate: policy decision (no agent) ──
 function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
-  const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
   // A human-gate feeding this gate is a PRECONDITION, not a suggestion: require
   // its approval check on the exact head SHA. Before this, the human-gate job ran
   // on its own and the merge gate never looked at it — approval blocked a merge
@@ -535,6 +574,8 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   // `<name>@<app>` — the check must also have been WRITTEN by the app the
   // human-gate publishes as, or a name is all an impostor needs.
   const requiredChecks = humanGates.map(humanGateRequiredCheck);
+  if (isEvaluateGate(node)) return emitEvaluateGate(ctx, requiredChecks);
+  const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
   steps.push({
     uses: ctx.actionRef("merge-gate"),
     name: "Evaluate merge gate",
@@ -550,6 +591,7 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
       "base-branch": ctx.config.repo.base_branch,
       "branch-prefix": ctx.config.repo.branch_prefix,
       ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
       ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
     },
   });
@@ -560,6 +602,66 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
     permissions: { contents: "write", "pull-requests": "write", issues: "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
+  };
+}
+
+/**
+ * mode="evaluate": the same policy, evaluated every tick for every open PR in
+ * scope, published as one check run per head — never a merge, never a label.
+ * Gate state (CI, open threads, review requests) changes without a push, so a
+ * verdict posted once per head goes stale; this check is re-derived each tick
+ * at no model cost, and can be made a required check.
+ *
+ * Everything runs on GITHUB_TOKEN: it is the token the Checks API accepts for a
+ * write, and the one a job's `permissions:` block bounds, so this job can read
+ * the PRs and write checks but cannot push or merge. No harness token, no App
+ * token, no git identity: nothing here commits.
+ */
+function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJobFragment {
+  const node = ctx.node;
+  const checkout = checkoutStep(ctx, { persistCredentials: false });
+  checkout.with = { ...checkout.with, token: "${{ github.token }}" };
+  let checkName: string;
+  try {
+    checkName = parseEvaluateCheckName(node);
+  } catch {
+    checkName = `gp-foundry/approval (${node.id})`; // malformed: validate() reports it
+  }
+  // PR selection beyond branch prefix + not-draft: the same author allowlist,
+  // opt-in label and skip= exclusions a PR lane honours.
+  const authors = authorsOf(node, ctx.config);
+  const optIn = optInLabelOf(node, ctx.config);
+  const conds = skipOf(node);
+  const skipLabels = conds.flatMap((c) => (c.kind === "label" ? [ctx.config.labels?.[c.label] ?? c.label] : []));
+  const skipBots = conds.some((c) => c.kind === "bot-author");
+  return {
+    jobId: node.id,
+    name: node.id,
+    permissions: { contents: "read", "pull-requests": "read", checks: "write" },
+    timeoutMinutes: timeoutOf(node, 10),
+    steps: [
+      checkout,
+      {
+        uses: ctx.actionRef("merge-gate"),
+        name: "Evaluate merge gate (publish check, never merge)",
+        with: {
+          mode: "evaluate",
+          "check-name": checkName,
+          token: "${{ github.token }}",
+          "checks-token": "${{ github.token }}",
+          "policy-path": resolveFile(ctx, node.files.policy),
+          "base-branch": ctx.config.repo.base_branch,
+          "branch-prefix": ctx.config.repo.branch_prefix,
+          ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+          ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
+          ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
+          ...(authors ? { authors: authors.join(",") } : {}),
+          ...(authors && optIn ? { "opt-in-label": optIn } : {}),
+          ...(skipLabels.length ? { "skip-labels": skipLabels.join(",") } : {}),
+          ...(skipBots ? { "skip-bot-authors": "true" } : {}),
+        },
+      },
+    ],
   };
 }
 

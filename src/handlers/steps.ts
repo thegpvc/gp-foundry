@@ -235,7 +235,7 @@ export function contextStep(
   };
 }
 
-export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): UsesStep {
+export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean; outputContract?: string }): UsesStep {
   const node = ctx.node;
   const cfg = ctx.config;
   const withBlock: Record<string, string> = {
@@ -254,7 +254,10 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
   // withheld HERE, not dropped inside run-agent: a variable unset in a shell is
   // still readable from that shell's /proc environ. The cost is that giving a
   // role `gh` later needs a rebuild — `build --check` flags the drift.
-  if (roleCanUseGh(ctx.roleTools?.(node.id))) withBlock["github-token"] = tokenExpr(ctx);
+  // post="review" (outputContract set): a workflow step posts what the agent
+  // prints, so the agent gets no token whatever its role's tools say.
+  if (!opts.outputContract && roleCanUseGh(ctx.roleTools?.(node.id))) withBlock["github-token"] = tokenExpr(ctx);
+  if (opts.outputContract) withBlock["output-contract"] = opts.outputContract;
   // repo_guides=false: keep the repo's CLAUDE.md / AGENTS.md out of every turn.
   if (node.attrs.repo_guides === false) withBlock["repo-guides"] = "false";
   if (opts.withContext) withBlock["context-file"] = "${{ steps.ctx.outputs.context-file }}";
@@ -291,7 +294,12 @@ export function runAgentStep(ctx: EmitContext, opts: { withContext: boolean }): 
   if (agentAttempts !== undefined) withBlock["max-attempts"] = String(agentAttempts);
   const override = node.files.prompt;
   if (override) withBlock["prompt-override-file"] = resolveFile(ctx, override);
-  return { uses: ctx.actionRef("run-agent"), name: "Run agent", with: withBlock };
+  return {
+    uses: ctx.actionRef("run-agent"),
+    ...(opts.outputContract ? { id: "agent" } : {}),
+    name: "Run agent",
+    with: withBlock,
+  };
 }
 
 /** A guard-safe run step: env holds any untrusted event values, read as "$VAR". */

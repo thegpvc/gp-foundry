@@ -20,6 +20,12 @@ import {
   type PullRequestFacts,
   type MergePolicy,
   type VerdictEvent,
+  checkConclusion,
+  filterEvaluateCandidates,
+  isOpenThread,
+  latestHeadVerdictIsEscalation,
+  awaitingApproverOnly,
+  type ReviewThreadFact,
 } from "./gate.js";
 
 describe("normalizePolicyKeys (snake_case policy support)", () => {
@@ -878,5 +884,185 @@ describe("latestAttemptPerCheck (range-labs/mono#12952)", () => {
   it("leaves distinct checks alone", () => {
     const out = latestAttemptPerCheck([run(1, "a", "success"), run(2, "b", "failure")]);
     expect(out.map((c) => c.name).sort()).toEqual(["a", "b"]);
+  });
+});
+
+// ── evaluate-mode clauses ────────────────────────────────────────────────────
+
+describe("require_no_open_threads", () => {
+  const AUTHOR = "fletch-bot[bot]";
+  const threadPolicy: MergePolicy = {
+    ...policy,
+    requireNoOpenThreads: true,
+    botLogins: ["greptile-apps[bot]", "cursor[bot]"],
+  };
+  const thread = (over: Partial<ReviewThreadFact> = {}): ReviewThreadFact => ({
+    isResolved: false,
+    path: "src/a.ts",
+    line: 3,
+    comments: [{ author: "alice", body: "This leaks the handle." }],
+    ...over,
+  });
+  const pr = (threads: ReviewThreadFact[]) => readyPr({ authorLogin: AUTHOR, reviewThreads: threads });
+
+  it("blocks on an unresolved thread a human opened", () => {
+    const d = evaluateMergeGate(pr([thread()]), threadPolicy, NOW);
+    expect(d.code).toBe("open-threads");
+    expect(d.action).toBe("skip");
+    expect(d.detail?.openThreads).toBe(1);
+  });
+  it("ignores a resolved thread", () => {
+    expect(evaluateMergeGate(pr([thread({ isResolved: true })]), threadPolicy, NOW).code).toBe("ready-to-merge");
+  });
+  it("ignores a thread the author replied in (GraphQL login without [bot])", () => {
+    const t = thread({ comments: [{ author: "alice", body: "Leak." }, { author: "fletch-bot", body: "Fixed in abc." }] });
+    expect(evaluateMergeGate(pr([t]), threadPolicy, NOW).code).toBe("ready-to-merge");
+  });
+  it("ignores a thread whose first comment the author reacted to", () => {
+    const t = thread({ firstCommentReactions: [{ content: "THUMBS_UP", user: "fletch-bot" }] });
+    expect(evaluateMergeGate(pr([t]), threadPolicy, NOW).code).toBe("ready-to-merge");
+  });
+  it("still blocks when only someone else replied or reacted", () => {
+    const t = thread({
+      comments: [{ author: "alice", body: "Leak." }, { author: "bob", body: "+1" }],
+      firstCommentReactions: [{ content: "THUMBS_UP", user: "bob" }],
+    });
+    expect(isOpenThread(t, AUTHOR, threadPolicy)).toBe(true);
+  });
+  it("never blocks on a thread the author opened", () => {
+    expect(isOpenThread(thread({ comments: [{ author: AUTHOR, body: "note to self" }] }), AUTHOR, threadPolicy)).toBe(false);
+  });
+  it("ignores a review bot's P2 thread", () => {
+    const t = thread({ comments: [{ author: "greptile-apps", body: "**P2** Consider renaming." }] });
+    expect(evaluateMergeGate(pr([t]), threadPolicy, NOW).code).toBe("ready-to-merge");
+  });
+  it("blocks on a review bot's P1 thread", () => {
+    const t = thread({ comments: [{ author: "greptile-apps[bot]", body: "**P1** Null deref on the error path." }] });
+    expect(evaluateMergeGate(pr([t]), threadPolicy, NOW).code).toBe("open-threads");
+  });
+  it("blocks on a Cursor High Severity thread, honouring a custom regex", () => {
+    const t = thread({ comments: [{ author: "cursor[bot]", body: "### Bug\n**High Severity**" }] });
+    expect(isOpenThread(t, AUTHOR, threadPolicy)).toBe(true);
+    expect(isOpenThread(t, AUTHOR, { ...threadPolicy, botThreadBlockingRegex: "Critical" })).toBe(false);
+  });
+  it("is off by default", () => {
+    expect(evaluateMergeGate(pr([thread()]), policy, NOW).code).toBe("ready-to-merge");
+  });
+});
+
+describe("require_no_review_requests", () => {
+  it("blocks while a reviewer or team is still requested", () => {
+    const d = evaluateMergeGate(readyPr({ requestedReviewers: ["alice", "team:core"] }), { ...policy, requireNoReviewRequests: true }, NOW);
+    expect(d.code).toBe("review-requested");
+    expect(d.reason).toContain("team:core");
+    expect(d.detail?.requestedReviewers).toEqual(["alice", "team:core"]);
+  });
+  it("passes with no pending requests", () => {
+    expect(evaluateMergeGate(readyPr({ requestedReviewers: [] }), { ...policy, requireNoReviewRequests: true }, NOW).code).toBe("ready-to-merge");
+  });
+  it("is off by default", () => {
+    expect(evaluateMergeGate(readyPr({ requestedReviewers: ["alice"] }), policy, NOW).code).toBe("ready-to-merge");
+  });
+});
+
+describe("evaluate-mode check conclusion", () => {
+  const markers = {
+    approval: /\*\*Verdict:\*\* APPROVE$/,
+    rejection: /\*\*Verdict:\*\* REQUEST_CHANGES$/,
+    escalation: /\*\*Verdict:\*\* ESCALATE$/,
+  };
+  const trust = { botLogin: "fletch-bot[bot]" };
+  const review = (at: string, body: string, over: Record<string, unknown> = {}) => ({
+    at, sha: "head", author: "fletch-bot[bot]", authorAssociation: "NONE", body, ...over,
+  });
+
+  it("maps merge to success and anything else to failure", () => {
+    expect(checkConclusion(evaluateMergeGate(readyPr(), policy, NOW), {})).toBe("success");
+    expect(checkConclusion(evaluateMergeGate(readyPr({ ciStatus: "failing" }), policy, NOW), {})).toBe("failure");
+  });
+  it("maps an escalation to action_required, even over a would-merge decision", () => {
+    expect(checkConclusion(evaluateMergeGate(readyPr({ approvedAt: null }), policy, NOW), { escalated: true })).toBe("action_required");
+    expect(checkConclusion(evaluateMergeGate(readyPr(), policy, NOW), { escalated: true })).toBe("action_required");
+  });
+  it("reads the bot's latest verdict on the head, trailing newline and all", () => {
+    expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "Needs a human.\n\n**Verdict:** ESCALATE\n")], "head", trust, markers)).toBe(true);
+    // A later approval on the same head supersedes the escalation.
+    expect(
+      latestHeadVerdictIsEscalation(
+        [review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE"), review("2026-01-01T01:00:00Z", "**Verdict:** APPROVE")],
+        "head", trust, markers,
+      ),
+    ).toBe(false);
+    // A non-verdict review after the escalation does not hide it.
+    expect(
+      latestHeadVerdictIsEscalation(
+        [review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE"), review("2026-01-01T01:00:00Z", "a note")],
+        "head", trust, markers,
+      ),
+    ).toBe(true);
+  });
+  it("ignores escalations on another head, from untrusted authors, or not on the last line", () => {
+    expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE", { sha: "old" })], "head", trust, markers)).toBe(false);
+    expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "**Verdict:** ESCALATE", { author: "mallory", authorAssociation: "NONE" })], "head", trust, markers)).toBe(false);
+    expect(latestHeadVerdictIsEscalation([review("2026-01-01T00:00:00Z", "quoting `**Verdict:** ESCALATE` here\nbut no")], "head", trust, markers)).toBe(false);
+  });
+});
+
+describe("no_verdict_conclusion: neutral", () => {
+  const waiting = readyPr({ approvedAt: null });
+  const neutral = (pr: PullRequestFacts, p: MergePolicy = policy) => {
+    const d = evaluateMergeGate(pr, p, NOW);
+    return checkConclusion(d, pr, { awaitingApprover: awaitingApproverOnly(pr, d, p, NOW) });
+  };
+  it("is neutral when the missing approval is the only failing clause", () => {
+    expect(neutral(waiting)).toBe("neutral");
+    // Also with an approval delay: a missing approval is not "approved too recently".
+    expect(neutral(waiting, { ...policy, approvalDelayMinutes: 600 })).toBe("neutral");
+  });
+  it("is failure when anything else fails too, or the reviewer rejected the head", () => {
+    expect(neutral(readyPr({ approvedAt: null, ciStatus: "failing" }))).toBe("failure");
+    expect(neutral(readyPr({ approvedAt: null, files: [{ path: "db/migrations/1.sql", additions: 1 }] }))).toBe("failure");
+    expect(neutral(readyPr({ approvedAt: null, headVerdict: "reject" }))).toBe("failure");
+  });
+  it("leaves success and escalation alone", () => {
+    expect(neutral(readyPr())).toBe("success");
+    expect(neutral(readyPr({ approvedAt: null, escalated: true, headVerdict: "escalate" }))).toBe("action_required");
+  });
+  it("is off unless asked for", () => {
+    const d = evaluateMergeGate(waiting, policy, NOW);
+    expect(checkConclusion(d, waiting)).toBe("failure");
+  });
+});
+
+describe("trusted_author_associations: [] — only the bot's verdicts count", () => {
+  const trust = { botLogin: "fletch-bot[bot]", trustedAuthorAssociations: [] as string[] };
+  const approve = (author: string, authorAssociation: string): VerdictEvent => ({ at: "2026-01-01T00:00:00Z", kind: "approve", sha: "head", author, authorAssociation, source: "review" });
+  it("drops an OWNER's approval and keeps the bot's", () => {
+    expect(isCountableVerdict(approve("dpup", "OWNER"), trust)).toBe(false);
+    expect(isCountableVerdict(approve("Fletch-Bot[bot]", "NONE"), trust)).toBe(true);
+    expect(latestValidApproval(filterCountableVerdicts([approve("dpup", "OWNER")], trust), "head")).toBeNull();
+    expect(latestValidApproval(filterCountableVerdicts([approve("fletch-bot[bot]", "NONE")], trust), "head")).not.toBeNull();
+  });
+  it("drops every non-bot approval when no bot login is set either", () => {
+    expect(isCountableVerdict(approve("dpup", "OWNER"), { trustedAuthorAssociations: [] })).toBe(false);
+  });
+  it("still counts rejections from anyone (they can only hold a merge back)", () => {
+    expect(isCountableVerdict({ ...approve("dpup", "OWNER"), kind: "reject" }, trust)).toBe(true);
+  });
+});
+
+describe("filterEvaluateCandidates", () => {
+  const pr = (number: number, over: Record<string, unknown> = {}) => ({
+    number, headRefName: "agent/x", draft: false, authorLogin: "fletch-bot[bot]", authorType: "Bot", labels: [] as string[], ...over,
+  });
+  it("keeps open, non-draft PRs on the prefix", () => {
+    expect(filterEvaluateCandidates([pr(1), pr(2, { draft: true }), pr(3, { headRefName: "feature/y" })], "agent/", false)).toEqual([1]);
+  });
+  it("applies authors, the opt-in label, skip labels and bot authors", () => {
+    const prs = [pr(1), pr(2, { authorLogin: "Alice", authorType: "User" }), pr(3, { authorLogin: "eve", authorType: "User", labels: ["agent-review"] }), pr(4, { authorLogin: "eve", authorType: "User" })];
+    expect(filterEvaluateCandidates(prs, "agent/", false, { authors: ["alice"], optInLabel: "agent-review" })).toEqual([2, 3]);
+    expect(filterEvaluateCandidates(prs, "agent/", false, { skipLabels: ["agent-review"] })).toEqual([1, 2, 4]);
+    const bots = [pr(1), pr(2, { authorLogin: "renovate[bot]" })];
+    expect(filterEvaluateCandidates(bots, "agent/", false, { skipBotAuthors: true, botLogin: "fletch-bot[bot]" })).toEqual([1]);
   });
 });

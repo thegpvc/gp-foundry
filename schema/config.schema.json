@@ -117,6 +117,14 @@
       "description": "semantic role -> repo label (the drift-killer).",
       "additionalProperties": { "type": "string" }
     },
+    "verdicts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$" },
+      "description": "The verdict words, in order: approve, request changes, escalate (default [APPROVE, REQUEST_CHANGES, ESCALATE]). A verdict is a review whose last non-empty line, trimmed, is exactly `**Verdict:** <word>`; the sweep, the mark job and the merge gate all read this one list."
+    },
     "markers": {
       "type": "object",
       "description": "parseable markers shared by prompts + guards + enforcers.",
