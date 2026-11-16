@@ -72,6 +72,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ "$method" != "GET" ]; then
+  [ -z "\${STUB_FAIL_WRITES:-}" ] || { echo "stub gh: HTTP 502" >&2; exit 1; }
   printf '%s %s\\n%s\\n' "$method" "$path" "$field" >> "$FIXTURES/writes.log"
   exit 0
 fi
@@ -431,8 +432,14 @@ describe("skip= compiles to a guard job", () => {
       "repos/o/r/compare/base1...head1": diff,
       "repos/o/r/pulls/7/reviews": reviews,
     });
-    const run = (fx: Record<string, unknown>, action = "synchronize") =>
-      runStepScript(step(), fx, { PR: "7", EVENT_ACTION: action });
+    const run = (fx: Record<string, unknown>, action = "synchronize", env: Record<string, string> = {}) =>
+      runStepScript(step(), fx, { PR: "7", EVENT_ACTION: action, ...env });
+    // The guard reads a covering review by id before it marks it.
+    const withById = (fx: Record<string, unknown>) => {
+      const out = { ...fx };
+      for (const r of (fx["repos/o/r/pulls/7/reviews"] as any[]) ?? []) if (r.id !== undefined) out[`repos/o/r/pulls/7/reviews/${r.id}`] = r;
+      return out;
+    };
 
     it("runs a plain PR and reports the diff hash", () => {
       const r = run(fixtures(pr()));
@@ -464,11 +471,13 @@ describe("skip= compiles to a guard job", () => {
 
     it("skips when the bot's last stamped review covers the same diff", () => {
       const hash = run(fixtures(pr())).outputs.diff_hash!;
+      let id = 0;
       const stamped = (h: string, login = BOT) => ({
+        id: ++id,
         user: { login },
         body: `Looks fine.\n\n**Verdict:** APPROVE\n\n<!-- gp-foundry:diff:reviewer:${h} -->`,
       });
-      const same = run(fixtures(pr(), [stamped("0".repeat(64)), stamped(hash)]));
+      const same = run(withById(fixtures(pr(), [stamped("0".repeat(64)), stamped(hash)])));
       expect(same.outputs.run).toBe("false");
       expect(same.outputs.reason).toContain("unchanged");
 
@@ -503,10 +512,44 @@ describe("skip= compiles to a guard job", () => {
       expect(changed.writes).toBe("");
     });
 
+    it("skips only once the covering review is marked — a failed read or edit runs the lane", () => {
+      const hash = run(fixtures(pr())).outputs.diff_hash!;
+      const body = `Looks fine.\n\n<!-- gp-foundry:diff:reviewer:${hash} -->`;
+      const listed = fixtures(pr(), [{ id: 41, user: { login: BOT }, body }]);
+
+      // The review cannot be read: no marker, so no skip.
+      const unread = run(listed);
+      expect(unread.status).toBe(0);
+      expect(unread.outputs.run).toBe("true");
+      expect(unread.outputs.diff_hash).toBe(hash);
+      expect(unread.stdout).toContain("::notice::the diff is unchanged since review 41, but it could not be marked as covering head1");
+
+      // The edit fails: no marker, so no skip.
+      const failed = run({ ...listed, "repos/o/r/pulls/7/reviews/41": { body } }, "synchronize", { STUB_FAIL_WRITES: "1" });
+      expect(failed.status).toBe(0);
+      expect(failed.outputs.run).toBe("true");
+      expect(failed.stdout).toContain("running the lane again");
+
+      // Already marked for this head: nothing to write, so a failing write path still skips.
+      const marked = `${body}\n<!-- gp-foundry:also-head:reviewer:head1 -->`;
+      const already = run({ ...fixtures(pr(), [{ id: 41, user: { login: BOT }, body: marked }]), "repos/o/r/pulls/7/reviews/41": { body: marked } }, "synchronize", { STUB_FAIL_WRITES: "1" });
+      expect(already.outputs.run).toBe("false");
+    });
+
+    it("calls skip for an unchanged diff only on the marked path", () => {
+      const script: string = step().run;
+      const guard = script.slice(script.indexOf('MARK="$ALSO_HEAD_PREFIX'), script.indexOf("could not hash the diff"));
+      expect(guard).not.toContain("best-effort");
+      expect(guard.match(/skip "/g)).toHaveLength(1);
+      expect(guard).toMatch(/if \[ -n "\$MARKED" \]; then\n\s+skip "the diff is unchanged since the last review"\n\s+fi/);
+      expect(guard).toContain("*\"$MARK\"*) MARKED=1 ;;");
+      expect(guard).toMatch(/gh api --method PUT [^\n]*\\\n[^\n]*>\/dev\/null; then MARKED=1; fi/);
+    });
+
     it("only ever skips a push on unchanged-diff — an explicit ask is still reviewed", () => {
       const hash = run(fixtures(pr())).outputs.diff_hash!;
-      const stamped = { user: { login: BOT }, body: `<!-- gp-foundry:diff:reviewer:${hash} -->` };
-      expect(run(fixtures(pr(), [stamped]), "synchronize").outputs.run).toBe("false");
+      const stamped = { id: 9, user: { login: BOT }, body: `<!-- gp-foundry:diff:reviewer:${hash} -->` };
+      expect(run(withById(fixtures(pr(), [stamped])), "synchronize").outputs.run).toBe("false");
       for (const action of ["labeled", "ready_for_review", "opened"]) {
         const r = run(fixtures(pr(), [stamped]), action);
         expect(r.outputs.run, action).toBe("true");
