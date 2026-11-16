@@ -6,6 +6,7 @@
  * it and fall back to "attribute absent" so assemble stays non-throwing.
  */
 import type { FoundryConfig, HarnessNode } from "../ir/types.js";
+import { parseVerdictWords, verdictLinesEnv } from "../shared/verdicts.js";
 
 // ── the attribute vocabulary ─────────────────────────────────────────────────
 
@@ -22,6 +23,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
+  "mode", "check_name", "requires_review", "post", "post_marker",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -173,9 +175,16 @@ function normalizeAuthors(list: unknown[], where: string): string[] {
   return out;
 }
 
-/** The node types an author allowlist can bind: lanes handed one pull request. */
+/**
+ * The node types an author allowlist can bind: lanes handed one pull request,
+ * and an evaluate-mode merge gate, which picks the PRs it publishes a check on.
+ */
 export function takesAuthors(node: HarnessNode): boolean {
-  return node.type === "pr-fix" || ((node.type === "pr-review" || node.type === "analyst") && hasPrContext(node));
+  return (
+    node.type === "pr-fix" ||
+    ((node.type === "pr-review" || node.type === "analyst") && hasPrContext(node)) ||
+    isEvaluateGate(node)
+  );
 }
 
 /**
@@ -262,6 +271,43 @@ export function optInLabelOf(node: HarnessNode, cfg: FoundryConfig): string | un
   }
 }
 
+// ── merge-gate mode= / check_name= ───────────────────────────────────────────
+
+export type MergeGateMode = "merge" | "evaluate";
+
+/**
+ * `mode="merge"` (the default) merges or labels; `mode="evaluate"` never does
+ * either — it publishes the gate's result as a check run on each PR head.
+ * Throws on any other value.
+ */
+export function parseMergeGateMode(node: HarnessNode): MergeGateMode {
+  const raw = node.attrs.mode;
+  if (raw === undefined) return "merge";
+  if (raw === "merge" || raw === "evaluate") return raw;
+  throw new Error(`node '${node.id}': mode= must be "merge" or "evaluate", got ${JSON.stringify(raw)}`);
+}
+
+/** A merge-gate node with `mode="evaluate"`. A malformed mode is validate()'s to report and reads as merge. */
+export function isEvaluateGate(node: HarnessNode): boolean {
+  if (node.type !== "merge-gate") return false;
+  try {
+    return parseMergeGateMode(node) === "evaluate";
+  } catch {
+    return false;
+  }
+}
+
+/** The check run an evaluate gate publishes: `check_name=`, else `gp-foundry/approval (<node>)`. Throws on a malformed value. */
+export function parseEvaluateCheckName(node: HarnessNode): string {
+  const raw = node.attrs.check_name;
+  if (raw === undefined) return `gp-foundry/approval (${node.id})`;
+  // Passed to the action as an input and compared against check-run names, so one line of printable text.
+  if (typeof raw !== "string" || !raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new Error(`node '${node.id}': check_name= must be a non-empty, single-line check-run name like "fletch/approval"`);
+  }
+  return raw.trim();
+}
+
 // ── context / select= / checkout= ────────────────────────────────────────────
 
 /** A node whose job is handed a pull request (the context an analyst emits for). */
@@ -282,6 +328,44 @@ export function isSweep(node: HarnessNode): boolean {
     hasPrContext(node) &&
     node.attrs.schedule !== undefined
   );
+}
+
+/**
+ * `requires_review=true` on a sweep: a head is a candidate only once a review by
+ * the bot covers it (on the head, or marked `also-head` for it) — for a lane that
+ * acts on an upstream review, so it does not spend a run on heads still waiting.
+ */
+export function sweepRequiresReview(node: HarnessNode): boolean {
+  return isSweep(node) && node.attrs.requires_review === true;
+}
+
+/** The also-head marker for any node, as a regex prefix: a sweep does not know which lane wrote it. */
+export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
+
+// ── post="review" ────────────────────────────────────────────────────────────
+
+/**
+ * `post="review"` on a pr-review / PR-context analyst: the agent PRINTS its review
+ * as a fenced json block and a compiled step posts it with the lane's token. The
+ * agent gets no GitHub token and needs no `gh` — a shell under dontAsk denies the
+ * quoting a real review body needs, and an agent reading untrusted PR text should
+ * not hold a token anyway. True only for a node it applies to.
+ */
+export function postsReview(node: HarnessNode): boolean {
+  return node.attrs.post === "review" && (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);
+}
+
+/** Default heading the post step puts on line 1 of the review: placeholders `<n>` and `<sha>`. */
+export const DEFAULT_POST_MARKER = "PR #<n> head <sha>";
+
+/** `post_marker="…"`, else the default. Throws on a malformed value. */
+export function parsePostMarker(node: HarnessNode): string {
+  const raw = node.attrs.post_marker;
+  if (raw === undefined) return DEFAULT_POST_MARKER;
+  if (typeof raw !== "string" || !raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new Error(`node '${node.id}': post_marker= must be a non-empty single line, e.g. "PR #<n> head <sha>"`);
+  }
+  return raw.trim();
 }
 
 /**
@@ -313,6 +397,15 @@ export function sweepFailedCheckName(node: HarnessNode): string {
 }
 
 /**
+ * The check-run a sweep publishes for each run on a head that SUCCEEDED but
+ * left no verdict there. A lane cannot fail its job on purpose, so "nothing to
+ * decide yet" looks like success; it is retried, but not without limit.
+ */
+export function sweepIdleCheckName(node: HarnessNode): string {
+  return `gp-foundry/sweep-idle (${node.id})`;
+}
+
+/**
  * The check-run a sweep publishes on a head once its lane has run there — the
  * sweep's own record of "done", independent of anything the agent posts.
  */
@@ -329,5 +422,41 @@ export function diffMarkerPrefix(node: HarnessNode): string {
   return `<!-- gp-foundry:diff:${node.id}:`;
 }
 
-/** The marker every verdict review carries; a sweep reads it as "decided". */
-export const VERDICT_MARKER = "**Verdict:**";
+/**
+ * `<!-- gp-foundry:also-head:<node>:` — the prefix of the marker appended to a
+ * review, one per head, when the guard skips a push whose diff that review
+ * already covers: the review stands for the new head too. A downstream sweep
+ * (`requires_review=true`) reads it as "reviewed" for that head.
+ */
+export function alsoHeadMarkerPrefix(node: HarnessNode): string {
+  return `<!-- gp-foundry:also-head:${node.id}:`;
+}
+
+/**
+ * jq predicate over one review: is it a verdict? A verdict is a review whose LAST
+ * VISIBLE line — HTML comments removed (the harness's own stamps), lines trimmed,
+ * blanks dropped — is exactly one of the verdict lines (src/shared/verdicts.ts)
+ * — a substring match would let a lane posting as the same bot decide a head just by
+ * quoting the marker, and a prefix match would accept `**Verdict:** APPROVE (once
+ * gates pass)`, which the merge gate never reads as an approval. Shared by the
+ * sweep's select and mark jobs and by every step that edits a review (the diff
+ * stamp, the also-head marker). Reads
+ * `env.VERDICT_LINES` (newline-separated; see verdictLinesOf).
+ */
+export const IS_VERDICT_JQ =
+  `(((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
+  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line` +
+  ` | env.VERDICT_LINES | split("\\n") | any(.[]; . == $line))`;
+
+/**
+ * The exact verdict lines for `env.VERDICT_LINES`, from `verdicts:` in
+ * foundry.config.yaml. A malformed list is validate()'s to report and compiles
+ * to the defaults.
+ */
+export function verdictLinesOf(cfg: FoundryConfig): string {
+  try {
+    return verdictLinesEnv(parseVerdictWords(cfg.verdicts));
+  } catch {
+    return verdictLinesEnv(parseVerdictWords(undefined));
+  }
+}

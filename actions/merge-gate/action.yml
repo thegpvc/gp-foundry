@@ -63,6 +63,44 @@ inputs:
       unset, the action infers it from the PR's mergeable state.
     required: false
     default: ""
+  verdicts:
+    description: >
+      The verdict words, comma-separated, in order: approve, request changes,
+      escalate (default "APPROVE,REQUEST_CHANGES,ESCALATE"). A review is a verdict
+      when its last non-empty line, trimmed, is exactly "**Verdict:** <word>"; the
+      approval, rejection and escalation markers default to those lines. The
+      compiler passes foundry.config.yaml's `verdicts:` here.
+    required: false
+    default: ""
+  mode:
+    description: >
+      "merge" (default): merge the first qualifying PR, or label/skip. "evaluate":
+      never merge or label — evaluate every open PR in scope and publish the
+      result as one check run per head (named by check-name), updated in place
+      each run and left alone when nothing changed. Evaluate mode needs only
+      `checks: write`, `pull-requests: read` and `contents: read` on the token.
+    required: false
+    default: "merge"
+  check-name:
+    description: "Evaluate mode: the check run to publish on each head (required in that mode)."
+    required: false
+    default: ""
+  authors:
+    description: "Evaluate mode: only PRs by these comma-separated logins (or carrying opt-in-label)."
+    required: false
+    default: ""
+  opt-in-label:
+    description: "Evaluate mode: with authors, a PR carrying this label is in scope whoever opened it."
+    required: false
+    default: ""
+  skip-labels:
+    description: "Evaluate mode: comma-separated labels; a PR carrying any is not evaluated."
+    required: false
+    default: ""
+  skip-bot-authors:
+    description: "Evaluate mode: 'true' leaves out PRs opened by a bot other than bot-login."
+    required: false
+    default: "false"
   dry-run:
     description: "When 'true', evaluate and emit outputs but perform no mutation."
     required: false
@@ -81,6 +119,10 @@ outputs:
     description: "'true' if a PR was merged by this run, else 'false'."
   merged-pr:
     description: "The PR number that was merged, if any."
+  evaluated:
+    description: "Evaluate mode: how many PRs were evaluated."
+  checks-written:
+    description: "Evaluate mode: how many check runs were created or updated (unchanged ones are not written)."
 
 runs:
   using: "node24"

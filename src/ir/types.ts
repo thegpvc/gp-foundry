@@ -144,6 +144,12 @@ export interface FoundryConfig {
   labels: Record<string, string>;
   /** parseable markers shared by prompts + guards + enforcers. */
   markers?: Record<string, string>;
+  /**
+   * The verdict words, in order: approve, request changes, escalate (default
+   * APPROVE, REQUEST_CHANGES, ESCALATE). A verdict is a review whose last line is
+   * exactly `**Verdict:** <word>` — see src/shared/verdicts.ts.
+   */
+  verdicts?: string[];
   size?: { warn_additions?: number; hard_additions?: number; exclude_globs?: string[] };
   /** How generated workflows reference the runtime-core actions. */
   runtime?: { mode?: "pinned" | "vendored"; ref?: string; owner_repo?: string };

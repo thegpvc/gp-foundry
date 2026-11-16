@@ -7,9 +7,12 @@
 # Only consider PRs whose head branch starts with this prefix.
 branch_prefix: "agent/"
 
-# Approval — the Reviewer posts its verdict in a review BODY; count a body matching
-# this regex as approval (a bot can't formally APPROVE its own PR).
-approval_body_regex: "Verdict.*APPROVE"
+# Approval — the Reviewer posts its verdict in a review BODY (a bot can't formally
+# APPROVE its own PR). A body is a verdict when its LAST non-empty line, trimmed, is
+# exactly `**Verdict:** APPROVE` / `REQUEST_CHANGES` / `ESCALATE` — the words come from
+# `verdicts:` in foundry.config.yaml, and the sweep reads the same grammar, so leave the
+# markers unset. Setting a regex here overrides that marker and can drift from the sweep.
+# approval_body_regex: '(?:^|\n)[ \t]*\*\*Verdict:\*\* APPROVE[ \t]*$'
 # WHO may approve. An approval is an instruction to push to the base branch, so the
 # gate only counts verdicts it can attribute: the reviewer bot itself (bot_login —
 # the compiler passes identity.bot_login for you), or a review from someone with
@@ -24,10 +27,12 @@ allow_comment_approvals: false
 # An entry may pin the author as "<name>@<app-slug>": a check-run's name is public,
 # so anything that can write checks could otherwise publish its own "approval".
 required_checks: []
-# A matching body INVALIDATES earlier approvals (latest verdict wins). Keep it anchored
-# to the verdict line — a bare substring would misread approvals that mention the
-# earlier requested changes in prose.
-rejection_body_regex: "Verdict.*REQUEST_CHANGES"
+# A rejection verdict INVALIDATES earlier approvals (latest verdict wins). The default,
+# derived from the request-changes word in `verdicts:`, is deliberately looser than the
+# approval marker: a rejection the gate fails to recognize leaves an earlier approval
+# standing, so it matches the marker anywhere on a line. It cannot misread an approval
+# that mentions the earlier request in prose — the approval marker is tested first.
+# rejection_body_regex: "Verdict.*REQUEST_CHANGES"
 approval_delay_minutes: 0        # cool-off after approval before auto-merge (0 = none)
 
 # CI — require the check rollup to be passing; optionally ignore named checks.
@@ -66,3 +71,29 @@ blocking_labels:
 labels:
   needs_human: needs-human       # too-large / protected-path
   rebase_needed: needs-rebase    # proactive rebase label (used if require_clean_rebase: true)
+
+# ── Evaluate-mode clauses (all off by default) ─────────────────────────────────
+# Useful with a merge-gate node carrying mode="evaluate", which publishes this
+# policy's result as a check run on every head each tick instead of merging. They
+# apply in merge mode too when set.
+#
+# Fail (`open-threads`) while a review thread is open: unresolved, the PR author has
+# not replied in it or reacted to its first comment, and it was not opened by the
+# author. A thread opened by one of bot_logins blocks only when its first comment
+# matches bot_thread_blocking_regex (a bot's P2 nit never blocks).
+# require_no_open_threads: true
+# bot_logins: ["greptile-apps[bot]", "cursor[bot]"]
+# bot_thread_blocking_regex: "P1|High Severity"
+#
+# What the check says for a head with no verdict yet whose ONLY failing clause is the
+# missing approval: failure (default) or neutral ("awaiting the approver"), which keeps a
+# red X off every PR between its review and the approver's verdict.
+# no_verdict_conclusion: neutral
+#
+# Fail (`review-requested`) while a reviewer or team is still requested.
+# require_no_review_requests: true
+#
+# The trusted reviewer's latest verdict on the head being an escalation turns the check
+# `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`
+# line; this key only overrides it.
+# escalation_body_regex: '(?:^|\n)[ \t]*\*\*Verdict:\*\* ESCALATE[ \t]*$'
