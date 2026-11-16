@@ -13,7 +13,7 @@ import { parseRoleFrontmatter } from "../roles/role.js";
 import { validate } from "../validate/validate.js";
 import { modelCheck } from "../modelcheck/check.js";
 import { renderDiagram } from "../diagram/render.js";
-import { staleGeneratedWorkflows, emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
+import { specFileReader, staleGeneratedWorkflows, emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
 import { registerOpsCommands } from "./ops.js";
 
 const program = new Command();
@@ -136,7 +136,7 @@ program
     const out = resolve(opts.out ?? root);
     const specDir = relative(out, base).replace(/\\/g, "/");
     const fileExists = (rel: string) => existsSync(join(base, rel));
-    const { files, diagnostics } = compile(harness, { fileExists }, { specDir });
+    const { files, diagnostics } = compile(harness, { fileExists, readFile: specFileReader(base) }, { specDir });
     if (!opts.json) printDiagnostics(diagnostics);
 
     // Generated workflows the graph no longer produces still run on GitHub.

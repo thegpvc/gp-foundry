@@ -4,12 +4,22 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fetchContext } from "./fetchers.js";
-import { formatContext, type ContextType, type SanitizeStats } from "./formatters.js";
+import {
+  formatContext,
+  TRUSTED_FRAMINGS,
+  type ContextType,
+  type SanitizeStats,
+  type TrustedFraming,
+} from "./formatters.js";
 
 const VALID_TYPES: ContextType[] = ["issue", "pr-diff", "pr-review", "pr-full"];
 
 function isContextType(value: string): value is ContextType {
   return (VALID_TYPES as string[]).includes(value);
+}
+
+function isTrustedFraming(value: string): value is TrustedFraming {
+  return (TRUSTED_FRAMINGS as string[]).includes(value);
 }
 
 async function run(): Promise<void> {
@@ -33,8 +43,22 @@ async function run(): Promise<void> {
     // caller can confirm the comparison base, and is available for downstream
     // steps. The diff itself is always relative to the PR's own base ref.
     const baseBranch = core.getInput("base-branch");
+    // Validated before any API call: a typo here would otherwise fall back to
+    // the default framing silently, and the framing decides whether the agent
+    // obeys the bot's earlier post or merely compares against it.
+    const trustedFraming = core.getInput("trusted-framing") || "work-item";
+    if (!isTrustedFraming(trustedFraming)) {
+      throw new Error(
+        `Invalid trusted-framing "${trustedFraming}". Must be one of: ${TRUSTED_FRAMINGS.join(", ")}`
+      );
+    }
 
     const octokit = github.getOctokit(token);
+    // Check runs are read with their own token: the Checks permission has no
+    // fine-grained-PAT equivalent, so the harness token cannot see them and the
+    // caller passes GITHUB_TOKEN here instead. Empty means "no checks section".
+    const checksToken = core.getInput("checks-token");
+    const checksOctokit = checksToken ? github.getOctokit(checksToken) : undefined;
     const { owner, repo } = github.context.repo;
 
     const data = await fetchContext(octokit, {
@@ -43,7 +67,18 @@ async function run(): Promise<void> {
       number,
       type,
       includeDiff,
+      checksOctokit,
     });
+    // Best-effort fetches that degraded. The context file says so in its own
+    // words; the detail (API error text) belongs in the log, not the prompt.
+    for (const warning of data.fetchWarnings ?? []) {
+      core.warning(`agent-context: ${warning}`);
+    }
+    if (data.diffTooLarge) {
+      core.warning(
+        "agent-context: the diff was too large for the GitHub API; the context carries a truncated per-file fallback.",
+      );
+    }
     // Untrusted prose is fenced and neutralized before it can reach the prompt.
     // Opt-out exists for a consumer that sanitizes in its own way; there is no
     // reason to use it otherwise — run-agent appends this file verbatim.
@@ -60,6 +95,7 @@ async function run(): Promise<void> {
       triggeringComment,
       sanitize: sanitizeInput,
       trustedAuthors,
+      trustedFraming,
       stats,
     });
     if (!sanitizeInput) {

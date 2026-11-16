@@ -68,3 +68,15 @@ export function resolvePaths(opts: { dot?: string; config?: string }): ResolvedP
   const root = base.endsWith(".github") ? dirname(base) : base;
   return { dot, config, base, root };
 }
+
+/** A reader for spec-relative files (roles), for compile()'s `readFile` dependency. */
+export function specFileReader(base: string): (rel: string) => string | undefined {
+  return (rel) => {
+    const p = join(base, rel);
+    try {
+      return existsSync(p) ? readFileSync(p, "utf8") : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+}

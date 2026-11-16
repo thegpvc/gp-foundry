@@ -34,6 +34,14 @@ inputs:
     description: git user.email to configure. Skipped when empty.
     required: false
     default: ""
+  claude-code-version:
+    description: >-
+      Version of @anthropic-ai/claude-code to install (an exact version such as
+      "2.1.325", or a dist-tag). Empty installs the latest release — convenient,
+      but a new CLI release then changes every lane's behaviour unannounced;
+      pin it to make agent runs reproducible.
+    required: false
+    default: ""
   claude-code-oauth-token:
     description: Claude Code OAuth token. Validated (must be non-empty) when provided.
     required: false
@@ -55,9 +63,13 @@ runs:
 
     - name: Install Claude Code
       shell: bash
+      env:
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
       run: |
         set -euo pipefail
-        npm install -g @anthropic-ai/claude-code
+        # Pinned when asked: an unpinned install picks up every CLI release the
+        # moment it ships, on every lane at once.
+        npm install -g "@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@${CLAUDE_CODE_VERSION}}"
         # npm can exit 0 having silently dropped the platform-native binary — the
         # optionalDependencies flake (npm/cli#4828), or a runner with ignore-scripts
         # set so the postinstall that fetches it never runs. The lane then dies at

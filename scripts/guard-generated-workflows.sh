@@ -4,7 +4,9 @@
 # regex below are not misparsed as workflow expressions by actionlint.
 #
 #   1. `uses: ./` is forbidden EXCEPT the sanctioned ./.github/agent-setup consumer
-#      composite (the toolchain escape hatch, intentionally local to the consumer).
+#      composite (the toolchain escape hatch, intentionally local to the consumer) —
+#      either at the repo root or in a PR lane's base-ref copy of the harness files
+#      (./.gp-foundry/harness/.github/agent-setup).
 #   2. `${{ github.event.* }}` inside a run: block is forbidden — untrusted event
 #      data must flow through env + sanitize-untrusted-input (script-injection class).
 set -uo pipefail
@@ -23,7 +25,7 @@ EVENT_EXPR='\$\{\{[[:space:]]*github\.event\.'
 # (1) local action paths
 bad_local=$(grep -REn --include='*.yml' --include='*.yaml' \
      '^[[:space:]]*uses:[[:space:]]*\./' "${gen[@]}" \
-     | grep -v 'uses:[[:space:]]*\./\.github/agent-setup' || true)
+     | grep -vE 'uses:[[:space:]]*\./(\.gp-foundry/harness/)?\.github/agent-setup' || true)
 if [ -n "$bad_local" ]; then
   echo "$bad_local"
   echo "::error::Generated workflow uses a local action path ('uses: ./') other than ./.github/agent-setup. Reference the pinned runtime core by version instead."

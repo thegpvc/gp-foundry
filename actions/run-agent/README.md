@@ -41,6 +41,9 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
 | `claude-code-oauth-token` | one of   | `""`                          | OAuth token (one subscription seat); passed explicitly (composites have no `secrets`). |
 | `anthropic-api-key`       | one of   | `""`                          | Anthropic API key (usage-billed, no seat). Pass exactly one of the two credentials; both or neither fails the step. |
 | `github-token`            | no       | `""`                          | Token for the agent's own `gh`/git calls (`GH_TOKEN`/`GITHUB_TOKEN`). |
+| `repo-guides`             | no       | `true`                        | `false` excludes every `CLAUDE.md` / `AGENTS.md` under the workspace from the CLI's auto-load (`--settings` `claudeMdExcludes`). |
+| `step-summary`            | no       | `true`                        | Write the agent's final output to the job summary (truncated at 900 KB with a pointer to the log). |
+| `step-summary-heading`    | no       | `Agent output`                | Heading for that job-summary section. |
 | `comms-file`              | no       | `.github/agents/communication.md` | Team communication guide, included verbatim if it exists. |
 | `extra-args`              | no       | `""`                          | Extra args appended verbatim to the `claude` invocation. |
 | `extra-env`               | no       | `""`                          | Newline-separated `NAME=VALUE` pairs exported before the CLI runs. |
@@ -53,6 +56,12 @@ Rationale: the agent reads *who it is* and *what to do* before it reads the
   `claude -p --model <model> --allowedTools <allowed-tools> <extra-args> < <promptfile>`.
 - `stderr` is captured to a file. If non-empty, it is emitted as a single
   `::warning::` group. `stdout` streams to the job log normally.
+- Everything the agent prints is wrapped in `::stop-commands::<random token>` /
+  `::<token>::`, so a line such as `::error::…` or `::add-mask::…` in a quoted
+  diff is logged as text instead of being executed as a workflow command.
+- With no `github-token`, `GH_TOKEN`/`GITHUB_TOKEN` are removed from the agent's
+  environment (the compiler withholds the token from a role whose `tools:` cannot
+  run `gh`); a role that does list `gh` gets a warning that its calls are anonymous.
 - A nonzero exit **fails the step**, preserving the CLI's own exit code. PR lanes
   preserve partial output through guarded fallback steps. Failed direct-commit
   scheduled lanes recover output on a separate PR labeled `needs-human`; they

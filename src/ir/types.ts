@@ -257,6 +257,14 @@ export interface EmitContext {
   nodeById: (id: string) => HarnessNode | undefined;
   /** Directory of harness.dot relative to the repo root (e.g. ".github"); prefixes file paths. */
   specDir: string;
+  /**
+   * Set once a lane has checked the harness files out from the BASE ref: the
+   * workspace-relative directory that checkout lives in. Role, scope, comms and
+   * the agent-setup composite then resolve under it instead of the PR head.
+   */
+  harnessRoot?: string;
+  /** The `tools:` front-matter of a node's role, when the compiler could read it. */
+  roleTools?: (nodeId: string) => string | undefined;
 }
 
 export interface Handler {

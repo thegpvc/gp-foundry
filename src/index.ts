@@ -5,6 +5,7 @@ import { modelCheck } from "./modelcheck/check.js";
 import { wire } from "./wiring/wire.js";
 import { assemble } from "./assemble/assemble.js";
 import { renderDiagram } from "./diagram/render.js";
+import { parseRoleFrontmatter } from "./roles/role.js";
 
 export interface CompileResult {
   files: GeneratedFile[];
@@ -17,8 +18,18 @@ export function compile(
   opts: { specDir?: string } = {},
 ): CompileResult {
   const diagnostics = [...validate(ir, deps), ...modelCheck(ir)];
-  const files = assemble(ir, wire(ir), opts.specDir ?? "");
-  files.push({ path: ".github/HARNESS.md", contents: renderDiagram(ir), generated: true });
+  // A role's `tools:` front-matter, when the role can be read. Undefined means
+  // "unknown", which every consumer of it treats as "assume it needs everything".
+  const roleTools = (nodeId: string): string | undefined => {
+    const rel = ir.nodes.find((n) => n.id === nodeId)?.files.role;
+    const text = rel && deps.readFile ? deps.readFile(rel) : undefined;
+    if (text === undefined) return undefined;
+    const tools = parseRoleFrontmatter(text)?.tools;
+    return typeof tools === "string" ? tools : undefined;
+  };
+  const wiring = wire(ir);
+  const files = assemble(ir, wiring, opts.specDir ?? "", { roleTools });
+  files.push({ path: ".github/HARNESS.md", contents: renderDiagram(ir, wiring), generated: true });
   return { files, diagnostics };
 }
 

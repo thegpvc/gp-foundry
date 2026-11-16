@@ -40,6 +40,7 @@ Minimal usage (Node + Claude Code only):
 | `setup-commands` | no | `""` | Arbitrary shell run after toolchain setup (e.g. `make tools`, dependency installs). Skipped when empty. |
 | `git-name` | no | `""` | `git config user.name` value. Configured only when non-empty. |
 | `git-email` | no | `""` | `git config user.email` value. Configured only when non-empty. |
+| `claude-code-version` | no | `""` | Version (or dist-tag) of `@anthropic-ai/claude-code` to install. Empty installs the latest release; pin it for reproducible agent runs. |
 | `claude-code-oauth-token` | no | `""` | Claude Code OAuth token. When provided, the action validates that it resolves to a non-empty value and fails fast otherwise. Skipped when empty. |
 
 ## Notes

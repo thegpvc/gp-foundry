@@ -30,7 +30,9 @@ describe("auth modes", () => {
   it("app mode mints an app token and uses it", () => {
     const job = builderJob(harnessWith({ mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" }));
     const appStep = job.steps.find((s: any) => s.uses === "actions/create-github-app-token@v3");
-    expect(appStep.with["app-id"]).toBe("${{ secrets.APP_ID }}");
+    // `app-id` is deprecated by the action; `client-id` takes the same secret.
+    expect(appStep.with["client-id"]).toBe("${{ secrets.APP_ID }}");
+    expect(appStep.with["app-id"]).toBeUndefined();
     const checkout = job.steps.find((s: any) => (s.uses ?? "").startsWith("actions/checkout"));
     expect(checkout.with.token).toBe("${{ steps.app-token.outputs.token }}");
   });

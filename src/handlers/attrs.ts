@@ -21,6 +21,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "gates", "skip", "select", "authors", "max_attempts", "agent_attempts",
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
+  "title", "harness_ref", "persist_credentials", "repo_guides",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -59,13 +60,18 @@ export interface GateSpec {
   kind: "workflow" | "check";
   /** `?N` — seconds to wait for the target to APPEAR before concluding `skipped`. */
   graceSeconds?: number;
+  /** `?info` — advisory: its result is shown to the reviewer but is never, by itself, blocking. */
+  info?: boolean;
 }
 
 /**
- * `gates="ci.yml, lint / eslint, e2e (chromium)?90"`. An entry that names a
- * workflow file waits on that workflow's runs; any other entry is a check-run
- * name. A trailing `?N` is the grace, in seconds, for a target that may never
- * appear on this head (a path-filtered or conditional check).
+ * `gates="ci.yml, lint / eslint, e2e (chromium)?90, bugbot?info?30"`. An entry
+ * that names a workflow file waits on that workflow's runs; any other entry is a
+ * check-run name. Options follow the name, each introduced by `?`:
+ *   `?N`     the grace, in seconds, for a target that may never appear on this
+ *            head (a path-filtered or conditional check);
+ *   `?info`  the gate is advisory — a review bot, say — so a result other than
+ *            `success` is context for the reviewer, not a blocking finding.
  */
 export function parseGates(node: HarnessNode): GateSpec[] {
   const raw = node.attrs.gates;
@@ -75,20 +81,22 @@ export function parseGates(node: HarnessNode): GateSpec[] {
   }
   const out: GateSpec[] = [];
   for (const entry of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
-    const m = /^(.*?)(?:\?([^?]*))?$/.exec(entry)!;
-    const name = m[1]!.trim();
-    const grace = m[2];
+    const [rawName, ...options] = entry.split("?");
+    const name = rawName!.trim();
     if (!name) {
       throw new Error(`node '${node.id}': gates= entry '${entry}' names no workflow or check`);
     }
     const spec: GateSpec = { name, kind: /\.ya?ml$/i.test(name) ? "workflow" : "check" };
-    if (grace !== undefined) {
-      if (!/^[1-9]\d*$/.test(grace.trim())) {
+    for (const option of options.map((o) => o.trim())) {
+      if (option === "info") {
+        spec.info = true;
+      } else if (/^[1-9]\d*$/.test(option) && spec.graceSeconds === undefined) {
+        spec.graceSeconds = Number(option);
+      } else {
         throw new Error(
-          `node '${node.id}': gates= entry '${entry}' has a bad grace suffix — expected '?<seconds>' with a whole number >= 1, e.g. "${name}?90"`,
+          `node '${node.id}': gates= entry '${entry}' has a bad '?${option}' suffix — expected '?<seconds>' (a whole number >= 1) and/or '?info', e.g. "${name}?90" or "${name}?info"`,
         );
       }
-      spec.graceSeconds = Number(grace.trim());
     }
     out.push(spec);
   }
@@ -255,6 +263,11 @@ export function preJobId(node: HarnessNode): string {
 /** A sweep lane's matrix job is NAMED per PR, so the mark job can tell which ones succeeded. */
 export function sweepJobNamePrefix(node: HarnessNode): string {
   return `${node.id} #`;
+}
+
+/** The check-run a sweep publishes for each FAILED attempt on a head; enough of them and it stops retrying. */
+export function sweepFailedCheckName(node: HarnessNode): string {
+  return `gp-foundry/sweep-failed (${node.id})`;
 }
 
 /**

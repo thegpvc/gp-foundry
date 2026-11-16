@@ -81,6 +81,16 @@ inputs:
       (passthrough for flags like --max-turns, --add-dir, etc.).
     required: false
     default: ""
+  repo-guides:
+    description: >-
+      Whether the CLI auto-loads the repository's own CLAUDE.md / AGENTS.md files
+      into every turn. "true" (default) leaves the CLI's behaviour alone. "false"
+      excludes every CLAUDE.md and AGENTS.md under the workspace (via
+      `--settings` `claudeMdExcludes`): the role, conventions and scope are then
+      the whole of the agent's standing instructions. For a repo whose guide is
+      large, that is a real share of every turn's input.
+    required: false
+    default: "true"
   step-summary:
     description: >-
       Write the agent's final output to the job summary ($GITHUB_STEP_SUMMARY) under a
@@ -212,6 +222,7 @@ runs:
         MAX_ATTEMPTS: ${{ inputs.max-attempts }}
         RETRY_BASE_DELAY_SECONDS: ${{ inputs.retry-base-delay-seconds }}
         STEP_SUMMARY: ${{ inputs.step-summary }}
+        REPO_GUIDES: ${{ inputs.repo-guides }}
         STEP_SUMMARY_HEADING: ${{ inputs.step-summary-heading }}
       run: |
         set -uo pipefail
@@ -264,6 +275,35 @@ runs:
         if [ -z "${ALLOWED_TOOLS}" ]; then
           echo "::warning::no allowed-tools input and no tools: in role front-matter; claude will use its defaults"
         fi
+
+        # No token was passed (the compiler withholds it from a role whose tools
+        # cannot use it): drop the empty variables rather than leave them set, and
+        # say so if the role has since gained `gh` — its calls would be anonymous.
+        if [ -z "${GH_TOKEN:-}" ]; then
+          unset GH_TOKEN GITHUB_TOKEN
+          case ",${ALLOWED_TOOLS}," in
+            *"(gh:"*|*"(gh "*|*"(gh)"*) echo "::warning::run-agent: the role's tools mention gh but no github-token was passed — its gh calls will be unauthenticated. If the role gained gh recently, re-run \`gp-foundry build\`." ;;
+          esac
+        fi
+
+        # repo-guides=false: keep the repo's own CLAUDE.md / AGENTS.md out of the
+        # CLI's auto-loaded memory. The patterns are absolute, so they are built
+        # here, where the workspace path is known. Passed as its own argv entry —
+        # EXTRA_ARGS is word-split and could not carry a JSON value intact.
+        SETTINGS_ARGS=()
+        if [ "${REPO_GUIDES:-true}" = "false" ]; then
+          WS="${GITHUB_WORKSPACE:-$PWD}"
+          SETTINGS_JSON="$(printf '{"claudeMdExcludes":["%s/CLAUDE.md","%s/AGENTS.md","%s/**/CLAUDE.md","%s/**/AGENTS.md"]}' "$WS" "$WS" "$WS" "$WS")"
+          SETTINGS_ARGS=(--settings "$SETTINGS_JSON")
+          echo "::notice::run-agent: repo-guides=false — CLAUDE.md / AGENTS.md under ${WS} are not auto-loaded"
+        fi
+
+        # Everything the agent prints is DATA. A review that quotes a diff can
+        # contain a line like "::error::…" or "::add-mask::…", and the runner
+        # would execute it as a workflow command. stop-commands suspends command
+        # processing until the matching token; the token is random and never
+        # exported, so nothing the agent prints can end the suspension early.
+        stop_token() { printf 'gpf-%s' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"; }
 
         STDERR_LOG="$(mktemp)"
         STDOUT_LOG="$(mktemp)"
@@ -329,19 +369,29 @@ runs:
           # shellcheck disable=SC2086
           # The prompt goes in on stdin, not argv: Linux limits each argument to
           # 128 KiB and a large PR diff exceeds it.
+          STOP="$(stop_token)"
+          echo "::stop-commands::${STOP}"
           ( set +e
             claude -p \
               --model "$MODEL" \
               --allowedTools "$ALLOWED_TOOLS" \
+              ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
               $EXTRA_ARGS \
               < "$PROMPT_FILE" 2> "$STDERR_LOG"
             echo $? > "$EXIT_FILE" ) | tee "$STDOUT_LOG"
+          # The resume marker must start a line, whatever the output ended with.
+          echo
+          echo "::${STOP}::"
           AGENT_EXIT="$(cat "$EXIT_FILE" 2>/dev/null || echo 1)"
           [ -n "$AGENT_EXIT" ] || AGENT_EXIT=1
 
           if [ -s "$STDERR_LOG" ]; then
             echo "::warning::Claude produced stderr output:"
+            STOP="$(stop_token)"
+            echo "::stop-commands::${STOP}"
             cat "$STDERR_LOG"
+            echo
+            echo "::${STOP}::"
           fi
 
           if [ "$AGENT_EXIT" -eq 0 ]; then

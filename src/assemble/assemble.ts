@@ -54,8 +54,13 @@ function stepToObject(s: StepSpec): Record<string, unknown> {
   return o;
 }
 
+/**
+ * The workflow's `name:` — what a PR check reads as `<name> / <job>`. `title=`
+ * (or its older spelling `name=`) lets a lane present as the product it is
+ * ("Fletch / reviewer") instead of repeating the node id ("reviewer / reviewer").
+ */
 function displayName(node: HarnessNode): string {
-  return String(node.attrs.name ?? node.id);
+  return String(node.attrs.title ?? node.attrs.name ?? node.id);
 }
 
 /**
@@ -153,7 +158,12 @@ export function writesCode(ir: Harness): boolean {
   );
 }
 
-export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): GeneratedFile[] {
+export function assemble(
+  ir: Harness,
+  wiring: WiringPlan,
+  specDir = "",
+  extra: Pick<EmitContext, "roleTools"> = {},
+): GeneratedFile[] {
   const files: GeneratedFile[] = [];
   const actionRef = makeActionRef(ir.config);
   const byId = new Map(ir.nodes.map((n) => [n.id, n] as const));
@@ -176,6 +186,7 @@ export function assemble(ir: Harness, wiring: WiringPlan, specDir = ""): Generat
     actionRef,
     nodeById: (id: string) => byId.get(id),
     specDir,
+    roleTools: extra.roleTools,
   });
 
   const fragmentToJob = (fragment: WorkflowJobFragment, guard?: string): Record<string, unknown> => {

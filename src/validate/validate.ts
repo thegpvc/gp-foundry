@@ -26,6 +26,12 @@ export interface ValidateDeps {
   fileExists?: (relPath: string) => boolean;
   /** parsed role specs keyed by node id. Omit to skip the handoff cross-check. */
   roles?: Map<string, RoleSpec>;
+  /**
+   * Read a spec-relative file (a role), or undefined if it cannot be read. Lets
+   * the compiler see a role's `tools:` — which decides whether the lane's agent
+   * is handed a GitHub token. Omit and every agent is handed one.
+   */
+  readFile?: (relPath: string) => string | undefined;
 }
 
 const AGENT = new Set(AGENT_TYPES);
@@ -175,6 +181,65 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           where: { node: n.id, line: n.line },
           hint: "move agent_attempts= to the agent lane whose retry budget you meant to change",
         });
+      }
+    }
+    const emitsJob = n.type !== "start" && n.type !== "exit" && n.type !== "parallel";
+    const analystFamily = n.type === "analyst" || n.type === "issue-agent" || n.type === "pr-review" || n.type === "fan_in";
+    const prLane = n.type === "pr-fix" || ((n.type === "pr-review" || n.type === "analyst") && hasPrContext(n)) || n.type === "fan_in";
+    const bad = (code: string, message: string, hint?: string): void => {
+      diags.push({ level: "error", code, message, where: { node: n.id, line: n.line }, ...(hint ? { hint } : {}) });
+    };
+    if (n.attrs.title !== undefined) {
+      // Emitted as a workflow `name:`; a `${{` would be evaluated there.
+      if (typeof n.attrs.title !== "string" || !n.attrs.title.trim() || n.attrs.title.includes("${{")) {
+        bad("node.bad-title", `title= on '${n.id}' must be a plain, non-empty string, got ${JSON.stringify(n.attrs.title)}`);
+      } else if (!emitsJob || diamondMembers.has(n.id)) {
+        bad(
+          "node.title-unsupported",
+          `title= on '${n.id}' has no workflow to name — this node does not own one`,
+          "set it on the node that owns the workflow (for a diamond, the fan_in)",
+        );
+      }
+    }
+    if (n.attrs.harness_ref !== undefined) {
+      if (n.attrs.harness_ref !== "base" && n.attrs.harness_ref !== "head") {
+        bad("node.bad-harness-ref", `harness_ref= on '${n.id}' must be "base" or "head", got ${JSON.stringify(n.attrs.harness_ref)}`);
+      } else if (!prLane) {
+        bad(
+          "node.harness-ref-unsupported",
+          `harness_ref= on '${n.id}' does not apply — only a lane handed a pull request chooses between the base ref's harness files and the PR head's`,
+        );
+      } else if (n.attrs.harness_ref === "head") {
+        diags.push({
+          level: "warning",
+          code: "node.harness-from-head",
+          message: `harness_ref="head" on '${n.id}': its role, scope and setup composite are read from the PR under review, so a PR can rewrite the instructions it is judged by — and the setup step that runs with this job's secrets`,
+          where: { node: n.id, line: n.line },
+          hint: "omit harness_ref (the default is the base ref) unless you are testing a harness change in its own PR",
+        });
+      }
+    }
+    if (n.attrs.persist_credentials !== undefined) {
+      if (typeof n.attrs.persist_credentials !== "boolean") {
+        bad("node.bad-persist-credentials", `persist_credentials= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.persist_credentials)}`);
+      } else if (!analystFamily) {
+        bad(
+          "node.persist-credentials-unsupported",
+          `persist_credentials= on '${n.id}' (type ${n.type}) does not apply — only read-and-advise lanes drop the checkout credential; a lane that pushes needs it`,
+        );
+      } else if (n.attrs.persist_credentials === false && n.attrs.checkout === "partial") {
+        bad(
+          "node.partial-needs-credentials",
+          `'${n.id}' sets checkout="partial" with persist_credentials=false — a blob-less clone fetches file contents on demand and cannot without the credential`,
+          `drop checkout="partial" (a full clone needs no credential after checkout), or drop persist_credentials=false`,
+        );
+      }
+    }
+    if (n.attrs.repo_guides !== undefined) {
+      if (typeof n.attrs.repo_guides !== "boolean") {
+        bad("node.bad-repo-guides", `repo_guides= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.repo_guides)}`);
+      } else if (!AGENT.has(n.type) && n.type !== "fan_in") {
+        bad("node.repo-guides-unsupported", `repo_guides= on '${n.id}' (type ${n.type}) does not apply — this node runs no agent`);
       }
     }
     if (n.attrs.cancel_in_progress !== undefined) {
