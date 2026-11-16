@@ -438,6 +438,7 @@ describe("skip= compiles to a guard job", () => {
       const r = run(fixtures(pr()));
       expect(r.status).toBe(0);
       expect(r.outputs.run).toBe("true");
+      expect(r.outputs.started_at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
       expect(r.outputs.head_sha).toBe("head1");
       expect(r.outputs.diff_hash).toMatch(/^[0-9a-f]{64}$/);
     });
@@ -536,12 +537,13 @@ describe("skip= compiles to a guard job", () => {
 
   describe("the stamp script, run against a stub gh", () => {
     const step = () => wf().jobs.reviewer.steps.at(-1);
-    const env = { PR: "7", HEAD_SHA: "head1", DIFF_HASH: "f".repeat(64), GH_TOKEN: "t" };
+    const env = { PR: "7", HEAD_SHA: "head1", DIFF_HASH: "f".repeat(64), GH_TOKEN: "t", STARTED_AT: "2026-11-16T10:00:00Z" };
     const review = (id: number, over: Record<string, unknown> = {}) => ({
       id,
       user: { login: BOT },
       commit_id: "head1",
-      body: "**Verdict:** APPROVE",
+      submitted_at: "2026-11-16T10:05:00Z",
+      body: "Two findings, both minor.",
       ...over,
     });
 
@@ -556,8 +558,27 @@ describe("skip= compiles to a guard job", () => {
       );
       expect(r.status).toBe(0);
       expect(r.writes).toContain("PUT repos/o/r/pulls/7/reviews/2");
-      expect(r.writes).toContain("**Verdict:** APPROVE");
+      expect(r.writes).toContain("Two findings, both minor.");
       expect(r.writes).toContain(`<!-- gp-foundry:diff:reviewer:${"f".repeat(64)} -->`);
+    });
+
+    it("stamps only a review this run posted, never another lane's verdict", () => {
+      // The approver (same bot) decided this head before this reviewer run started
+      // (a label event re-ran the reviewer); the reviewer then posted its own verdict.
+      const approver = review(3, { body: "Ship it.\n\n**Verdict:** APPROVE", submitted_at: "2026-11-16T09:00:00Z" });
+      const own = review(4, { body: "Fine.\n\n**Verdict:** APPROVE" });
+      const both = runStepScript(
+        step(),
+        { "repos/o/r/pulls/7/reviews": [own, approver], "repos/o/r/pulls/7/reviews/4": own, "repos/o/r/pulls/7/reviews/3": approver },
+        env,
+      );
+      // Its own verdict is stamped: the stamp is an HTML comment, which the verdict test ignores.
+      expect(both.writes).toContain("PUT repos/o/r/pulls/7/reviews/4");
+      expect(both.writes).not.toContain("reviews/3");
+      const onlyOlder = runStepScript(step(), { "repos/o/r/pulls/7/reviews": [approver], "repos/o/r/pulls/7/reviews/3": approver }, env);
+      expect(onlyOlder.status).toBe(0);
+      expect(onlyOlder.writes).toBe("");
+      expect(step().env.STARTED_AT).toBe("${{ needs.reviewer_guard.outputs.started_at }}");
     });
 
     it("writes nothing when the agent posted no review on this head", () => {

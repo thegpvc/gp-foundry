@@ -14,6 +14,7 @@
 import type { EmitContext, WorkflowJobFragment } from "../ir/types.js";
 import {
   ALSO_HEAD_ANY_NODE_PATTERN,
+  IS_VERDICT_JQ,
   VERDICT_MARKER,
   alsoHeadMarkerPrefix,
   authorsOf,
@@ -86,9 +87,6 @@ export function emitPostJob(ctx: EmitContext): WorkflowJobFragment | null {
  * Shared by the select job ("decided") and the mark job ("the lane delivered").
  */
 const BY_BOT_JQ = `(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`;
-const IS_VERDICT_JQ =
-  `((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
-  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
 const VERDICT_REVIEWS_JQ = [
   `[ .[] | select(.commit_id == env.SHA)`,
   `  | select(${BY_BOT_JQ})`,
@@ -132,8 +130,10 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
     `# costs a review nobody knows is missing. The author allowlist is the one`,
     `# exception and fails CLOSED — it says whose PRs the lane may touch at all.`,
     `RUN=true; REASON=""; HEAD_SHA=""; DIFF_HASH=""`,
+    `# The lane's stamp step edits only a review submitted after this moment (its own).`,
+    `STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`,
     `finish() {`,
-    `  { echo "run=$RUN"; echo "reason=$REASON"; echo "head_sha=$HEAD_SHA"; echo "diff_hash=$DIFF_HASH"; } >> "$GITHUB_OUTPUT"`,
+    `  { echo "run=$RUN"; echo "reason=$REASON"; echo "head_sha=$HEAD_SHA"; echo "diff_hash=$DIFF_HASH"; echo "started_at=$STARTED_AT"; } >> "$GITHUB_OUTPUT"`,
     `  if [ "$RUN" = "true" ]; then echo "Running $NODE."; else echo "::notice::Skipping $NODE: $REASON"; fi`,
     `  exit 0`,
     `}`,
@@ -266,6 +266,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
       reason: "${{ steps.decide.outputs.reason }}",
       head_sha: "${{ steps.decide.outputs.head_sha }}",
       diff_hash: "${{ steps.decide.outputs.diff_hash }}",
+      started_at: "${{ steps.decide.outputs.started_at }}",
     },
     steps: [...(app ? [app] : []), runStep({ id: "decide", name: "Decide whether to run", env, run: lines.join("\n") })],
   };

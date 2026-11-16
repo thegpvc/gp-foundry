@@ -407,3 +407,15 @@ export function alsoHeadMarkerPrefix(node: HarnessNode): string {
 
 /** The marker every verdict review carries; a sweep reads it as "decided". */
 export const VERDICT_MARKER = "**Verdict:**";
+
+/**
+ * jq predicate over one review: is it a verdict? A verdict is a review whose LAST
+ * visible line (HTML comments removed, lines trimmed, blanks dropped — see the
+ * notes on VERDICT_REVIEWS_JQ in prejob.ts) is the verdict line — a substring match would let a lane posting
+ * as the same bot decide a head just by quoting the marker. Shared by the sweep's
+ * select and mark jobs and by every step that edits a review (the diff stamp, the
+ * also-head marker), which must never touch a verdict. Reads `env.VERDICT_MARKER`.
+ */
+export const IS_VERDICT_JQ =
+  `((.body // "") | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n")` +
+  ` | map(gsub("^\\\\s+|\\\\s+$"; "")) | map(select(length > 0)) | (last // "") | startswith(env.VERDICT_MARKER))`;
