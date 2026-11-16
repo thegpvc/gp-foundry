@@ -54,6 +54,7 @@ describe('post="review" compiles', () => {
     expect(agent.id).toBe("agent");
     expect(agent.with["github-token"]).toBeUndefined();
     expect(agent.with["output-contract"]).toContain("```json");
+    expect(agent.with["output-contract"]).toContain("The fence is required: a bare object at the very end is accepted as a fallback");
     expect(agent.with["output-contract"]).not.toContain("must be exactly one of");
     const names = j.steps.map((s: any) => s.name);
     // Post after the agent, and before the diff stamp, which stamps the posted review.
@@ -211,7 +212,7 @@ describe("the post script, run against a stub gh", () => {
     const none = runPost(plain(), "I couldn't post the review: the shell blocked it.");
     expect(none.status).toBe(0);
     expect(none.posts).toEqual([]);
-    expect(none.stdout).toContain("::warning::no fenced json review block");
+    expect(none.stdout).toContain("::warning::no review in the agent's output: neither a fenced json block nor a bare JSON object");
     expect(none.stdout).toContain("I couldn't post the review");
 
     const broken = runPost(plain(), "```json\n{\"body\": \"unterminated\n```\n");
@@ -230,6 +231,51 @@ describe("the post script, run against a stub gh", () => {
       expect(r.posts, JSON.stringify(bad)).toEqual([]);
       expect(r.stdout).toContain("not a valid review");
     }
+  });
+
+  describe("with no fence, falls back to a bare JSON object at the end", () => {
+    const expected = { commit_id: "head1", event: "COMMENT", body: `PR #7 head head1\n\n${REVIEW.body}${posted("reviewer")}`, comments: REVIEW.comments };
+
+    it("posts a bare object that ends the output, exactly as the fenced form", () => {
+      // Observed live: the agent ended its final message with the object, unfenced.
+      const fenced = runPost(plain(), fence(REVIEW));
+      const bare = runPost(plain(), JSON.stringify(REVIEW) + "\n");
+      expect(bare.status).toBe(0);
+      expect(bare.posts).toEqual([expected]);
+      expect(bare.posts).toEqual(fenced.posts);
+      expect(bare.stdout).toContain("using the bare JSON object at its end");
+    });
+
+    it("finds the object after prose, pretty-printed, and ignores trailing noise", () => {
+      const prose = runPost(plain(), `Here is my review.\n\nIt covers {braces} too.\n${JSON.stringify(REVIEW)}`);
+      expect(prose.posts).toEqual([expected]);
+      // Pretty-printed: the comment's own "{" line is not mistaken for the review.
+      const pretty = runPost(plain(), `Done.\n\n${JSON.stringify(REVIEW, null, 2)}\n\nThat is all.\n`);
+      expect(pretty.posts).toEqual([expected]);
+    });
+
+    it("lets a fenced block win over a later bare object", () => {
+      const r = runPost(plain(), `${fence(REVIEW)}\nAnd again:\n${JSON.stringify({ body: "the bare one" })}\n`);
+      expect(r.posts).toEqual([expected]);
+      expect(r.stdout).not.toContain("bare JSON object at its end");
+    });
+
+    it("posts nothing when the bare object has no string body", () => {
+      for (const bad of [{ comments: [] }, { body: 3 }]) {
+        const r = runPost(plain(), `My review:\n${JSON.stringify(bad)}\n`);
+        expect(r.status).toBe(0);
+        expect(r.posts, JSON.stringify(bad)).toEqual([]);
+        expect(r.stdout).toContain("neither a fenced json block nor a bare JSON object");
+      }
+    });
+
+    it("holds a bare object to the same validation and verdict rules", () => {
+      const r = runPost(plain(), JSON.stringify({ body: "x", event: "APPROVE" }));
+      expect(r.posts).toEqual([]);
+      expect(r.stdout).toContain("not a valid review");
+      expect(runPost(verdictLane(), JSON.stringify({ body: "Ship it." })).stdout).toContain("not one of the verdict lines");
+      expect(runPost(verdictLane(), JSON.stringify({ body: "Ship it.\n\n**Verdict:** APPROVE" })).posts).toHaveLength(1);
+    });
   });
 
   it("does not post again when its heading is already on the head", () => {

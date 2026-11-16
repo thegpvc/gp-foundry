@@ -1,7 +1,7 @@
 /**
  * post="review": the step that posts the review an agent PRINTED. The agent ends
- * its final message with one fenced json block; this step extracts the last one,
- * validates it, prepends the idempotency heading, sets commit_id to the head and
+ * its final message with one fenced json block; this step extracts the last one
+ * (or, with no fence, a bare object at the end of the output), validates it, prepends the idempotency heading, sets commit_id to the head and
  * POSTs it with the lane's token. Generated from one script so the compiled
  * workflow and the tests run the same text.
  */
@@ -26,8 +26,29 @@ BLOCK=$(awk '
   inb && /^[ \\t]*\`\`\`[ \\t]*$/ { inb = 0; last = buf; found = 1; next }
   inb { buf = buf $0 "\\n" }
   END { if (found) printf "%s", last }' "$STDOUT_FILE")
+
+# No fence: fall back to a BARE object at the end of the output, which models
+# print often enough. It ends on the last line ending in "}" (anything after it
+# is ignored) and starts on a line beginning with "{"; the start is the latest
+# such line from which the slice parses as exactly one object with a string
+# body. A line inside a pretty-printed object (a comment's "{") leaves the rest
+# of the object behind it, so it never parses alone and the scan moves up. A
+# fenced block, when there is one, always wins.
 if [ -z "$BLOCK" ]; then
-  echo "::warning::no fenced json review block in the agent's output — nothing posted. It began: $(preview)"
+  END_LINE=$(awk '/}[ \\t\\r]*$/ { e = NR } END { print e + 0 }' "$STDOUT_FILE")
+  if [ "$END_LINE" -gt 0 ]; then
+    for START in $(awk -v e="$END_LINE" 'NR <= e && /^[ \\t]*[{]/ { print NR }' "$STDOUT_FILE" | tail -n 200 | sort -rn); do
+      SLICE=$(sed -n "\${START},\${END_LINE}p" "$STDOUT_FILE")
+      if jq -se 'length == 1 and (.[0] | type == "object" and (.body | type) == "string")' <<< "$SLICE" > /dev/null 2>&1; then
+        BLOCK=$SLICE
+        echo "::notice::no fenced json block in the agent's output — using the bare JSON object at its end"
+        break
+      fi
+    done
+  fi
+fi
+if [ -z "$BLOCK" ]; then
+  echo "::warning::no review in the agent's output: neither a fenced json block nor a bare JSON object with a string body at its end — nothing posted. It began: $(preview)"
   exit 0
 fi
 
@@ -167,6 +188,7 @@ export function reviewOutputContract(ctx: EmitContext, verdictLane: boolean): st
     ...(verdictLane
       ? [`- The LAST line of \`body\` must be exactly one of: ${lines.map((l) => `\`${l}\``).join(", ")}. Anything else, and nothing is posted.`]
       : []),
+    "The fence is required: a bare object at the very end is accepted as a fallback, but always use the fence.",
     "If the block is missing or is not valid JSON, nothing is posted.",
   ].join("\n");
 }
