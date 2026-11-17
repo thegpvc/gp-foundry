@@ -1008,8 +1008,13 @@ describe('select="sweep" on pr-review', () => {
       expect(r.outputs.count).toBe("0");
     });
 
-    it("fails the job when the PR list itself cannot be read", () => {
-      expect(select({}).status).not.toBe(0);
+    it("retries a failed PR listing once, then has a quiet tick — not a red run", () => {
+      // The API has a bad minute now and then; nothing else in the sweep ran.
+      const r = select({}, { LIST_RETRY_SECONDS: "0" });
+      expect(r.status).toBe(0);
+      expect(r.outputs.prs).toBe("[]");
+      expect(r.outputs.count).toBe("0");
+      expect(r.stdout).toContain("could not list open pull requests this tick");
     });
   });
 });

@@ -7,6 +7,7 @@ const JS_ACTIONS = [
   "config-loader",
   "dependency-chain",
   "merge-gate",
+  "pr-scope",
   "sanitize-untrusted-input",
   "wait-for-checks",
 ];

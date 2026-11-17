@@ -73,6 +73,38 @@ outcome for an attribute meant to *restrict* a lane.
 | `schedule="*/30 * * * *"` | `merge-gate`, sweeps | cron cadence |
 | `environment=NAME` | `human-gate` | GitHub Environment gating approval (**required** on human-gate) |
 
+### Hybrid harnesses: people and agents in one repo
+
+A harness is **hybrid** when `foundry.config.yaml` has a `rollout` block — even an empty
+one. That key changes how every PR lane and the gate decide what to look at:
+
+```yaml
+rollout:                       # `rollout: {}` = every PR
+  authors: [alice, bob]        # human PRs by these people are in scope
+  opt_in_label: agent-review   # ...or any PR carrying this label
+  skip_label: no-agent-review  # never these
+```
+
+- **Scope is the rollout, not the branch prefix.** In order: a draft never; a PR with the
+  skip label never; a PR `identity.bot_login` opened always; another bot only if named in
+  `authors`; then a listed author or the opt-in label. A block naming neither `authors` nor
+  `opt_in_label` admits everyone. Finish a rollout by emptying the block, not deleting it:
+  without the key the harness is not hybrid.
+- **One implementation.** Each event-driven PR lane gets a `<node>_guard` job that runs the
+  `pr-scope` action against the live PR; a sweep's select job asks the same action for its
+  candidates; the gate (`merge=`) uses the same rule. The job-level `if:` is only a cheap
+  prefilter on the event.
+- **Lanes read or write.** `pr-review` and PR-context `analyst` lanes read: they run on any
+  PR in scope. `pr-fix` writes: it runs only on a PR the pipeline wrote — opened by the bot,
+  every commit its own. No lane pushes to a person's PR.
+- **Per-node scope is an error here**: `authors=`, `opt_in_label=`, `skip=` (other than
+  `unchanged-diff`, which is a lane's own behaviour) and `repo.authors`. Lanes always listen
+  for `ready_for_review`, and for `labeled` when there is an opt-in label.
+- Needs `identity.bot_login` wherever a writing lane or `merge="agent-only"` is used.
+
+Without a `rollout` key nothing here applies: lanes are scoped by `repo.branch_prefix` and
+the per-node attributes below, exactly as before.
+
 ### What each lane's credentials can do
 
 - **App token (`auth.mode: app`)** is minted per job with `permission-*` inputs, so it carries

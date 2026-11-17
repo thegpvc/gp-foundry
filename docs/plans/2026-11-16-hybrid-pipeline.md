@@ -51,10 +51,15 @@ convention for agent branches; nothing's safety rests on it in a harness that op
      skip_label: no-agent-review  # never these
    ```
 
-   - **No `rollout` block means every PR is in scope.** Finishing the rollout is deleting
-     it — or keeping only `skip_label`: a block that names neither `authors` nor
-     `opt_in_label` also admits everyone, so the off switch can outlive the rollout.
-     (`authors: []` is different: an admission rule that admits nobody by name.)
+   - **The block is also the opt-in.** A harness is hybrid when its config has a `rollout`
+     key at all. Without the key every lane compiles as it did under 0.2.16, which is what
+     the compatibility rule requires — so "no block" cannot also mean "every PR".
+   - **An empty block, `rollout: {}`, means every PR is in scope.** Finishing the rollout is
+     emptying the block, not deleting it — or keeping only `skip_label`: a block that names
+     neither `authors` nor `opt_in_label` admits everyone, so the off switch can outlive
+     the rollout. (`authors: []` is different: an admission rule that admits nobody by name.)
+   - **A gate with `merge=` requires the block**, so the gate and the lanes are always on
+     one scope.
    - **The skip label outranks everything**, the pipeline's own PRs included. It is the
      off switch a person holds.
    - **Agent-written PRs are always in scope**, whatever the dial says: the pipeline made
@@ -76,13 +81,18 @@ gp-foundry runs in several repos. The rule for 0.3.0:
 > An existing `harness.dot` and config, unchanged, compiles to workflows that behave as
 > they did under 0.2.16. New behaviour appears only when a harness opts in.
 
+- A harness with **no `rollout` key** is not hybrid: its lanes are scoped by branch prefix
+  and per-node attributes, as today. In a hybrid harness those per-node attributes
+  (`authors=`, `opt_in_label=`, `skip=` other than `unchanged-diff`) and `repo.authors`
+  are build errors, not aliases: one scope, said once.
 - A gate with **no `merge=`** merges, by the branch-prefix test, exactly as today. The
   validator notes that the attribute should be made explicit; it is not an error.
 - `gp-foundry init` writes **`merge="off"`** into new harnesses: a new setup starts with
   merging off and turns it on as a deliberate step.
 - Only an explicit `merge="agent-only"` uses the agent-written test.
 - `mode="evaluate"` and `mode="merge"`, and the per-node `authors=`, `opt_in_label=` and
-  `skip=`, keep working as aliases with a deprecation note. They are not removed in 0.3.0.
+  `skip=`, keep working in a harness without a rollout block, on their existing code
+  paths. They are not removed in 0.3.0.
 
 A hybrid graph then carries no scope attributes at all:
 
