@@ -13,6 +13,8 @@ import {
   KNOWN_NODE_ATTRS,
   hasPrContext,
   isEvaluateGate,
+  parseMergeSetting,
+  publishesCheck,
   isSweep,
   parsePostMarker,
   postsReview,
@@ -133,7 +135,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
   // other's result on every tick (each PATCHes the run it finds by name).
   const evalGateByCheck = new Map<string, string>();
   for (const n of ir.nodes) {
-    if (!isEvaluateGate(n)) continue;
+    if (!publishesCheck(n)) continue;
     let name: string;
     try {
       name = parseEvaluateCheckName(n);
@@ -147,7 +149,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         code: "node.duplicate-check-name",
         message: `merge gates '${other}' and '${n.id}' both publish the check '${name}'`,
         where: { node: n.id, line: n.line },
-        hint: "give each evaluate gate its own check_name=",
+        hint: "give each gate its own check_name=",
       });
     } else {
       evalGateByCheck.set(name, n.id);
@@ -590,16 +592,67 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         }
       }
     }
+    if (n.attrs.merge !== undefined) {
+      if (n.type !== "merge-gate") {
+        bad("node.merge-unsupported", `merge= on '${n.id}' is not supported here — it is the merge-gate's setting ("off" or "agent-only")`);
+      } else {
+        let setting: ReturnType<typeof parseMergeSetting>;
+        try {
+          setting = parseMergeSetting(n);
+        } catch (e) {
+          bad(
+            "node.bad-merge",
+            (e as Error).message,
+            `merge="off" publishes the gate's result as a check and never merges; merge="agent-only" also merges the PRs the pipeline wrote`,
+          );
+        }
+        if (n.attrs.mode !== undefined) {
+          bad(
+            "node.merge-and-mode",
+            `'${n.id}' sets both merge= and mode= — merge= replaces mode=`,
+            `drop mode=: mode="evaluate" is merge="off"`,
+          );
+        }
+        // One scope for the whole pipeline: a gate that picked its own PRs could
+        // judge a PR no lane reviewed, or ignore one a lane did.
+        for (const attr of ["authors", "opt_in_label", "skip"] as const) {
+          if (n.attrs[attr] !== undefined) {
+            bad(
+              "node.gate-scope-attr",
+              `${attr}= on '${n.id}' does not apply to a gate with merge= — its scope is the rollout block in foundry.config.yaml`,
+              "move it to rollout: { authors, opt_in_label, skip_label }",
+            );
+          }
+        }
+        if (setting === "agent-only" && !ir.config.identity?.bot_login) {
+          bad(
+            "node.merge-needs-bot-login",
+            `merge="agent-only" on '${n.id}' merges the PRs the pipeline wrote, but identity.bot_login is unset — no PR could be attributed to it`,
+            "set identity.bot_login in foundry.config.yaml to the login that opens the agent PRs",
+          );
+        }
+      }
+    } else if (n.type === "merge-gate" && n.attrs.mode === undefined) {
+      // The original gate: it merges, by branch prefix, exactly as it always has.
+      // Not a problem — but the choice is now worth writing down.
+      diags.push({
+        level: "info",
+        code: "node.merge-implicit",
+        message: `merge-gate '${n.id}' has no merge= — it merges every approved PR on a '${ir.config.repo.branch_prefix}' branch, as before`,
+        where: { node: n.id, line: n.line },
+        hint: `merge="agent-only" merges only PRs the pipeline wrote and publishes the result as a check; merge="off" publishes the check and never merges`,
+      });
+    }
     if (n.attrs.check_name !== undefined) {
-      if (!isEvaluateGate(n)) {
+      if (!publishesCheck(n)) {
         // An error, not a no-op warning: the name only exists for the check an
         // evaluate gate publishes, and a merge gate publishes none.
         diags.push({
           level: "error",
           code: "node.check-name-without-evaluate",
-          message: `check_name= on '${n.id}' needs a merge-gate with mode="evaluate" — only that mode publishes a check run`,
+          message: `check_name= on '${n.id}' needs a merge-gate that publishes a check — one with merge= (or the older mode="evaluate")`,
           where: { node: n.id, line: n.line },
-          hint: `add mode="evaluate" to the merge-gate, or drop check_name=`,
+          hint: `add merge="off" or merge="agent-only" to the merge-gate, or drop check_name=`,
         });
       } else {
         try {

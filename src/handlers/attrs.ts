@@ -23,7 +23,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
-  "mode", "check_name", "requires_review", "post", "post_marker",
+  "mode", "merge", "check_name", "requires_review", "post", "post_marker",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -295,6 +295,42 @@ export function isEvaluateGate(node: HarnessNode): boolean {
   } catch {
     return false;
   }
+}
+
+export type MergeSetting = "off" | "agent-only";
+
+/**
+ * `merge=` on a merge-gate: the single gate. It publishes its result as a check
+ * on every PR in scope, and
+ *   "off"         never merges;
+ *   "agent-only"  also merges the PRs the pipeline wrote, when they are ready.
+ * An enumeration, so a later value can be added without changing these two.
+ * Undefined when the attribute is absent (the gate then runs as it always has:
+ * `mode=`, or the original merging gate). Throws on any other value.
+ */
+export function parseMergeSetting(node: HarnessNode): MergeSetting | undefined {
+  const raw = node.attrs.merge;
+  if (raw === undefined) return undefined;
+  if (raw === "off" || raw === "agent-only") return raw;
+  throw new Error(`node '${node.id}': merge= must be "off" or "agent-only", got ${JSON.stringify(raw)}`);
+}
+
+/**
+ * parseMergeSetting for emitters. A malformed value is validate()'s to report,
+ * and must not compile to a gate that merges: it reads as "off".
+ */
+export function mergeSettingOf(node: HarnessNode): MergeSetting | undefined {
+  if (node.type !== "merge-gate" || node.attrs.merge === undefined) return undefined;
+  try {
+    return parseMergeSetting(node);
+  } catch {
+    return "off";
+  }
+}
+
+/** Does this gate publish a check? An evaluate gate, or any gate with `merge=`. */
+export function publishesCheck(node: HarnessNode): boolean {
+  return isEvaluateGate(node) || mergeSettingOf(node) !== undefined;
 }
 
 /** The check run an evaluate gate publishes: `check_name=`, else `gp-foundry/approval (<node>)`. Throws on a malformed value. */

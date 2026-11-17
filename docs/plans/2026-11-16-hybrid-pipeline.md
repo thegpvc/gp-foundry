@@ -62,7 +62,9 @@ convention for agent branches; nothing's safety rests on it in a harness that op
      labelled for the builder, and by the gate's `merge=`.
    - **Drafts and other bots' PRs are always skipped**, with no setting. A bot's PR is
      reviewed only if that bot is named in `authors`. (The merge gate's existing dependabot
-     lane is separate, opt-in in the policy file, and unchanged.)
+     lane is separate, opt-in in the policy file, and unchanged: when it is on, the single
+     gate judges dependabot's PRs on it, and `merge="agent-only"` merges them as that lane
+     always has.)
 5. **One implementation.** "Is this PR in scope", "is it agent-written" and "what is the
    result" are one tested TypeScript function, called by the guard, the sweep and the gate.
    Generated workflows stop carrying that logic in shell.
@@ -114,8 +116,8 @@ further 0.2.x releases. Fixes that arrive meanwhile are folded into the branch.
 
 ## Open
 
-1. A regression check for the compatibility rule: compile real consumer harnesses with
-   0.2.16 and with 0.3.0 and compare the output.
+1. A regression check for the compatibility rule. Decided: against this repo's own
+   fixtures and the starter example, not against other consumers' harnesses.
 2. The gate's check can still be published by any workflow in the repo. Unchanged from
    0.2.15, and less pressing while a person is the last step on human PRs.
 3. Whether a human may opt a PR in to the fixer. Not built until asked for; if built, the
