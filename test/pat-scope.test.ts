@@ -160,6 +160,8 @@ describe("the generated merge gate reads CI with GITHUB_TOKEN", () => {
   it("the shipped starter example carries that wiring", () => {
     const wf = repoFile("examples/starter/.github/workflows/merge_gate.yml");
     expect(wf).toContain("checks-token: ${{ github.token }}");
-    expect(wf).toMatch(/checks:\s*read/);
+    // The starter's gate publishes its result as a check (merge="off"), so the
+    // job's GITHUB_TOKEN both reads the CI rollup and writes that check.
+    expect(wf).toMatch(/checks:\s*write/);
   });
 });

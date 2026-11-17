@@ -1,6 +1,6 @@
 # Native merge, one policy
 
-**Date:** 2026-11-16 · **Status:** Draft for review · Amends §"merge-gate" of the
+**Date:** 2026-11-16 · **Status:** Superseded by [Hybrid pipeline (0.3.0)](./2026-11-16-hybrid-pipeline.md) — native merge cannot be assumed; the "one policy" half carries over · Amends §"merge-gate" of the
 [system design](./2026-07-01-gp-foundry-system-design.md).
 
 ## Problem

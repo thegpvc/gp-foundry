@@ -16,6 +16,7 @@ import yaml from "js-yaml";
 import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
+import { releaseTag } from "../src/shared/version.js";
 import { validate } from "../src/validate/validate.js";
 import { parseGates } from "../src/handlers/attrs.js";
 import { staleGeneratedWorkflows } from "../src/cli/common.js";
@@ -1008,8 +1009,13 @@ describe('select="sweep" on pr-review', () => {
       expect(r.outputs.count).toBe("0");
     });
 
-    it("fails the job when the PR list itself cannot be read", () => {
-      expect(select({}).status).not.toBe(0);
+    it("retries a failed PR listing once, then has a quiet tick — not a red run", () => {
+      // The API has a bad minute now and then; nothing else in the sweep ran.
+      const r = select({}, { LIST_RETRY_SECONDS: "0" });
+      expect(r.status).toBe(0);
+      expect(r.outputs.prs).toBe("[]");
+      expect(r.outputs.count).toBe("0");
+      expect(r.stdout).toContain("could not list open pull requests this tick");
     });
   });
 });
@@ -1785,7 +1791,7 @@ describe("harness files come from the base ref, not the PR head", () => {
       expect(s.uses).toMatch(/^\.\/\.gp-foundry\/harness\/\.github\/actions\//);
     }
     // Pinned mode references the release, which a PR cannot edit.
-    expect(stepNamed(job(), "Run agent").uses).toBe("thegpvc/gp-foundry/actions/run-agent@v1");
+    expect(stepNamed(job(), "Run agent").uses).toBe(`thegpvc/gp-foundry/actions/run-agent@${releaseTag()}`);
   });
 
   it("a sweep takes the base ref from the selected PR", () => {

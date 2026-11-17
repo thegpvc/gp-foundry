@@ -38,6 +38,10 @@ Confirm with the user, then edit:
 
 - **`.github/agent-setup/action.yml`** — add the project's toolchain (setup-python,
   setup-go, pnpm, …) below the agent-CLI step, so pipeline agents can build and test.
+- **`.github/agents/foundry.config.yaml`** — set `identity.bot_login` to the account the
+  pipeline posts as (under PAT auth, the PAT's owner): it is how the pipeline recognizes its
+  own PRs. Leave `rollout: { authors: [] }` to start with the pipeline's own PRs only; add
+  logins (or an `opt_in_label`) to have it review people's PRs too.
 - **`.github/agents/scope.yaml`** — what must agents NEVER touch (`immutable_paths`)?
   Add the repo's build/test commands to `guidance:` (e.g. "run `make test` before any PR").
 - **`.github/agents/roles/*.md`** — the "Repo-specific guidance" of `builder.md`,
@@ -80,7 +84,10 @@ npx -y @thegpvc/gp-foundry@latest doctor   # everything green?
 ```
 
 Then have the user **file an issue** describing a small change. The 🕵️ scout triages it
-within a minute and the factory takes it from there. Day-2: `npx -y @thegpvc/gp-foundry@latest status`
+within a minute and the factory takes it from there — up to a reviewed PR with the gate's
+verdict on it as a check. **Merging starts off.** When the user wants the pipeline's own
+PRs merged for them, change `merge="off"` to `merge="agent-only"` on the `merge_gate` node
+in `.github/harness.dot` and rebuild. A person's PR is never merged by the pipeline. Day-2: `npx -y @thegpvc/gp-foundry@latest status`
 shows work in flight and anything stalled; add `gp-foundry build --check` to CI as a
 drift gate.
 

@@ -83,6 +83,28 @@ export const CONFIG_SCHEMA = {
         }
       }
     },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The rollout dial: which human PRs the pipeline looks at while it is brought to a repo gradually. Leave the block out and every PR is in scope. PRs the harness bot opened are always in scope; drafts and other bots' PRs never are (a bot is reviewed only if named in authors).",
+      "properties": {
+        "authors": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "GitHub logins whose PRs are in scope. Case-insensitive."
+        },
+        "opt_in_label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A PR carrying this label is in scope, whoever opened it. A key of `labels`, or a literal label name."
+        },
+        "skip_label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A PR carrying this label is never in scope. A key of `labels`, or a literal label name."
+        }
+      }
+    },
     "labels": {
       "type": "object",
       "description": "semantic role -> repo label (the drift-killer).",
@@ -107,8 +129,16 @@ export const CONFIG_SCHEMA = {
       "additionalProperties": false,
       "properties": {
         "mode": { "type": "string", "enum": ["pinned", "vendored"] },
-        "ref": { "type": "string" },
-        "owner_repo": { "type": "string" }
+        "ref": {
+          "type": "string",
+          "description": "Pinned mode: the git ref the runtime actions are referenced at. Omit it and the compiler uses its own release tag (v<version>), so the workflows and the actions they call always come from the same release. Name an exact tag or a commit to hold them elsewhere. Do not use v1: that tag has not moved since 0.1.2."
+        },
+        "owner_repo": { "type": "string" },
+        "runs_on": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The runner label every generated job uses. Default ubuntu-latest. A node's runs_on= attribute overrides it for that node's jobs."
+        }
       }
     },
     "personas": {

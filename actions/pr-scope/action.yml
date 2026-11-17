@@ -1,0 +1,76 @@
+name: "pr-scope"
+description: >-
+  Decide whether the pipeline looks at a pull request, and whether it wrote it.
+  One implementation of the scope rule (the rollout dial) and the agent-written
+  test, shared by every lane's guard so a lane and the gate cannot disagree.
+
+inputs:
+  number:
+    description: "The pull request number. Required unless `list` is true."
+    required: false
+    default: ""
+  list:
+    description: >-
+      "true": instead of judging one PR, list every open PR on `base-branch`
+      that is in scope, oldest first, as the `prs` output. For a sweep's select
+      job. One retry on a failed listing; if it still fails, `listed` is "false"
+      and `prs` is "[]" — the step does not fail, since nothing is wrong with
+      the repo.
+    required: false
+    default: "false"
+  base-branch:
+    description: "With `list`: only PRs targeting this branch."
+    required: false
+    default: ""
+  token:
+    description: "Token used to read the pull request and its commits (pull-requests: read)."
+    required: true
+  rollout:
+    description: >-
+      The rollout dial as JSON ({"authors":[...],"optInLabel":"...","skipLabel":"..."}),
+      written by the compiler from foundry.config.yaml. Empty means every PR is
+      in scope. Drafts and other bots' PRs never are; PRs opened by bot-login
+      always are.
+    required: false
+    default: ""
+  bot-login:
+    description: "The harness bot's login: the author of the PRs the pipeline writes."
+    required: false
+    default: ""
+  branch-prefix:
+    description: >-
+      The harness's agent-branch prefix. Used only for a hint: a PR on such a
+      branch that is turned away because bot-login did not open it usually means
+      bot-login is not the account the pipeline actually posts as.
+    required: false
+    default: ""
+  require-agent-written:
+    description: >-
+      "true" for a lane that WRITES to the pull request (pushes commits, merges):
+      `run` is then true only for a PR the pipeline wrote — opened by bot-login,
+      every commit its own.
+    required: false
+    default: "false"
+
+outputs:
+  in-scope:
+    description: '"true" when the pipeline looks at this PR.'
+  agent-written:
+    description: '"true" when the pipeline wrote this PR. Only computed with require-agent-written.'
+  run:
+    description: >-
+      "true" when the lane should run: in scope, and agent-written if that was
+      required. "false" on anything else, including a PR that could not be read.
+  reason:
+    description: "One line saying why."
+  prs:
+    description: >-
+      With `list`: a JSON array, oldest PR first, of {number, sha, base,
+      requested, quiet} — head SHA, base ref, the number of pending review
+      requests, and seconds since the PR last changed.
+  listed:
+    description: 'With `list`: "true" when the open PRs could be listed, "false" when the API was unavailable.' 
+
+runs:
+  using: "node24"
+  main: "dist/index.cjs"

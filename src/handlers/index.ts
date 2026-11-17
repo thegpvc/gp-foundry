@@ -14,6 +14,8 @@ import type {
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
+import { parseRollout } from "../shared/scope.js";
+import type { MergeSetting } from "./attrs.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
   authorsOf,
@@ -21,6 +23,7 @@ import {
   gatesOf,
   hasSkipGuard,
   isEvaluateGate,
+  mergeSettingOf,
   isSweep,
   postsReview,
   optInLabelOf,
@@ -515,6 +518,11 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
     permissions: { contents: "write", "pull-requests": "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 35),
     steps,
+    // A hybrid harness lets the Fixer push only to PRs the pipeline wrote: its
+    // guard job runs the agent-written test, and the Fixer runs behind it.
+    ...(hasSkipGuard(node, ctx.config)
+      ? { needs: [preJobId(node)], if: `needs.${preJobId(node)}.outputs.run == 'true'` }
+      : {}),
   };
 }
 
@@ -574,6 +582,8 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
   // `<name>@<app>` — the check must also have been WRITTEN by the app the
   // human-gate publishes as, or a name is all an impostor needs.
   const requiredChecks = humanGates.map(humanGateRequiredCheck);
+  const merge = mergeSettingOf(node);
+  if (merge) return emitSingleGate(ctx, merge, requiredChecks);
   if (isEvaluateGate(node)) return emitEvaluateGate(ctx, requiredChecks);
   const steps: StepSpec[] = preamble(ctx, { fetchDepth: 0 });
   steps.push({
@@ -617,6 +627,85 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
  * the PRs and write checks but cannot push or merge. No harness token, no App
  * token, no git identity: nothing here commits.
  */
+/**
+ * merge="off" | "agent-only": the single gate. Every tick it judges every PR the
+ * rollout dial puts in scope, publishes the result as a check on the head, and —
+ * with "agent-only" — merges the PRs the pipeline wrote when they are ready.
+ *
+ * Who publishes the check matters once it can be a required check. With
+ * GITHUB_TOKEN it is published as `github-actions`, which is every workflow in
+ * the repo: any of them could publish a passing check under the same name. Under
+ * App auth the gate publishes with the harness's own App token instead, and
+ * adopts only runs that App wrote. (A fine-grained PAT cannot write checks at
+ * all, so the other auth modes stay on GITHUB_TOKEN.)
+ */
+function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: string[]): WorkflowJobFragment {
+  const node = ctx.node;
+  const merging = merge === "agent-only";
+  let checkName: string;
+  try {
+    checkName = parseEvaluateCheckName(node);
+  } catch {
+    checkName = `gp-foundry/approval (${node.id})`; // malformed: validate() reports it
+  }
+  // The dial, already parsed and label-resolved. Malformed is validate()'s to
+  // report — and must not compile to "everyone": it admits nobody by name.
+  let rollout: string | undefined;
+  try {
+    const parsed = parseRollout(ctx.config.rollout, ctx.config.labels);
+    rollout = parsed && Object.keys(parsed).length ? JSON.stringify(parsed) : undefined;
+  } catch {
+    rollout = JSON.stringify({ authors: [] });
+  }
+
+  const steps: StepSpec[] = [];
+  // "off" needs to read PRs and write checks, nothing more. A merging gate is left
+  // on the App's own permissions, like the original merge gate: what a merge
+  // needs is open-ended (a PR that touches workflows needs `workflows`).
+  const app = appTokenStep(
+    ctx,
+    merging ? undefined : { contents: "read", "pull-requests": "read", checks: "write" },
+  );
+  if (app) steps.push(app);
+  // Only the policy file is read from the tree; no credential is left behind.
+  const checkout = checkoutStep(ctx, { persistCredentials: false });
+  checkout.with = { ...checkout.with, token: "${{ github.token }}" };
+  steps.push(checkout);
+  steps.push({
+    uses: ctx.actionRef("merge-gate"),
+    name: merging ? "Evaluate merge gate (publish check, merge agent-written PRs)" : "Evaluate merge gate (publish check, never merge)",
+    with: {
+      merge,
+      "check-name": checkName,
+      // Merging (and its labels) goes out under the harness identity so it is
+      // attributable and its events cascade; a gate that never merges only reads.
+      token: merging || app ? tokenExpr(ctx) : "${{ github.token }}",
+      "checks-token": app ? tokenExpr(ctx) : "${{ github.token }}",
+      ...(app ? { "check-app": "${{ steps.app-token.outputs.app-slug }}" } : {}),
+      "policy-path": resolveFile(ctx, node.files.policy),
+      "base-branch": ctx.config.repo.base_branch,
+      ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
+      ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
+      ...(rollout ? { rollout } : {}),
+    },
+  });
+  return {
+    jobId: node.id,
+    name: node.id,
+    // Under App auth the App token does everything the gate does — reads the PRs,
+    // writes the check, merges — so the job's GITHUB_TOKEN is left with the one
+    // thing it is used for: checking out the policy file.
+    permissions: app
+      ? { contents: "read" }
+      : merging
+        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write" }
+        : { contents: "read", "pull-requests": "read", checks: "write" },
+    timeoutMinutes: timeoutOf(node, 10),
+    steps,
+  };
+}
+
 function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJobFragment {
   const node = ctx.node;
   const checkout = checkoutStep(ctx, { persistCredentials: false });

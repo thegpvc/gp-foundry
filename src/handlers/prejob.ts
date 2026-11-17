@@ -11,8 +11,11 @@
  * they need no write, and check-runs cannot be read with a fine-grained PAT at all.
  * Untrusted values never reach the script text — everything arrives via `env:`.
  */
-import type { EmitContext, WorkflowJobFragment } from "../ir/types.js";
+import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
+  isHybrid,
+  isWritingPrLane,
+  rolloutOf,
   ALSO_HEAD_ANY_NODE_PATTERN,
   IS_VERDICT_JQ,
   alsoHeadMarkerPrefix,
@@ -59,7 +62,7 @@ export const SWEEP_SETTLE_SECONDS = 600;
 
 export function emitPreJob(ctx: EmitContext): WorkflowJobFragment | null {
   if (isSweep(ctx.node)) return emitSweepSelect(ctx);
-  if (hasSkipGuard(ctx.node, ctx.config)) return emitSkipGuard(ctx);
+  if (hasSkipGuard(ctx.node, ctx.config)) return isHybrid(ctx.config) ? emitHybridGuard(ctx) : emitSkipGuard(ctx);
   return null;
 }
 
@@ -110,6 +113,180 @@ const SELECT_REVIEWS_JQ = [
 const MARK_APP = "github-actions";
 
 // ── skip= guard ──────────────────────────────────────────────────────────────
+
+/**
+ * skip="unchanged-diff": the guard's check that a push left the diff as it was
+ * when this lane last reviewed it. Appends to `lines` and fills `env`. Shared by
+ * the per-node guard and the hybrid one — it is a lane behaviour, not scope.
+ */
+function unchangedDiffLines(ctx: EmitContext, env: Record<string, string>, lines: string[]): void {
+  const node = ctx.node;
+  env.MARKER_PREFIX = diffMarkerPrefix(node);
+  env.ALSO_HEAD_PREFIX = alsoHeadMarkerPrefix(node);
+  env.EVENT_ACTION = "${{ github.event.action }}";
+  // The review is the bot's, so only the token that posted (and stamps) it can edit it.
+  env.STAMP_TOKEN = tokenExpr(ctx);
+  lines.push(
+    `# unchanged-diff: hash the PR's merge-base diff and compare it with the hash`,
+    `# stamped into this bot's last review. Blob ids and hunk positions are`,
+    `# dropped first, so a rebase or a merge from the base branch that leaves the`,
+    `# change itself untouched hashes the same. Only a push (synchronize) is`,
+    `# ever skipped this way: a label, a ready-for-review or a re-request is`,
+    `# someone asking for a review, and "nothing changed" is no answer to that.`,
+    `BASE_SHA=$(jq -r '.base.sha // ""' <<< "$PR_JSON")`,
+    `if [ -n "$HEAD_SHA" ] && [ -n "$BASE_SHA" ] \\`,
+    `  && DIFF=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" -H "Accept: application/vnd.github.diff" 2>/dev/null) \\`,
+    `  && [ -n "$DIFF" ]; then`,
+    `  DIFF_HASH=$(printf '%s\\n' "$DIFF" \\`,
+    `    | sed -E -e '/^index [0-9a-f]+\\.\\.[0-9a-f]+/d' -e 's/^@@ -[0-9,]+ \\+[0-9,]+ @@/@@/' \\`,
+    `    | sha256sum | cut -d' ' -f1)`,
+    `  LAST_REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
+    `    .[] | select(.user.login == env.BOT_LOGIN) | select((.body // "") | contains(env.MARKER_PREFIX))`,
+    `    | "\\(.id) \\((.body // "") | split(env.MARKER_PREFIX) | last | .[0:64])"' 2>/dev/null | tail -n 1) || LAST_REVIEW=""`,
+    `  LAST_ID=\${LAST_REVIEW%% *}; LAST=\${LAST_REVIEW#* }`,
+    `  if [ "$EVENT_ACTION" = "synchronize" ] && [ -n "$LAST" ] && [ "$LAST" = "$DIFF_HASH" ]; then`,
+    `    # That review covers this head too: say so in it, so a downstream lane can`,
+    `    # tell "reviewed" from the other reasons this lane skips. One marker per`,
+    `    # head, appended. Skip only once the marker is there: a sweep with`,
+    `    # requires_review selects a head only on a review that covers it, so a`,
+    `    # skip without the marker would leave the head unreviewed and never`,
+    `    # selected. If the read or the edit fails, the lane runs again instead.`,
+    `    MARK="$ALSO_HEAD_PREFIX$HEAD_SHA -->"`,
+    `    MARKED=""`,
+    `    if BODY=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" --jq '.body // ""' 2>/dev/null); then`,
+    `      case "$BODY" in`,
+    `        *"$MARK"*) MARKED=1 ;;`,
+    `        *) if GH_TOKEN="$STAMP_TOKEN" gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" \\`,
+    `             -f body="$(printf '%s\\n%s' "$BODY" "$MARK")" >/dev/null; then MARKED=1; fi ;;`,
+    `      esac`,
+    `    fi`,
+    `    if [ -n "$MARKED" ]; then`,
+    `      skip "the diff is unchanged since the last review"`,
+    `    fi`,
+    `    echo "::notice::the diff is unchanged since review $LAST_ID, but it could not be marked as covering $HEAD_SHA — running the lane again"`,
+    `  fi`,
+    `else`,
+    `  echo "::warning::could not hash the diff of PR #$PR — not skipping on unchanged-diff"`,
+    `fi`,
+  );
+}
+
+/**
+ * The guard of a hybrid harness. Scope is not decided here in shell: the
+ * pr-scope action runs the one shared rule against the live PR (and, for a lane
+ * that writes, the agent-written test). What is left for the script is the one
+ * thing that is a lane's own behaviour, the unchanged-diff skip.
+ */
+function emitHybridGuard(ctx: EmitContext): WorkflowJobFragment {
+  const node = ctx.node;
+  const writing = isWritingPrLane(node);
+  const unchangedDiff = !writing && skipOf(node).some((c) => c.kind === "unchanged-diff");
+  const rollout = rolloutOf(ctx.config);
+  const vendored = ctx.config.runtime?.mode === "vendored";
+
+  const steps: StepSpec[] = [];
+  if (vendored) {
+    // A vendored action is a local path, so it has to be checked out — from the
+    // BASE ref: the default for a pull_request event is the PR's own merge
+    // commit, and the code deciding scope must not be the PR's to edit.
+    steps.push({
+      uses: "actions/checkout@v5",
+      name: "Checkout the scope action (base ref)",
+      with: {
+        ref: "${{ github.event.pull_request.base.ref }}",
+        "sparse-checkout": ".github/actions/pr-scope",
+        "fetch-depth": 1,
+        "persist-credentials": false,
+      },
+    });
+  }
+  steps.push({
+    uses: ctx.actionRef("pr-scope"),
+    id: "scope",
+    name: writing ? "Is this a PR the pipeline wrote?" : "Is this PR in scope?",
+    with: {
+      number: PR_NUMBER,
+      token: "${{ github.token }}",
+      ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
+      ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      // For a hint only: an agent-named branch turned away usually means bot_login is wrong.
+      ...(ctx.config.repo?.branch_prefix ? { "branch-prefix": ctx.config.repo.branch_prefix } : {}),
+      ...(writing ? { "require-agent-written": "true" } : {}),
+    },
+  });
+
+  const base = {
+    jobId: preJobId(node),
+    name: `${node.id} guard`,
+    displayName: `${node.id} guard`,
+    timeoutMinutes: 5,
+  };
+  if (!unchangedDiff) {
+    return {
+      ...base,
+      permissions: { contents: "read", "pull-requests": "read" },
+      outputs: {
+        run: "${{ steps.scope.outputs.run }}",
+        reason: "${{ steps.scope.outputs.reason }}",
+        head_sha: "",
+        diff_hash: "",
+        started_at: "",
+      },
+      steps,
+    };
+  }
+
+  const env: Record<string, string> = {
+    GH_TOKEN: "${{ github.token }}",
+    PR: PR_NUMBER,
+    NODE: node.id,
+    BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
+    SCOPE_RUN: "${{ steps.scope.outputs.run }}",
+    SCOPE_REASON: "${{ steps.scope.outputs.reason }}",
+  };
+  const lines = [
+    `RUN=true; REASON=""; HEAD_SHA=""; DIFF_HASH=""`,
+    `# The lane's stamp step edits only a review submitted after this moment (its own).`,
+    `STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`,
+    `finish() {`,
+    `  { echo "run=$RUN"; echo "reason=$REASON"; echo "head_sha=$HEAD_SHA"; echo "diff_hash=$DIFF_HASH"; echo "started_at=$STARTED_AT"; } >> "$GITHUB_OUTPUT"`,
+    `  if [ "$RUN" = "true" ]; then echo "Running $NODE."; else echo "::notice::Skipping $NODE: $REASON"; fi`,
+    `  exit 0`,
+    `}`,
+    `skip() { RUN=false; REASON="$1"; finish; }`,
+    ``,
+    `# Scope was decided by the step above, by the rule every lane and the gate share.`,
+    `if [ "$SCOPE_RUN" != "true" ]; then skip "$SCOPE_REASON"; fi`,
+    ``,
+    `# From here on only the unchanged-diff skip, which fails OPEN: a lane that runs`,
+    `# once too often costs a run, one wrongly skipped costs a review nobody misses.`,
+    `PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" 2>/dev/null) || PR_JSON=""`,
+    `if [ -z "$PR_JSON" ]; then`,
+    `  echo "::warning::could not read PR #$PR — not skipping on unchanged-diff"`,
+    `  finish`,
+    `fi`,
+    `HEAD_SHA=$(jq -r '.head.sha // ""' <<< "$PR_JSON")`,
+    ``,
+  ];
+  unchangedDiffLines(ctx, env, lines);
+  lines.push(``, `finish`);
+  const app = appTokenStep(ctx, { "pull-requests": "write" });
+  const writesWithGithubToken = tokenExpr(ctx) === "${{ github.token }}";
+  if (app) steps.push(app);
+  steps.push(runStep({ id: "decide", name: "Decide whether to run", env, run: lines.join("\n") }));
+  return {
+    ...base,
+    permissions: { contents: "read", "pull-requests": writesWithGithubToken ? "write" : "read" },
+    outputs: {
+      run: "${{ steps.decide.outputs.run }}",
+      reason: "${{ steps.decide.outputs.reason }}",
+      head_sha: "${{ steps.decide.outputs.head_sha }}",
+      diff_hash: "${{ steps.decide.outputs.diff_hash }}",
+      started_at: "${{ steps.decide.outputs.started_at }}",
+    },
+    steps,
+  };
+}
 
 function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
@@ -201,54 +378,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
         `fi`,
       );
     } else {
-      env.MARKER_PREFIX = diffMarkerPrefix(node);
-      env.ALSO_HEAD_PREFIX = alsoHeadMarkerPrefix(node);
-      env.EVENT_ACTION = "${{ github.event.action }}";
-      // The review is the bot's, so only the token that posted (and stamps) it can edit it.
-      env.STAMP_TOKEN = tokenExpr(ctx);
-      lines.push(
-        `# unchanged-diff: hash the PR's merge-base diff and compare it with the hash`,
-        `# stamped into this bot's last review. Blob ids and hunk positions are`,
-        `# dropped first, so a rebase or a merge from the base branch that leaves the`,
-        `# change itself untouched hashes the same. Only a push (synchronize) is`,
-        `# ever skipped this way: a label, a ready-for-review or a re-request is`,
-        `# someone asking for a review, and "nothing changed" is no answer to that.`,
-        `BASE_SHA=$(jq -r '.base.sha // ""' <<< "$PR_JSON")`,
-        `if [ -n "$HEAD_SHA" ] && [ -n "$BASE_SHA" ] \\`,
-        `  && DIFF=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" -H "Accept: application/vnd.github.diff" 2>/dev/null) \\`,
-        `  && [ -n "$DIFF" ]; then`,
-        `  DIFF_HASH=$(printf '%s\\n' "$DIFF" \\`,
-        `    | sed -E -e '/^index [0-9a-f]+\\.\\.[0-9a-f]+/d' -e 's/^@@ -[0-9,]+ \\+[0-9,]+ @@/@@/' \\`,
-        `    | sha256sum | cut -d' ' -f1)`,
-        `  LAST_REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '`,
-        `    .[] | select(.user.login == env.BOT_LOGIN) | select((.body // "") | contains(env.MARKER_PREFIX))`,
-        `    | "\\(.id) \\((.body // "") | split(env.MARKER_PREFIX) | last | .[0:64])"' 2>/dev/null | tail -n 1) || LAST_REVIEW=""`,
-        `  LAST_ID=\${LAST_REVIEW%% *}; LAST=\${LAST_REVIEW#* }`,
-        `  if [ "$EVENT_ACTION" = "synchronize" ] && [ -n "$LAST" ] && [ "$LAST" = "$DIFF_HASH" ]; then`,
-        `    # That review covers this head too: say so in it, so a downstream lane can`,
-        `    # tell "reviewed" from the other reasons this lane skips. One marker per`,
-        `    # head, appended. Skip only once the marker is there: a sweep with`,
-        `    # requires_review selects a head only on a review that covers it, so a`,
-        `    # skip without the marker would leave the head unreviewed and never`,
-        `    # selected. If the read or the edit fails, the lane runs again instead.`,
-        `    MARK="$ALSO_HEAD_PREFIX$HEAD_SHA -->"`,
-        `    MARKED=""`,
-        `    if BODY=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" --jq '.body // ""' 2>/dev/null); then`,
-        `      case "$BODY" in`,
-        `        *"$MARK"*) MARKED=1 ;;`,
-        `        *) if GH_TOKEN="$STAMP_TOKEN" gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$LAST_ID" \\`,
-        `             -f body="$(printf '%s\\n%s' "$BODY" "$MARK")" >/dev/null; then MARKED=1; fi ;;`,
-        `      esac`,
-        `    fi`,
-        `    if [ -n "$MARKED" ]; then`,
-        `      skip "the diff is unchanged since the last review"`,
-        `    fi`,
-        `    echo "::notice::the diff is unchanged since review $LAST_ID, but it could not be marked as covering $HEAD_SHA — running the lane again"`,
-        `  fi`,
-        `else`,
-        `  echo "::warning::could not hash the diff of PR #$PR — not skipping on unchanged-diff"`,
-        `fi`,
-      );
+      unchangedDiffLines(ctx, env, lines);
     }
   }
   lines.push(``, `finish`);
@@ -293,12 +423,83 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     // Semantic key -> the repo's actual label, like every other label guard.
     skipLabels[`SKIP_LABEL_${Object.keys(skipLabels).length + 1}`] = ctx.config.labels?.[c.label] ?? c.label;
   }
+  // Listing the candidates. The API has a bad minute now and then (a truncated
+  // page is "unexpected end of JSON input"); one retry, and after that a quiet
+  // tick: nothing else in the sweep has run, so there is nothing to be red about.
+  const LIST_FALLBACK = [
+    `LIST=$(list_prs) || { sleep "\${LIST_RETRY_SECONDS:-5}"; LIST=$(list_prs); } || {`,
+    `  echo "::notice::could not list open pull requests this tick — nothing selected; the next sweep tries again"`,
+    `  { echo "prs=[]"; echo "count=0"; } >> "$GITHUB_OUTPUT"`,
+    `  exit 0`,
+    `}`,
+  ];
+  const hybrid = isHybrid(ctx.config);
+  const listing: string[] = hybrid
+    ? [
+        `# The candidates were listed and scoped by the step above: the rollout rule`,
+        `# every lane and the gate share, not a copy of it here.`,
+        `if [ "$SCOPE_LISTED" != "true" ]; then`,
+        `  echo "::notice::could not list open pull requests this tick — nothing selected; the next sweep tries again"`,
+        `  { echo "prs=[]"; echo "count=0"; } >> "$GITHUB_OUTPUT"`,
+        `  exit 0`,
+        `fi`,
+        `LIST=$(jq -r '.[] | "\\(.number) \\(.sha) \\(.requested) \\(.quiet) \\(.base)"' <<< "$SCOPED")`,
+      ]
+    : [
+        `list_prs() {`,
+        `  gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&sort=created&direction=asc&per_page=100" --paginate --jq '`,
+        `  .[] | select(.draft | not)`,
+        `  | select(.head.ref | startswith(env.PREFIX))`,
+        ...(authors
+          ? [
+              optIn
+                ? `  | select(${authorTest} or ((.labels // []) | any(.name == env.OPT_IN_LABEL)))`
+                : `  | select(${authorTest})`,
+            ]
+          : []),
+        ...(skipBots
+          ? [`  | select((.user.login // "") == env.BOT_LOGIN or (((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not)))`]
+          : []),
+        ...Object.keys(skipLabels).map((k) => `  | select((.labels // []) | any(.name == env.${k}) | not)`),
+        `  | "\\(.number) \\(.head.sha) \\((.requested_reviewers | length) + (.requested_teams | length)) \\(now - (.updated_at | fromdateiso8601) | floor) \\(.base.ref)"'`,
+        `}`,
+        ...LIST_FALLBACK,
+      ];
+  const rollout = rolloutOf(ctx.config);
+  const scopeListSteps: StepSpec[] = hybrid
+    ? [
+        ...(ctx.config.runtime?.mode === "vendored"
+          ? [
+              {
+                // A scheduled run checks out the default branch: the harness's own copy.
+                uses: "actions/checkout@v5",
+                name: "Checkout the scope action",
+                with: { "sparse-checkout": ".github/actions/pr-scope", "fetch-depth": 1, "persist-credentials": false },
+              } as StepSpec,
+            ]
+          : []),
+        {
+          uses: ctx.actionRef("pr-scope"),
+          id: "scope",
+          name: "List the pull requests in scope",
+          with: {
+            list: "true",
+            token: "${{ github.token }}",
+            "base-branch": ctx.config.repo.base_branch,
+            ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
+            ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+          },
+        },
+      ]
+    : [];
   const run = [
     `# Pick the PR heads that are ready for a decision. Selection is a pure`,
     `# function of repo state — no agent, no randomness — and every read fails`,
     `# CLOSED: a head whose state cannot be read is left for the next sweep.`,
     `#`,
-    `#   candidate   open, not a draft, on a harness branch${authors ? ", by an allowlisted author" : ""}${optIn ? " or labelled $OPT_IN_LABEL" : ""}`,
+    hybrid
+      ? `#   candidate   open and in scope by the rollout (decided by the step above)`
+      : `#   candidate   open, not a draft, on a harness branch${authors ? ", by an allowlisted author" : ""}${optIn ? " or labelled $OPT_IN_LABEL" : ""}`,
     ...(skipBots || Object.keys(skipLabels).length
       ? [`#   not skipped ${[skipBots ? "not opened by a bot (the harness's own is exempt)" : "", Object.keys(skipLabels).length ? "no skip= label" : ""].filter(Boolean).join(", ")}`]
       : []),
@@ -313,24 +514,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
       : []),
     `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head, and fewer`,
     `#               than $MAX_IDLE runs that succeeded without leaving a verdict`,
-    `LIST=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&sort=created&direction=asc&per_page=100" --paginate --jq '`,
-    `  .[] | select(.draft | not)`,
-    `  | select(.head.ref | startswith(env.PREFIX))`,
-    ...(authors
-      ? [
-          optIn
-            ? `  | select(${authorTest} or ((.labels // []) | any(.name == env.OPT_IN_LABEL)))`
-            : `  | select(${authorTest})`,
-        ]
-      : []),
-    ...(skipBots
-      ? [`  | select((.user.login // "") == env.BOT_LOGIN or (((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not)))`]
-      : []),
-    ...Object.keys(skipLabels).map((k) => `  | select((.labels // []) | any(.name == env.${k}) | not)`),
-    `  | "\\(.number) \\(.head.sha) \\((.requested_reviewers | length) + (.requested_teams | length)) \\(now - (.updated_at | fromdateiso8601) | floor) \\(.base.ref)"') || {`,
-    `  echo "::error::could not list open pull requests"`,
-    `  exit 1`,
-    `}`,
+    ...listing,
     `SELECTED='[]'`,
     `while read -r NUM SHA REQUESTED QUIET BASE; do`,
     `  [ -n "$NUM" ] || continue`,
@@ -392,11 +576,15 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
       count: "${{ steps.select.outputs.count }}",
     },
     steps: [
+      ...scopeListSteps,
       runStep({
         id: "select",
         name: "Select pull requests ready for a decision",
         env: {
           GH_TOKEN: "${{ github.token }}",
+          ...(hybrid
+            ? { SCOPED: "${{ steps.scope.outputs.prs }}", SCOPE_LISTED: "${{ steps.scope.outputs.listed }}" }
+            : {}),
           PREFIX: ctx.config.repo.branch_prefix,
           BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
           VERDICT_LINES: verdictLinesOf(ctx.config),

@@ -41,6 +41,15 @@ disqualifying first:
    requested reviewer or team, else `review-requested`.
 8. **Open review threads** (opt-in, `requireNoOpenThreads: true`) — no open
    thread, else `open-threads`. See [Open threads](#open-threads).
+   Between those two, opt-in: **standing change requests**
+   (`requireNoHumanChangesRequested: true`) — no person whose latest deciding
+   review is "changes requested", else `changes-requested`. Without it the latest
+   verdict wins, so the bot's later approval overrides a teammate's block.
+
+An **escalation label** (`escalationLabels: [...]`) is checked first, right after
+blocking labels and in both lanes: a PR carrying one is never merged (`escalated`),
+and in evaluate mode its check is `action_required` whether or not the approver
+has given a verdict.
 9. **Hand-written additions** — additions of non-`excludeGlobs` files must be
    `<= maxAdditions`, else apply `labels.needsHuman`.
 10. **Protected paths** — no changed file may match `protectedPaths`, else apply
@@ -97,6 +106,45 @@ Logins compare case-insensitively and with or without the `[bot]` suffix
 (GraphQL drops it). A failed thread read fails closed: the PR is not evaluated
 that run.
 
+## The single gate (`merge`)
+
+`merge: off | agent-only` is one gate for a repo where people and agents both
+open pull requests. Each tick, for every PR in scope:
+
+1. the result is worked out against the policy;
+2. it is published as the check `check-name` on the PR's head;
+3. with `agent-only`, a PR the pipeline **wrote** — opened by `bot-login`, every
+   commit its own — is acted on: merged when ready, labelled per the policy when
+   not. One merge per run.
+
+A human-written PR gets the check and nothing else: no merge, no label, no
+comment. With `agent-only` the check's text says who merges the PR and, for a
+PR that is not agent-written, why not.
+
+Scope comes from the `rollout` input (the dial in `foundry.config.yaml`), not
+from a branch prefix: a draft never, a PR with the skip label never, a PR
+`bot-login` opened always, another bot only if named in `authors`, then a listed
+author or the opt-in label. With no rollout, every remaining PR. The policy's
+`branchPrefix` clause is not applied. If the policy enables the dependabot lane,
+dependabot's PRs are judged and merged on that lane as before.
+
+`check-app` names the app whose runs the gate adopts. Leave it empty when the
+check is published with `GITHUB_TOKEN`; pass the harness App's slug when
+`checks-token` is that App's token, so a check published by any other workflow
+is never taken for the gate's.
+
+Which app owns the check matters twice over. A `GITHUB_TOKEN` check belongs to
+`github-actions`, so any workflow in the repo can publish one under the same
+name — it cannot safely be a required check — and GitHub files it under whatever
+Actions check suite is already on the commit, so it can show up beneath an
+unrelated workflow's name. A check written with the harness's App token belongs
+to that App alone. Anything that requires it downstream (another gate's
+`required-checks`, a ruleset) should name it pinned to the App:
+`<check name>@<app slug>`.
+
+`mode` (below) is the older interface and is unchanged; `merge` and `mode`
+cannot both be set.
+
 ## Evaluate mode
 
 `mode: evaluate` never merges, labels or comments. It evaluates the policy for
@@ -109,8 +157,8 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | --- | --- |
 | `success` | the gate's decision is `merge` |
 | `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`) |
-| `neutral` | `noVerdictConclusion: neutral` and the head has no verdict yet, with the missing approval as its only failing clause ("awaiting the approver") |
-| `failure` | anything else; `output.summary` carries the gate's `code` and `reason` |
+| `neutral` | `noVerdictConclusion: neutral` and the trusted approver has given no verdict (approve, reject or escalate) on the head yet ("Awaiting the approver"), whatever else fails; `output.summary` lists every other clause still failing (CI counts, unanswered threads, review requests, size, protected paths) |
+| `failure` | anything else (a rejected head, an approved head with a clause failing, or any unverdicted head without `noVerdictConclusion: neutral`); `output.summary` carries the gate's first failing `code` and `reason` |
 
 `output.text` lists the open threads, the checks not passing and the pending
 review requests. The run is written with `checks-token` (GITHUB_TOKEN) and is

@@ -17,14 +17,16 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import yaml from "js-yaml";
 import {
+  escalationLabel,
   sameLogin,
+  standingChangeRequests,
   visibleBody,
   checkConclusion,
   describeCheckRunsFailure,
   evaluateMergeGate,
   filterCandidateNumbers,
   filterEvaluateCandidates,
-  awaitingApproverOnly,
+  awaitingApprover,
   latestHeadVerdict,
   openThreads,
   filterCountableVerdicts,
@@ -46,6 +48,7 @@ import {
   type VerdictTrustPolicy,
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
+import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
@@ -301,6 +304,12 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     ...(pr.requested_reviewers ?? []).map((u) => u.login),
     ...(pr.requested_teams ?? []).map((t) => `team:${t.slug}`),
   ];
+  // Whose formal review stands at "changes requested" — read only by the opt-in
+  // require_no_human_changes_requested clause, but cheap: the reviews are in hand.
+  const changesRequestedBy = standingChangeRequests(
+    reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, state: r.state })),
+    policy.botLogin,
+  );
   const headVerdict = latestHeadVerdict(
     reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
     pr.head.sha,
@@ -308,7 +317,7 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     markers,
   );
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, escalated: headVerdict === "escalate", headVerdict };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -421,14 +430,55 @@ export interface CheckOutput {
 
 const CHECK_TEXT_LIMIT = 60000; // GitHub caps output.text at 65535 characters
 
+/** Check runs on the head that are not (yet) green, minus the ignored ones. */
+function checksNotPassing(facts: PullRequestFacts, ignore: Set<string>): CheckRunFact[] {
+  return (facts.checkRuns ?? []).filter(
+    (c) => !ignore.has(c.name) && !(c.status === "completed" && ["success", "skipped", "neutral"].includes(c.conclusion ?? "")),
+  );
+}
+
+/**
+ * The neutral summary: the approver's verdict is missing, plus every other clause
+ * that fails on the head, so the author sees what else they will need. A failing
+ * CI clause is told as counts of running and failed checks.
+ */
+function awaitingSummary(alsoFailing: MergeDecision[], facts: PullRequestFacts, ignore: Set<string>): string {
+  if (alsoFailing.length === 0) {
+    return "awaiting the approver — every other clause of the merge policy passes on this head.";
+  }
+  const describe = (d: MergeDecision): string => {
+    if (d.code === "ci-not-passing") {
+      const notPassing = checksNotPassing(facts, ignore);
+      const running = notPassing.filter((c) => c.status !== "completed").length;
+      const failed = notPassing.length - running;
+      const parts = [
+        running ? `${running} check run${running === 1 ? "" : "s"} still running` : "",
+        failed ? `${failed} check run${failed === 1 ? "" : "s"} not successful` : "",
+      ].filter(Boolean);
+      if (parts.length) return `CI: ${parts.join(", ")}`;
+    }
+    if (d.code === "open-threads" && d.detail?.openThreads) {
+      const n = d.detail.openThreads;
+      return `${n} unanswered review thread${n === 1 ? "" : "s"}`;
+    }
+    return d.reason;
+  };
+  return [
+    "awaiting the approver — the approver has not given a verdict on this head yet. Also failing:",
+    "",
+    ...alsoFailing.map((d) => `- \`${d.code}\` — ${describe(d)}`),
+  ].join("\n");
+}
+
 /**
  * The check run for one head. Deterministic for an unchanged state — no clock in
  * it — so the next tick can tell nothing changed and skip the write. (The
  * ready-to-merge reason carries "approved Nm ago", so success gets fixed text.)
  */
 export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
-  const awaitingApprover = policy.noVerdictConclusion === "neutral" && awaitingApproverOnly(facts, decision, policy);
-  const conclusion = checkConclusion(decision, facts, { awaitingApprover });
+  const alsoFailing = policy.noVerdictConclusion === "neutral" ? awaitingApprover(facts, policy) : undefined;
+  const conclusion = checkConclusion(decision, facts, { awaitingApprover: alsoFailing !== undefined });
+  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
@@ -442,9 +492,9 @@ export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFac
           : `Not ready: ${decision.code}`;
   const summary =
     conclusion === "action_required"
-      ? `The reviewer escalated this head to a human.\n\nGate: ${gateLine}`
+      ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}`
       : conclusion === "neutral"
-        ? "awaiting the approver — every other clause of the merge policy passes on this head."
+        ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;
 
   const sections: string[] = [];
@@ -460,10 +510,7 @@ export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFac
       }),
     );
   }
-  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
-  const failing = (facts.checkRuns ?? []).filter(
-    (c) => !ignore.has(c.name) && !(c.status === "completed" && ["success", "skipped", "neutral"].includes(c.conclusion ?? "")),
-  );
+  const failing = checksNotPassing(facts, ignore);
   if (failing.length) {
     sections.push("### Checks not passing", ...failing.map((c) => `- \`${c.name}\`: ${c.status === "completed" ? c.conclusion : c.status ?? "pending"}`));
   }
@@ -487,10 +534,14 @@ export async function publishCheck(
   headSha: string,
   name: string,
   out: CheckOutput,
+  // The app whose runs this gate adopts and updates: github-actions when it
+  // publishes with GITHUB_TOKEN, the harness's own App when it publishes with
+  // that App's token (see the `check-app` input).
+  app: string = CHECK_APP,
 ): Promise<"created" | "updated" | "unchanged"> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs
-    .filter((r) => r.name === name && r.app?.slug === CHECK_APP)
+    .filter((r) => r.name === name && r.app?.slug === app)
     .sort((a, b) => b.id - a.id)[0];
   if (
     mine &&
@@ -592,6 +643,124 @@ export async function runEvaluate(opts: {
   return { evaluated: numbers.length, written };
 }
 
+export type MergeSetting = "off" | "agent-only";
+
+/**
+ * The single gate (`merge=` on the node). Each tick, for every pull request the
+ * pipeline looks at — the rollout dial decides that, not a branch prefix:
+ *
+ *   1. work out the result against the policy;
+ *   2. publish it as the check on the PR's head, human PR or agent PR alike;
+ *   3. with merge="agent-only", act on a PR the pipeline WROTE: merge it when
+ *      ready, or apply the policy's labels when not.
+ *
+ * A human-written PR gets the check and nothing else, ever: no merge, no label,
+ * no comment. The check a person reads on their PR is, by construction, the same
+ * decision that merges an agent's.
+ */
+export async function runHybridGate(opts: {
+  octokit: Octokit;
+  checksOctokit: Octokit;
+  owner: string;
+  repo: string;
+  policy: PolicyFile;
+  checkName: string;
+  checkApp: string;
+  baseBranch: string;
+  merge: MergeSetting;
+  rollout: Rollout | undefined;
+  prNumber?: number;
+  dryRun: boolean;
+}): Promise<{ evaluated: number; written: number; mergedPr: string }> {
+  const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
+  if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
+    throw new Error(`no_verdict_conclusion must be "failure" or "neutral", got ${JSON.stringify(opts.policy.noVerdictConclusion)}`);
+  }
+  // Scope comes from the rollout dial, so the branch prefix is not a clause here:
+  // a person's PR on any branch is judged on its merits, not failed for its name.
+  // The gate's own check is left out of the CI rollup, or a failing result would
+  // read as failing CI and hold itself failing.
+  const base: PolicyFile = { ...opts.policy, branchPrefix: undefined, ciIgnoreCheckNames: [...(opts.policy.ciIgnoreCheckNames ?? []), checkName] };
+  // The CHECK does not judge mergeability unless the policy asks: GitHub computes
+  // it lazily and only a merge attempt settles it. The MERGE keeps the default.
+  const checkPolicy: PolicyFile = { ...base, requireCleanRebase: opts.policy.requireCleanRebase ?? false };
+  const botLogin = base.botLogin;
+  const dependabotLane = (base.dependabot?.autoMerge?.length ?? 0) > 0;
+
+  const prs =
+    opts.prNumber !== undefined
+      ? [(await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data]
+      : await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
+
+  let evaluated = 0;
+  let written = 0;
+  let mergedPr = "";
+  for (const p of prs) {
+    const n = p.number;
+    const author = p.user?.login;
+    const scope = inScope(
+      { authorLogin: author, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean) },
+      rollout,
+      botLogin,
+    );
+    // The policy's dependabot lane is its own explicit opt-in, and stays one:
+    // when it is on, dependabot's PRs are judged (and merged) on that lane.
+    const onDependabotLane = dependabotLane && author === DEPENDABOT_LOGIN && !p.draft;
+    if (!scope.inScope && !onDependabotLane) {
+      core.info(`PR #${n}: out of scope — ${scope.detail}`);
+      continue;
+    }
+    evaluated++;
+    try {
+      const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit);
+
+      // Who merges this PR? Only asked when the gate may merge at all.
+      let writer: { agentWritten: boolean; detail: string } | undefined;
+      if (opts.merge === "agent-only" && !onDependabotLane) {
+        let commits: { authorLogin?: string | null }[] | undefined;
+        if (sameLogin(author, botLogin)) {
+          try {
+            commits = (await octokit.paginate(octokit.rest.pulls.listCommits, { owner, repo, pull_number: n, per_page: 100 })).map((c) => ({ authorLogin: c.author?.login }));
+          } catch (e) {
+            core.warning(`PR #${n}: could not read its commits (${(e as Error).message}) — treating it as human-written`);
+          }
+        }
+        writer = isAgentWritten({ authorLogin: author }, commits, botLogin);
+      }
+
+      const decision = evaluateMergeGate(facts, checkPolicy);
+      const out = renderCheckOutput(decision, facts, checkPolicy, checkName);
+      // Say, on the PR, who will merge it — the one thing the result alone does not.
+      if (opts.merge === "agent-only") {
+        const line = onDependabotLane
+          ? "Merge: the pipeline merges this PR on the dependabot lane when it is ready."
+          : writer?.agentWritten
+            ? "Merge: the pipeline wrote this PR and merges it when it is ready."
+            : `Merge: a person merges this PR — it is not agent-written (${writer?.detail ?? "unknown"}).`;
+        out.text = out.text ? `${out.text}\n\n${line}` : line;
+      }
+      core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
+      if (!opts.dryRun && facts.headSha) {
+        const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
+        if (result !== "unchanged") written++;
+        core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
+      }
+
+      // Acting is for the pipeline's own PRs only, and one merge per run.
+      if (opts.merge !== "agent-only" || mergedPr) continue;
+      if (!onDependabotLane && !writer?.agentWritten) continue;
+      // Judged again under the merge's own policy: the rebase clause is on here
+      // by default, where the check above leaves it off.
+      const mergeDecision = evaluateMergeGate(facts, base);
+      if (await actOnDecision(octokit, owner, repo, n, facts, mergeDecision, base, opts.dryRun)) mergedPr = String(n);
+    } catch (e) {
+      core.warning(`PR #${n}: not evaluated this tick — ${(e as Error).message}`);
+    }
+  }
+  core.info(`${evaluated} PR(s) in scope${mergedPr ? `; merged #${mergedPr}` : ""}`);
+  return { evaluated, written, mergedPr };
+}
+
 export async function run(): Promise<void> {
   try {
     const token = core.getInput("token", { required: true });
@@ -636,6 +805,40 @@ export async function run(): Promise<void> {
       );
     }
     const { owner, repo } = github.context.repo;
+
+    // merge= — the single gate. Scope from the rollout dial, a check on every PR
+    // in scope, and (agent-only) merges for the PRs the pipeline wrote.
+    const mergeSetting = core.getInput("merge").trim();
+    if (mergeSetting) {
+      if (mergeSetting !== "off" && mergeSetting !== "agent-only") throw new Error(`merge must be "off" or "agent-only", got "${mergeSetting}"`);
+      if (core.getInput("mode").trim()) throw new Error("set merge or mode, not both: merge replaces mode");
+      const checkName = core.getInput("check-name").trim();
+      if (!checkName) throw new Error("merge needs a check-name: the gate publishes its result as a check");
+      const rolloutInput = core.getInput("rollout").trim();
+      let rollout: Rollout | undefined;
+      if (rolloutInput) {
+        try {
+          rollout = JSON.parse(rolloutInput) as Rollout;
+        } catch {
+          throw new Error("rollout must be the JSON the compiler writes — run `gp-foundry build`");
+        }
+      }
+      let prNumber: number | undefined;
+      if (prNumberInput) {
+        prNumber = parseInt(prNumberInput, 10);
+        if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
+      }
+      const r = await runHybridGate({
+        octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun, rollout,
+        merge: mergeSetting,
+        checkApp: core.getInput("check-app").trim() || CHECK_APP,
+      });
+      core.setOutput("evaluated", String(r.evaluated));
+      core.setOutput("checks-written", String(r.written));
+      core.setOutput("merged", String(r.mergedPr !== ""));
+      core.setOutput("merged-pr", r.mergedPr);
+      return;
+    }
 
     const mode = core.getInput("mode").trim() || "merge";
     if (mode !== "merge" && mode !== "evaluate") throw new Error(`mode must be "merge" or "evaluate", got "${mode}"`);

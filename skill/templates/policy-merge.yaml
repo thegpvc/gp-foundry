@@ -85,13 +85,24 @@ labels:
 # bot_logins: ["greptile-apps[bot]", "cursor[bot]"]
 # bot_thread_blocking_regex: "P1|High Severity"
 #
-# What the check says for a head with no verdict yet whose ONLY failing clause is the
-# missing approval: failure (default) or neutral ("awaiting the approver"), which keeps a
-# red X off every PR between its review and the approver's verdict.
+# What the check says for a head the approver has not given a verdict on yet (no
+# approve, reject or escalate): failure (default) or neutral ("Awaiting the approver"),
+# which keeps a red X off every PR the approver has not decided. The neutral summary
+# still lists every other failing clause (CI, threads, review requests, size).
 # no_verdict_conclusion: neutral
 #
 # Fail (`review-requested`) while a reviewer or team is still requested.
 # require_no_review_requests: true
+#
+# Fail (`changes-requested`) while any PERSON's review stands at "changes requested".
+# Without it the latest verdict wins, so a later approval from the bot overrides a
+# teammate's block; with it the block holds until they approve or it is dismissed.
+# require_no_human_changes_requested: true
+#
+# Labels that hand a PR to a person outright: never merged, and in evaluate mode the
+# check is `action_required`, whether or not the approver has given a verdict.
+# (`blocking_labels` only hold a merge back; these say who decides.)
+# escalation_labels: [needs-human-decision]
 #
 # The trusted reviewer's latest verdict on the head being an escalation turns the check
 # `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`

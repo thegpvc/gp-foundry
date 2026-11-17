@@ -6,6 +6,7 @@
  * it and fall back to "attribute absent" so assemble stays non-throwing.
  */
 import type { FoundryConfig, HarnessNode } from "../ir/types.js";
+import { parseRollout, type Rollout } from "../shared/scope.js";
 import { parseVerdictWords, verdictLinesEnv } from "../shared/verdicts.js";
 
 // ── the attribute vocabulary ─────────────────────────────────────────────────
@@ -22,8 +23,8 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "gates", "skip", "select", "authors", "max_attempts", "agent_attempts",
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
-  "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
-  "mode", "check_name", "requires_review", "post", "post_marker",
+  "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
+  "mode", "merge", "check_name", "requires_review", "post", "post_marker",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -297,6 +298,42 @@ export function isEvaluateGate(node: HarnessNode): boolean {
   }
 }
 
+export type MergeSetting = "off" | "agent-only";
+
+/**
+ * `merge=` on a merge-gate: the single gate. It publishes its result as a check
+ * on every PR in scope, and
+ *   "off"         never merges;
+ *   "agent-only"  also merges the PRs the pipeline wrote, when they are ready.
+ * An enumeration, so a later value can be added without changing these two.
+ * Undefined when the attribute is absent (the gate then runs as it always has:
+ * `mode=`, or the original merging gate). Throws on any other value.
+ */
+export function parseMergeSetting(node: HarnessNode): MergeSetting | undefined {
+  const raw = node.attrs.merge;
+  if (raw === undefined) return undefined;
+  if (raw === "off" || raw === "agent-only") return raw;
+  throw new Error(`node '${node.id}': merge= must be "off" or "agent-only", got ${JSON.stringify(raw)}`);
+}
+
+/**
+ * parseMergeSetting for emitters. A malformed value is validate()'s to report,
+ * and must not compile to a gate that merges: it reads as "off".
+ */
+export function mergeSettingOf(node: HarnessNode): MergeSetting | undefined {
+  if (node.type !== "merge-gate" || node.attrs.merge === undefined) return undefined;
+  try {
+    return parseMergeSetting(node);
+  } catch {
+    return "off";
+  }
+}
+
+/** Does this gate publish a check? An evaluate gate, or any gate with `merge=`. */
+export function publishesCheck(node: HarnessNode): boolean {
+  return isEvaluateGate(node) || mergeSettingOf(node) !== undefined;
+}
+
 /** The check run an evaluate gate publishes: `check_name=`, else `gp-foundry/approval (<node>)`. Throws on a malformed value. */
 export function parseEvaluateCheckName(node: HarnessNode): string {
   const raw = node.attrs.check_name;
@@ -373,12 +410,109 @@ export function parsePostMarker(node: HarnessNode): string {
  * has something to guard on: a `skip=` condition or an author allowlist.
  */
 export function hasSkipGuard(node: HarnessNode, cfg: FoundryConfig): boolean {
+  // A hybrid harness guards every lane handed a pull request by an event: the
+  // rollout decides whose PRs it looks at, and a writing lane which it may touch.
+  if (isHybrid(cfg)) return node.attrs.schedule === undefined && (isReadingPrLane(node) || isWritingPrLane(node));
   return (
     (node.type === "pr-review" || node.type === "analyst") &&
     hasPrContext(node) &&
     node.attrs.schedule === undefined &&
     (skipOf(node).length > 0 || authorsOf(node, cfg) !== undefined)
   );
+}
+
+// ── runs_on= / runtime.runs_on ───────────────────────────────────────────────
+
+export const DEFAULT_RUNNER = "ubuntu-latest";
+
+/** One runner label. Strict: it is written into `runs-on:` as is. */
+const RUNNER = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Throws unless `raw` is a single runner label (`ubuntu-latest`, `blacksmith-4vcpu-ubuntu-2404`). */
+export function parseRunner(raw: unknown, where: string): string {
+  if (typeof raw !== "string" || !RUNNER.test(raw)) {
+    throw new Error(`${where} must be one runner label like "ubuntu-latest", got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
+/**
+ * The runner a node's jobs use: its own `runs_on=`, else `runtime.runs_on`, else
+ * ubuntu-latest. A malformed value is validate()'s to report and falls through.
+ */
+export function runnerOf(node: HarnessNode | undefined, cfg: FoundryConfig): string {
+  for (const [raw, where] of [
+    [node?.attrs.runs_on, "runs_on="],
+    [cfg.runtime?.runs_on, "runtime.runs_on"],
+  ] as const) {
+    if (raw === undefined) continue;
+    try {
+      return parseRunner(raw, where);
+    } catch {
+      // fall through to the next source
+    }
+  }
+  return DEFAULT_RUNNER;
+}
+
+// ── the hybrid harness: rollout scope, reading and writing lanes ─────────────
+
+/**
+ * A harness is hybrid — people and agents both open pull requests in it — when
+ * its config has a `rollout` block, even an empty one (`rollout: {}` = every PR).
+ * That one key is the opt-in: scope then comes from the rollout dial for every
+ * lane and the gate, instead of from `repo.branch_prefix` and per-node attrs.
+ * Without the key, every lane compiles exactly as it did before.
+ */
+export function isHybrid(cfg: FoundryConfig): boolean {
+  return cfg.rollout !== undefined && cfg.rollout !== null;
+}
+
+/**
+ * The parsed rollout for emitters. A malformed block is validate()'s to report
+ * and must not compile to "everyone": it admits nobody by name.
+ */
+export function rolloutOf(cfg: FoundryConfig): Rollout | undefined {
+  if (!isHybrid(cfg)) return undefined;
+  try {
+    return parseRollout(cfg.rollout, cfg.labels) ?? {};
+  } catch {
+    return { authors: [] };
+  }
+}
+
+/** A lane that reads a pull request and advises: it runs on any PR in scope. */
+export function isReadingPrLane(node: HarnessNode): boolean {
+  return (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);
+}
+
+/** A lane that pushes to a pull request: it runs only on PRs the pipeline wrote. */
+export function isWritingPrLane(node: HarnessNode): boolean {
+  return node.type === "pr-fix";
+}
+
+const PR = "github.event.pull_request";
+
+/**
+ * The job-level `if:` for a hybrid PR lane: a cheap test on the event payload
+ * that keeps a runner from starting for a PR plainly out of scope. It is a
+ * prefilter, not the decision — the lane's guard runs the real rule (pr-scope)
+ * against the live PR — so where the two could differ it errs towards letting
+ * the event through (another bot's PR, which only the guard turns away).
+ */
+export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, writing: boolean): string {
+  const clauses = [`${PR}.draft == false`];
+  if (rollout.skipLabel) clauses.push(`!contains(${PR}.labels.*.name, ${exprString(rollout.skipLabel)})`);
+  const by = (login: string) => `${PR}.user.login == ${exprString(login)}`;
+  if (writing) {
+    // Only the pipeline's own PRs; with no bot login there are none (validate errors).
+    clauses.push(by(botLogin ?? NO_AUTHOR));
+  } else if (rollout.authors !== undefined || rollout.optInLabel !== undefined) {
+    const admit = [...(botLogin ? [by(botLogin)] : []), ...(rollout.authors ?? []).map(by)];
+    if (rollout.optInLabel) admit.push(`contains(${PR}.labels.*.name, ${exprString(rollout.optInLabel)})`);
+    clauses.push(admit.length === 1 ? admit[0]! : `(${admit.length ? admit.join(" || ") : by(NO_AUTHOR)})`);
+  }
+  return clauses.join(" && ");
 }
 
 /** The job that decides whether (or for which PRs) the node's own job runs. */

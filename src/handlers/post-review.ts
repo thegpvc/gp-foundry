@@ -1,7 +1,7 @@
 /**
  * post="review": the step that posts the review an agent PRINTED. The agent ends
- * its final message with one fenced json block; this step extracts the last one,
- * validates it, prepends the idempotency heading, sets commit_id to the head and
+ * its final message with one fenced json block; this step extracts the last one
+ * (or, with no fence, a bare object at the end of the output), validates it, prepends the idempotency heading, sets commit_id to the head and
  * POSTs it with the lane's token. Generated from one script so the compiled
  * workflow and the tests run the same text.
  */
@@ -14,8 +14,13 @@ const SCRIPT = `set -euo pipefail
 # token. The agent's output is DATA — nothing here evaluates it, and it reaches gh
 # only as a JSON file built by jq.
 preview() { head -c 200 "$STDOUT_FILE" | tr '\\n\\r' '  '; }
+# One line in the job summary saying what became of the review, under the agent's
+# output: a link to it when posted, and a plain statement when not — so nobody
+# has to read the log to learn whether the text above ever reached the PR.
+note() { if [ -n "\${GITHUB_STEP_SUMMARY:-}" ]; then printf '\\n%s\\n' "$1" >> "$GITHUB_STEP_SUMMARY"; fi; }
 if [ -z "\${STDOUT_FILE:-}" ] || [ ! -s "$STDOUT_FILE" ]; then
   echo "::warning::the agent printed nothing — no review posted"
+  note "_No review was posted: the agent printed nothing._"
   exit 0
 fi
 
@@ -26,8 +31,30 @@ BLOCK=$(awk '
   inb && /^[ \\t]*\`\`\`[ \\t]*$/ { inb = 0; last = buf; found = 1; next }
   inb { buf = buf $0 "\\n" }
   END { if (found) printf "%s", last }' "$STDOUT_FILE")
+
+# No fence: fall back to a BARE object at the end of the output, which models
+# print often enough. It ends on the last line ending in "}" (anything after it
+# is ignored) and starts on a line beginning with "{"; the start is the latest
+# such line from which the slice parses as exactly one object with a string
+# body. A line inside a pretty-printed object (a comment's "{") leaves the rest
+# of the object behind it, so it never parses alone and the scan moves up. A
+# fenced block, when there is one, always wins.
 if [ -z "$BLOCK" ]; then
-  echo "::warning::no fenced json review block in the agent's output — nothing posted. It began: $(preview)"
+  END_LINE=$(awk '/}[ \\t\\r]*$/ { e = NR } END { print e + 0 }' "$STDOUT_FILE")
+  if [ "$END_LINE" -gt 0 ]; then
+    for START in $(awk -v e="$END_LINE" 'NR <= e && /^[ \\t]*[{]/ { print NR }' "$STDOUT_FILE" | tail -n 200 | sort -rn); do
+      SLICE=$(sed -n "\${START},\${END_LINE}p" "$STDOUT_FILE")
+      if jq -se 'length == 1 and (.[0] | type == "object" and (.body | type) == "string")' <<< "$SLICE" > /dev/null 2>&1; then
+        BLOCK=$SLICE
+        echo "::notice::no fenced json block in the agent's output — using the bare JSON object at its end"
+        break
+      fi
+    done
+  fi
+fi
+if [ -z "$BLOCK" ]; then
+  echo "::warning::no review in the agent's output: neither a fenced json block nor a bare JSON object with a string body at its end — nothing posted. It began: $(preview)"
+  note "_No review was posted: the agent's output held no review block._"
   exit 0
 fi
 
@@ -45,6 +72,7 @@ if ! REVIEW=$(jq -c '
   | {body, event: "COMMENT", comments: [$c[] | {path, line, side: (if .side == "LEFT" then "LEFT" else "RIGHT" end), body}]}
 ' <<< "$BLOCK" 2> "$ERR"); then
   echo "::warning::the review block is not a valid review — nothing posted: $(head -c 300 "$ERR" | tr '\\n\\r' '  ')"
+  note "_No review was posted: the review block was not valid._"
   exit 0
 fi
 
@@ -52,6 +80,7 @@ fi
 # the exact verdict lines, or the sweep and the gate would read it differently.
 if [ "$REQUIRE_VERDICT" = "true" ] && ! jq -e '__IS_VERDICT_JQ__' <<< "$REVIEW" > /dev/null; then
   echo "::warning::the review's last line is not one of the verdict lines ($(tr '\\n' '|' <<< "$VERDICT_LINES")) — nothing posted"
+  note "_No review was posted: its last line is not one of the verdict lines._"
   exit 0
 fi
 
@@ -83,6 +112,7 @@ if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100"
 fi
 if [ "$EXISTING" != "0" ]; then
   echo "$NODE has already posted its review on $HEAD_SHA — not posting it again"
+  note "_The review for this head was already posted; nothing new was posted._"
   exit 0
 fi
 
@@ -92,12 +122,19 @@ jq -c --arg sha "$HEAD_SHA" --arg head "$MARKER" \\
 # The posted marker goes on last, after any reshaping of the body below: it is
 # an HTML comment, which every verdict test ignores, so a verdict line above it
 # is still the review's last visible line.
+RESP=$(mktemp)
 post() {
   jq -c --arg m "$POSTED" '.body += "\\n\\n" + $m' "$1" > "$1.out"
-  gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1.out" > /dev/null 2> "$ERR"
+  gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1.out" > "$RESP" 2> "$ERR"
+}
+# The review's own URL, from the API's response, for the job summary.
+posted_note() {
+  URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
+  if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
 }
 if post "$PAYLOAD"; then
   echo "posted the review on $HEAD_SHA"
+  posted_note
   exit 0
 fi
 
@@ -113,10 +150,12 @@ if grep -q "422" "$ERR" && grep -qiE "line|diff|position|resolve" "$ERR" && [ "$
     | .comments = []' "$PAYLOAD" > "$PAYLOAD.flat"
   if post "$PAYLOAD.flat"; then
     echo "posted the review on $HEAD_SHA, with its inline findings in the body"
+    posted_note
     exit 0
   fi
 fi
 echo "::error::could not post the review: $(head -c 500 "$ERR" | tr '\\n\\r' '  ')"
+note "_No review was posted: GitHub rejected it. See the job log._"
 exit 1
 `;
 
@@ -167,6 +206,7 @@ export function reviewOutputContract(ctx: EmitContext, verdictLane: boolean): st
     ...(verdictLane
       ? [`- The LAST line of \`body\` must be exactly one of: ${lines.map((l) => `\`${l}\``).join(", ")}. Anything else, and nothing is posted.`]
       : []),
+    "The fence is required: a bare object at the very end is accepted as a fallback, but always use the fence.",
     "If the block is missing or is not valid JSON, nothing is posted.",
   ].join("\n");
 }

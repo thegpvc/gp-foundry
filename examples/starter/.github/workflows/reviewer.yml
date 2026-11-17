@@ -6,20 +6,47 @@ name: reviewer
     types:
       - opened
       - synchronize
+      - ready_for_review
 concurrency:
   group: reviewer-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 permissions:
   contents: read
 jobs:
+  reviewer_guard:
+    name: reviewer guard
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false && github.event.pull_request.user.login == 'agent-bot'
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+      head_sha: ""
+      diff_hash: ""
+      started_at: ""
+    steps:
+      - name: Is this PR in scope?
+        id: scope
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.3.0
+        with:
+          number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          rollout: "{\"authors\":[]}"
+          bot-login: agent-bot
+          branch-prefix: agent/
   reviewer:
     runs-on: ubuntu-latest
-    if: startsWith(github.event.pull_request.head.ref, 'agent/')
+    if: needs.reviewer_guard.outputs.run == 'true'
     permissions:
       contents: read
       pull-requests: write
       checks: read
     timeout-minutes: 25
+    needs:
+      - reviewer_guard
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -44,11 +71,28 @@ jobs:
         run: |-
           mkdir -p .git/info
           echo "/.gp-foundry/" >> .git/info/exclude
+      - name: Use this PR's harness files if the base ref has no harness yet
+        shell: bash
+        env:
+          HARNESS: .gp-foundry/harness
+          SPEC: .github/harness.dot
+          DIRS: |-
+            .github/agent-setup
+            .github/agents
+        run: |-
+          if [ -f "$HARNESS/$SPEC" ]; then exit 0; fi
+          echo "::notice::the base ref has no harness yet ($SPEC) — using this pull request's own harness files. This only happens while the harness itself is being installed."
+          while IFS= read -r D; do
+            [ -n "$D" ] && [ -d "$D" ] || continue
+            mkdir -p "$HARNESS/$(dirname "$D")"
+            rm -rf "${HARNESS:?}/$D"
+            cp -R "$D" "$HARNESS/$D"
+          done <<< "$DIRS"
       - name: Setup agent toolchain
         uses: ./.gp-foundry/harness/.github/agent-setup
       - name: Fetch context
         id: ctx
-        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.3.0
         with:
           type: pr-diff
           number: ${{ github.event.pull_request.number }}
@@ -58,7 +102,7 @@ jobs:
           trusted-framing: baseline
       - name: Run agent
         timeout-minutes: 15
-        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.3.0
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/reviewer.md
           model: claude-opus-4-8

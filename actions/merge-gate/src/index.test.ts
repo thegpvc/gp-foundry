@@ -35,12 +35,22 @@ const CHECK = "fletch/approval";
 
 interface World {
   approved: boolean;
+  /** Labels on the PR. */
+  labels?: string[];
+  /** Is the PR a draft? */
+  draft?: boolean;
+  /** The head branch (default: an agent branch). */
+  headRef?: string;
+  /** Who authored each commit on the head, as GitHub attributes it (default: all the bot's). */
+  commits?: (string | null)[];
   /** Who opened the PR (default: the harness bot). */
   author?: { login: string; type: string };
   /** When set, the PR's reviews verbatim (overrides `approved`). */
   reviews?: unknown[];
   verdictBody?: string;
   threads: unknown[];
+  /** The head's CI check runs (default: one green `ci`). */
+  ci?: { id: number; name: string; status: string; conclusion: string | null; app: { slug: string } }[];
   existing: { id: number; name: string; status: string; conclusion: string; app: { slug: string }; output: { summary: string; text: string } }[];
 }
 
@@ -53,11 +63,11 @@ function makeOctokit(world: World) {
   const pr = {
     number: 7,
     title: "Add widget",
-    draft: false,
-    head: { sha: HEAD, ref: "agent/widget" },
+    draft: world.draft ?? false,
+    head: { sha: HEAD, ref: world.headRef ?? "agent/widget" },
     base: { ref: "main" },
     user: world.author ?? { login: BOT, type: "Bot" },
-    labels: [],
+    labels: (world.labels ?? []).map((name) => ({ name })),
     mergeable: true,
     mergeable_state: "clean",
     requested_reviewers: [],
@@ -84,6 +94,7 @@ function makeOctokit(world: World) {
               : []),
         ),
         listFiles: rec("pulls.listFiles", [{ filename: "src/w.ts", additions: 10, deletions: 0 }]),
+        listCommits: rec("pulls.listCommits", (world.commits ?? [BOT]).map((login) => ({ author: login ? { login } : null }))),
         merge: rec("pulls.merge", {}),
       },
       issues: {
@@ -97,8 +108,8 @@ function makeOctokit(world: World) {
       checks: {
         listForRef: async (params: any) => {
           calls.push({ method: "checks.listForRef", params });
-          const ci = { id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } };
-          const named = params.check_name ? world.existing.filter((c) => c.name === params.check_name) : [ci, ...world.existing];
+          const ci = world.ci ?? [{ id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } }];
+          const named = params.check_name ? world.existing.filter((c) => c.name === params.check_name) : [...ci, ...world.existing];
           return { data: named };
         },
         create: rec("checks.create", {}),
@@ -216,10 +227,50 @@ describe("merge-gate evaluate mode", () => {
     const create = stub.calls.find((c) => c.method === "checks.create")?.params;
     expect(create).toMatchObject({ conclusion: "neutral", output: { title: "Awaiting the approver" } });
     expect(create.output.summary).toContain("awaiting the approver");
-    // An open thread is a second failing clause: a real failure, not a wait.
+    expect(create.output.summary).toContain("every other clause of the merge policy passes");
+  });
+
+  it("no_verdict_conclusion: neutral stays neutral with other clauses failing, and names each", async () => {
+    const created = () => stub.calls.find((c) => c.method === "checks.create")?.params;
+    // An open thread: neutral, with the thread count in the summary.
     setup({ approved: false, threads: [openThread] }, "no_verdict_conclusion: neutral\n");
     await run();
-    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("failure");
+    expect(created()).toMatchObject({ conclusion: "neutral", output: { title: "Awaiting the approver" } });
+    expect(created().output.summary).toContain("has not given a verdict on this head yet");
+    expect(created().output.summary).toContain("`open-threads` — 1 unanswered review thread");
+    expect(created().output.text).toContain("src/w.ts:4");
+
+    // CI still running: neutral, with the running checks counted.
+    const running = (id: number) => ({ id, name: `test-${id}`, status: "in_progress", conclusion: null, app: { slug: "github-actions" } });
+    setup({ approved: false, ci: [running(1), running(2), running(3)] }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(created().conclusion).toBe("neutral");
+    expect(created().output.summary).toContain("`ci-not-passing` — CI: 3 check runs still running");
+    const summary = created().output.summary;
+    // Deterministic for an unchanged state: a second tick writes nothing.
+    const existing = [{ id: 9, name: CHECK, status: "completed", conclusion: "neutral", app: { slug: "github-actions" }, output: { summary, text: created().output.text } }];
+    setup({ approved: false, ci: [running(1), running(2), running(3)], existing }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(writes()).toEqual([]);
+
+    // A rejection on the head is a decision, not a wait.
+    setup(
+      { approved: false, reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "No.\n\n**Verdict:** REQUEST_CHANGES\n" }] },
+      "no_verdict_conclusion: neutral\n",
+    );
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: not-approved" } });
+
+    // Approved, but CI red: failure naming CI.
+    setup({ ci: [{ id: 1, name: "ci", status: "completed", conclusion: "failure", app: { slug: "github-actions" } }] }, "no_verdict_conclusion: neutral\n");
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: ci-not-passing" } });
+
+    // Without the setting, unchanged: failure.
+    setup({ approved: false, threads: [openThread] });
+    await run();
+    expect(created()).toMatchObject({ conclusion: "failure", output: { title: "Not ready: not-approved" } });
+
     // A bad value fails the run rather than silently meaning failure.
     setup({ approved: false }, "no_verdict_conclusion: grey\n");
     await run();
@@ -361,5 +412,252 @@ describe("nobody approves their own pull request", () => {
     setup({ author: ALICE, reviews: [commentApproval("alice", "COLLABORATOR")] });
     await run();
     expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).not.toBe("success");
+  });
+});
+
+describe("escalation labels and standing change requests, end to end", () => {
+  const botApproval = { submitted_at: "2026-01-02T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "Fine.\n\n**Verdict:** APPROVE" };
+  const aliceBlocks = { submitted_at: "2026-01-01T00:00:00Z", state: "CHANGES_REQUESTED", commit_id: HEAD, user: { login: "alice" }, author_association: "COLLABORATOR", body: "Not like this." };
+  const conclusion = () => stub.calls.find((c) => c.method === "checks.create")?.params.conclusion;
+
+  it("an escalation label publishes action_required on an approved, green head", async () => {
+    setup({ labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\n");
+    await run();
+    expect(conclusion()).toBe("action_required");
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.output.summary).toContain("needs-a-person");
+  });
+
+  it("…and on a head the approver has not looked at, instead of 'awaiting'", async () => {
+    setup({ approved: false, labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\nno_verdict_conclusion: neutral\n");
+    await run();
+    expect(conclusion()).toBe("action_required");
+  });
+
+  it("an escalation label stops a merge in merge mode", async () => {
+    setup({ labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("without the clause, the bot's later approval overrides a teammate's block (unchanged)", async () => {
+    setup({ reviews: [aliceBlocks, botApproval] });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+
+  it("with require_no_human_changes_requested, the teammate's block holds", async () => {
+    setup({ reviews: [aliceBlocks, botApproval] }, "require_no_human_changes_requested: true\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+
+    setup({ reviews: [aliceBlocks, botApproval] }, "require_no_human_changes_requested: true\n");
+    await run();
+    expect(conclusion()).toBe("failure");
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.output.summary).toContain("alice");
+  });
+
+  it("…until she approves", async () => {
+    const aliceApproves = { ...aliceBlocks, submitted_at: "2026-01-03T00:00:00Z", state: "APPROVED", body: "" };
+    setup({ reviews: [aliceBlocks, botApproval, aliceApproves] }, "require_no_human_changes_requested: true\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+});
+
+// merge= — one gate for a repo where people and agents both open pull requests.
+// Every PR in scope gets the check; only a PR the pipeline wrote is ever merged.
+describe("the single gate (merge=)", () => {
+  const ALICE = { login: "alice", type: "User" };
+  const gate = (merge: string, world: Partial<World> = {}, rollout?: object, policyYaml = "") => {
+    setup(world, policyYaml);
+    delete inputs.mode;
+    inputs.merge = merge;
+    if (rollout) inputs.rollout = JSON.stringify(rollout);
+  };
+  const check = () => stub.calls.find((c) => c.method === "checks.create")?.params;
+
+  describe('merge="off"', () => {
+    it("publishes the check on an agent PR and on a person's PR, and merges neither", async () => {
+      gate("off");
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
+
+      gate("off", { author: ALICE, headRef: "alice/feature" });
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
+    });
+
+    it("does not fail a person's PR for its branch name", async () => {
+      // The policy file here sets branch_prefix: "agent/" (see setup). Under the
+      // original gate that is the `wrong-branch` clause; scope is the rollout's job now.
+      gate("off", { author: ALICE, headRef: "alice/feature" });
+      await run();
+      expect(check()?.conclusion).toBe("success");
+    });
+
+    it("says nothing about who merges", async () => {
+      gate("off");
+      await run();
+      expect(check()?.output.text ?? "").not.toContain("Merge:");
+    });
+  });
+
+  describe('merge="agent-only"', () => {
+    it("merges a ready PR the pipeline wrote, after publishing its check", async () => {
+      gate("agent-only");
+      await run();
+      const order = methods().filter((m) => m === "checks.create" || m === "pulls.merge");
+      expect(order).toEqual(["checks.create", "pulls.merge"]);
+      expect(check()?.output.text).toContain("the pipeline wrote this PR and merges it");
+      expect(outputs["merged-pr"]).toBe("7");
+    });
+
+    it("never merges a person's PR, however ready — and tells them so on the check", async () => {
+      gate("agent-only", { author: ALICE, headRef: "alice/feature" });
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(check()?.output.text).toContain("a person merges this PR");
+      expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
+    });
+
+    it("never merges a person's PR on an agent-named branch", async () => {
+      // What the branch-prefix test could not tell apart.
+      gate("agent-only", { author: ALICE, headRef: "agent/looks-like-one" });
+      await run();
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("one commit by someone else makes the pipeline's PR human-merged", async () => {
+      gate("agent-only", { commits: [BOT, "alice", BOT] });
+      await run();
+      expect(methods()).not.toContain("pulls.merge");
+      expect(check()?.conclusion).toBe("success");
+      expect(check()?.output.text).toContain("has commits by alice");
+    });
+
+    it("…and so does a commit GitHub cannot attribute to anyone", async () => {
+      gate("agent-only", { commits: [BOT, null] });
+      await run();
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("does not label or comment on a person's PR that is not ready", async () => {
+      gate("agent-only", { author: ALICE, approved: false }, undefined, "labels: { awaiting_approval: awaiting-approval }\n");
+      await run();
+      expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
+    });
+
+    it("still applies the policy's labels to the pipeline's own PR that is not ready", async () => {
+      gate("agent-only", { approved: false }, undefined, "labels: { awaiting_approval: awaiting-approval }\n");
+      await run();
+      expect(methods()).toContain("issues.addLabels");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("an escalation label stops the merge of an agent PR", async () => {
+      gate("agent-only", { labels: ["needs-a-person"] }, undefined, "escalation_labels: [needs-a-person]\n");
+      await run();
+      expect(check()?.conclusion).toBe("action_required");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+  });
+
+  describe("scope: the rollout dial", () => {
+    const rollout = { authors: ["alice"], optInLabel: "agent-review", skipLabel: "no-agent-review" };
+    const evaluated = () => outputs.evaluated;
+
+    it("judges a listed author's PR and ignores everyone else's", async () => {
+      gate("off", { author: ALICE }, rollout);
+      await run();
+      expect(evaluated()).toBe("1");
+      gate("off", { author: { login: "bob", type: "User" } }, rollout);
+      await run();
+      expect(evaluated()).toBe("0");
+      expect(writes()).toEqual([]);
+    });
+
+    it("the opt-in label admits anyone; the skip label excludes anyone", async () => {
+      gate("off", { author: { login: "bob", type: "User" }, labels: ["agent-review"] }, rollout);
+      await run();
+      expect(evaluated()).toBe("1");
+      gate("off", { author: ALICE, labels: ["no-agent-review"] }, rollout);
+      await run();
+      expect(evaluated()).toBe("0");
+    });
+
+    it("the pipeline's own PRs are in scope whatever the dial says", async () => {
+      gate("agent-only", {}, { authors: [] });
+      await run();
+      expect(evaluated()).toBe("1");
+      expect(methods()).toContain("pulls.merge");
+    });
+
+    it("drafts and other bots' PRs are never in scope", async () => {
+      gate("off", { draft: true });
+      await run();
+      expect(evaluated()).toBe("0");
+      gate("off", { author: { login: "renovate[bot]", type: "Bot" } });
+      await run();
+      expect(evaluated()).toBe("0");
+    });
+
+    it("with no rollout at all, every person's PR is in scope", async () => {
+      gate("off", { author: { login: "anyone", type: "User" } });
+      await run();
+      expect(evaluated()).toBe("1");
+    });
+  });
+
+  describe("who publishes the check", () => {
+    it("adopts only its own app's run: github-actions by default", async () => {
+      const theirs = { id: 5, name: CHECK, status: "completed", conclusion: "success", app: { slug: "some-other-app" }, output: { summary: "", text: "" } };
+      gate("off", { existing: [theirs] });
+      await run();
+      expect(methods()).toContain("checks.create"); // not an update of someone else's run
+    });
+
+    it("with check-app, adopts the harness App's run and not github-actions'", async () => {
+      const forged = { id: 5, name: CHECK, status: "completed", conclusion: "success", app: { slug: "github-actions" }, output: { summary: "", text: "" } };
+      const mine = { id: 6, name: CHECK, status: "completed", conclusion: "failure", app: { slug: "my-harness-app" }, output: { summary: "old", text: "" } };
+      gate("off", { existing: [forged, mine] });
+      inputs["check-app"] = "my-harness-app";
+      await run();
+      const update = stub.calls.find((c) => c.method === "checks.update");
+      expect(update?.params.check_run_id).toBe(6);
+      expect(methods()).not.toContain("checks.create");
+    });
+  });
+
+  describe("inputs", () => {
+    it("rejects an unknown merge value, and merge together with mode", async () => {
+      gate("everything");
+      await run();
+      expect(failures.join(" ")).toContain('merge must be "off" or "agent-only"');
+      gate("off");
+      inputs.mode = "evaluate";
+      await run();
+      expect(failures.join(" ")).toContain("merge replaces mode");
+    });
+
+    it("needs a check name", async () => {
+      gate("off");
+      delete inputs["check-name"];
+      await run();
+      expect(failures.join(" ")).toContain("check-name");
+    });
+  });
+
+  it("without merge=, the original gate is untouched: it merges by branch prefix and publishes nothing", async () => {
+    setup({ author: ALICE, headRef: "agent/by-a-person", reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "ok\n\n**Verdict:** APPROVE" }] });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+    expect(methods()).not.toContain("checks.create");
   });
 });

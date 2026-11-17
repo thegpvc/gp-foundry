@@ -1,6 +1,6 @@
 /** B7 — render the harness graph to HARNESS.md (a Mermaid flowchart, generated from the IR). */
 import type { Harness, HarnessNode, WiringPlan } from "../ir/types.js";
-import { isEvaluateGate, parseEvaluateCheckName } from "../handlers/attrs.js";
+import { mergeSettingOf, isEvaluateGate, parseEvaluateCheckName } from "../handlers/attrs.js";
 
 /** A workflow's compiled `on:` block in words: "pull_request: opened, synchronize · workflow_dispatch". */
 function triggerSummary(triggers: Record<string, unknown>): string {
@@ -42,15 +42,17 @@ function label(n: HarnessNode): string {
 
 /** An evaluate gate never merges; say so, and name the check it publishes instead. */
 function gateNote(n: HarnessNode): string {
-  if (!isEvaluateGate(n)) return "";
+  const merge = mergeSettingOf(n);
+  if (!merge && !isEvaluateGate(n)) return "";
+  const what = merge ? `merge ${merge}` : "evaluate";
   let check: string;
   try {
     check = parseEvaluateCheckName(n);
   } catch {
-    return " · evaluate";
+    return ` · ${what}`;
   }
   // Mermaid labels are double-quoted; keep the name from closing one.
-  return ` · evaluate → check ${check.replace(/"/g, "'")}`;
+  return ` · ${what} → check ${check.replace(/"/g, "'")}`;
 }
 
 export function renderDiagram(ir: Harness, wiring?: WiringPlan): string {

@@ -9,6 +9,10 @@
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import {
+  isReadingPrLane,
+  isWritingPrLane,
+  rolloutOf,
+  scopePrefilter,
   authorClause,
   authorsOf,
   exprString,
@@ -289,6 +293,10 @@ export function wire(ir: Harness): WiringPlan {
   // parallel→legs→fan_in diamonds compile to ONE workflow (the fan_in's), triggered
   // by the diamond's entry edge; the members get no standalone wiring.
   const diamonds = detectDiamonds(ir);
+  // A hybrid harness (config has `rollout:`) scopes its PR lanes by the rollout
+  // dial instead of by branch prefix and per-node attributes.
+  const rollout = rolloutOf(ir.config);
+  const botLogin = ir.config.identity?.bot_login;
 
   for (const node of ir.nodes) {
     if (node.type === "start" || node.type === "exit") continue;
@@ -313,15 +321,12 @@ export function wire(ir: Harness): WiringPlan {
       } catch {
         panelAuthors = [NO_AUTHOR];
       }
-      const g = applyAuthors(
-        applyBranchPrefix(
-          entry.when ? guardFor(entry.when, [...effEvents], ir.config) : undefined,
-          effEvents,
-          ir.config,
-        ),
-        effEvents,
-        panelAuthors,
-      );
+      const entryGuard = entry.when ? guardFor(entry.when, [...effEvents], ir.config) : undefined;
+      const g = rollout
+        ? // A review panel reads: any PR in scope. It has no guard job of its own,
+          // so here the prefilter is all there is (and another bot's PR gets through).
+          andForPrEvents(entryGuard, effEvents, scopePrefilter(rollout, botLogin, false))
+        : applyAuthors(applyBranchPrefix(entryGuard, effEvents, ir.config), effEvents, panelAuthors);
       if (g) nw.guard = g;
       // Unit scope follows the entry event; convention `<node-id>-<num>`, never cancel
       // a mid-synthesis join.
@@ -338,7 +343,10 @@ export function wire(ir: Harness): WiringPlan {
     const unguardedEvents = new Set<string>();
     const allEvents = new Set<string>();
     const dispatches: { toNode: string; when?: string }[] = [];
-    const optIn = optInLabelOf(node, ir.config);
+    const hybridLane = rollout !== undefined && (isReadingPrLane(node) || isWritingPrLane(node));
+    // The label that admits a PR by itself: the rollout's, for a hybrid reading
+    // lane (a writing lane is never opted in by label); else the node's own.
+    const optIn = rollout ? (isReadingPrLane(node) ? rollout.optInLabel : undefined) : optInLabelOf(node, ir.config);
     let gateLabelEvents = false;
 
     // scheduled nodes (e.g. merge-gate) are driven by cron + manual dispatch only
@@ -360,7 +368,8 @@ export function wire(ir: Harness): WiringPlan {
       if (
         triggers.pull_request &&
         hasSkipGuard(node, ir.config) &&
-        skipOf(node).some((c) => c.kind === "draft")
+        // A hybrid harness never looks at a draft, so its lanes always listen.
+        (hybridLane || skipOf(node).some((c) => c.kind === "draft"))
       ) {
         mergeEvent(triggers, "pull_request.ready_for_review", node);
         allEvents.add("pull_request.ready_for_review");
@@ -396,12 +405,10 @@ export function wire(ir: Harness): WiringPlan {
       }
     }
 
-    let guard = applyAuthors(
-      applyBranchPrefix(guards.size ? [...guards].join(" || ") : undefined, allEvents, ir.config),
-      allEvents,
-      authorsOf(node, ir.config),
-      optIn,
-    );
+    const edgeGuard = guards.size ? [...guards].join(" || ") : undefined;
+    let guard = hybridLane
+      ? andForPrEvents(edgeGuard, allEvents, scopePrefilter(rollout!, botLogin, isWritingPrLane(node)))
+      : applyAuthors(applyBranchPrefix(edgeGuard, allEvents, ir.config), allEvents, authorsOf(node, ir.config), optIn);
     if (gateLabelEvents && optIn) {
       guard = andForPrEvents(
         guard,

@@ -11,14 +11,41 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  fixer_guard:
+    name: fixer guard
+    runs-on: ubuntu-latest
+    if: (contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES') && github.event.review.user.login == 'agent-bot') && github.event.pull_request.draft == false && github.event.pull_request.user.login == 'agent-bot'
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+      head_sha: ""
+      diff_hash: ""
+      started_at: ""
+    steps:
+      - name: Is this a PR the pipeline wrote?
+        id: scope
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.3.0
+        with:
+          number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          rollout: "{\"authors\":[]}"
+          bot-login: agent-bot
+          branch-prefix: agent/
+          require-agent-written: "true"
   fixer:
     runs-on: ubuntu-latest
-    if: (contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES') && github.event.review.user.login == 'agent-bot') && startsWith(github.event.pull_request.head.ref, 'agent/')
+    if: needs.fixer_guard.outputs.run == 'true'
     permissions:
       contents: write
       pull-requests: write
       checks: read
     timeout-minutes: 35
+    needs:
+      - fixer_guard
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -50,6 +77,23 @@ jobs:
         run: |-
           mkdir -p .git/info
           echo "/.gp-foundry/" >> .git/info/exclude
+      - name: Use this PR's harness files if the base ref has no harness yet
+        shell: bash
+        env:
+          HARNESS: .gp-foundry/harness
+          SPEC: .github/harness.dot
+          DIRS: |-
+            .github/agent-setup
+            .github/agents
+        run: |-
+          if [ -f "$HARNESS/$SPEC" ]; then exit 0; fi
+          echo "::notice::the base ref has no harness yet ($SPEC) — using this pull request's own harness files. This only happens while the harness itself is being installed."
+          while IFS= read -r D; do
+            [ -n "$D" ] && [ -d "$D" ] || continue
+            mkdir -p "$HARNESS/$(dirname "$D")"
+            rm -rf "${HARNESS:?}/$D"
+            cp -R "$D" "$HARNESS/$D"
+          done <<< "$DIRS"
       - name: Enforce attempt budget (max 3)
         id: attempts
         shell: bash
@@ -85,7 +129,7 @@ jobs:
       - name: Fetch context
         id: ctx
         if: steps.attempts.outputs.exhausted != 'true'
-        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.3.0
         with:
           type: pr-review
           number: ${{ github.event.pull_request.number }}
@@ -95,7 +139,7 @@ jobs:
       - name: Run agent
         if: steps.attempts.outputs.exhausted != 'true'
         timeout-minutes: 25
-        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.3.0
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/fixer.md
           model: claude-opus-4-8

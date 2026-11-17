@@ -1,0 +1,194 @@
+import { describe, expect, it } from "vitest";
+import { decide, listInScope } from "./index.js";
+
+const BOT = "agent-bot[bot]";
+
+function octokit(pr: Record<string, unknown> | Error, commits: (string | null)[] | Error = [BOT]) {
+  const calls: string[] = [];
+  const o = {
+    calls,
+    paginate: async (fn: (p: unknown) => Promise<{ data: unknown }>, params: unknown) => (await fn(params)).data,
+    rest: {
+      pulls: {
+        get: async () => {
+          calls.push("pulls.get");
+          if (pr instanceof Error) throw pr;
+          return { data: { draft: false, labels: [], user: { login: BOT, type: "Bot" }, ...pr } };
+        },
+        listCommits: async () => {
+          calls.push("pulls.listCommits");
+          if (commits instanceof Error) throw commits;
+          return { data: commits.map((login) => ({ author: login ? { login } : null })) };
+        },
+      },
+    },
+  };
+  return o as unknown as Parameters<typeof decide>[0] & { calls: string[] };
+}
+const base = { owner: "o", repo: "r", number: 7, botLogin: BOT };
+const by = (login: string, type = "User", over: Record<string, unknown> = {}) => ({ user: { login, type }, ...over });
+
+describe("pr-scope: a reading lane", () => {
+  const read = (pr: Record<string, unknown> | Error, rollout?: object) =>
+    decide(octokit(pr), { ...base, rollout, requireAgentWritten: false });
+
+  it("runs on a PR in scope and says why", async () => {
+    const r = await read(by("alice"), { authors: ["alice"] });
+    expect(r).toMatchObject({ inScope: true, run: true });
+    expect(r.reason).toContain("alice");
+    expect(r.agentWritten).toBeUndefined();
+  });
+
+  it("does not run on one that is out, for each reason the rule has", async () => {
+    const rollout = { authors: ["alice"], optInLabel: "agent-review", skipLabel: "no-agent-review" };
+    expect((await read(by("bob"), rollout)).run).toBe(false);
+    expect((await read(by("alice", "User", { draft: true }), rollout)).run).toBe(false);
+    expect((await read(by("alice", "User", { labels: [{ name: "no-agent-review" }] }), rollout)).run).toBe(false);
+    expect((await read(by("renovate[bot]", "Bot"), rollout)).run).toBe(false);
+    expect((await read(by("bob", "User", { labels: [{ name: "agent-review" }] }), rollout)).run).toBe(true);
+  });
+
+  it("runs on the pipeline's own PR whatever the dial says, without reading commits", async () => {
+    const o = octokit({});
+    const r = await decide(o, { ...base, rollout: { authors: [] }, requireAgentWritten: false });
+    expect(r.run).toBe(true);
+    expect(o.calls).toEqual(["pulls.get"]);
+  });
+
+  it("with no rollout, runs on every person's PR", async () => {
+    expect((await read(by("anyone"))).run).toBe(true);
+  });
+
+  it("fails closed on a PR it cannot read", async () => {
+    const r = await read(new Error("503"));
+    expect(r).toMatchObject({ inScope: false, run: false });
+    expect(r.reason).toContain("could not read PR #7");
+  });
+});
+
+describe("pr-scope: a writing lane", () => {
+  const write = (pr: Record<string, unknown>, commits: (string | null)[] | Error = [BOT], rollout?: object) =>
+    decide(octokit(pr, commits), { ...base, rollout, requireAgentWritten: true });
+
+  it("runs on a PR the pipeline wrote", async () => {
+    expect(await write({})).toMatchObject({ inScope: true, agentWritten: true, run: true });
+  });
+
+  it("does not run on a person's PR, in scope or not — and never reads its commits", async () => {
+    const o = octokit(by("alice"));
+    const r = await decide(o, { ...base, rollout: { authors: ["alice"] }, requireAgentWritten: true });
+    expect(r).toMatchObject({ inScope: true, agentWritten: false, run: false });
+    expect(r.reason).toContain("only acts on PRs the pipeline wrote");
+    expect(o.calls).toEqual(["pulls.get"]);
+  });
+
+  it("does not run once anyone else has committed to the pipeline's PR", async () => {
+    const r = await write({}, [BOT, "alice"]);
+    expect(r).toMatchObject({ agentWritten: false, run: false });
+    expect(r.reason).toContain("alice");
+  });
+
+  it("does not run when a commit cannot be attributed, or the commits cannot be read", async () => {
+    expect((await write({}, [BOT, null])).run).toBe(false);
+    expect((await write({}, new Error("502"))).run).toBe(false);
+  });
+
+  it("is still subject to scope: the skip label stops it on the pipeline's own PR", async () => {
+    const r = await write({ labels: [{ name: "no-agent-review" }] }, [BOT], { skipLabel: "no-agent-review" });
+    expect(r).toMatchObject({ inScope: false, run: false });
+  });
+
+  it("never runs without a bot login to attribute PRs to", async () => {
+    const r = await decide(octokit(by("alice")), { owner: "o", repo: "r", number: 7, requireAgentWritten: true });
+    expect(r.run).toBe(false);
+  });
+});
+
+describe("pr-scope: listing for a sweep", () => {
+  const NOW = Date.parse("2026-01-01T01:00:00Z");
+  const open = (number: number, login: string, over: Record<string, unknown> = {}) => ({
+    number,
+    draft: false,
+    labels: [],
+    user: { login, type: login.endsWith("[bot]") ? "Bot" : "User" },
+    head: { sha: `sha${number}` },
+    base: { ref: "main" },
+    requested_reviewers: [],
+    requested_teams: [],
+    updated_at: "2026-01-01T00:59:00Z",
+    ...over,
+  });
+  function lister(pages: (unknown[] | Error)[]) {
+    let call = 0;
+    const seen: unknown[] = [];
+    const o = {
+      seen,
+      paginate: async (fn: (p: unknown) => Promise<{ data: unknown }>, params: unknown) => (await fn(params)).data,
+      rest: {
+        pulls: {
+          list: async (params: unknown) => {
+            seen.push(params);
+            const page = pages[Math.min(call++, pages.length - 1)]!;
+            if (page instanceof Error) throw page;
+            return { data: page };
+          },
+        },
+      },
+    };
+    return o as unknown as Parameters<typeof listInScope>[0] & { seen: any[] };
+  }
+  const opts = { owner: "o", repo: "r", baseBranch: "main", botLogin: BOT, nowMs: NOW, retryDelayMs: 0 };
+
+  it("returns the in-scope PRs, oldest first, with what the selector needs", async () => {
+    const o = lister([
+      [
+        open(1, "alice", { requested_reviewers: [{ login: "x" }], requested_teams: [{ slug: "t" }] }),
+        open(2, "bob"),
+        open(3, BOT, { base: { ref: "release" } }),
+        open(4, "alice", { draft: true }),
+        open(5, "renovate[bot]"),
+      ],
+    ]);
+    const prs = await listInScope(o, { ...opts, rollout: { authors: ["alice"] } });
+    expect(prs).toEqual([
+      { number: 1, sha: "sha1", base: "main", requested: 2, quiet: 60 },
+      { number: 3, sha: "sha3", base: "release", requested: 0, quiet: 60 },
+    ]);
+    expect(o.seen[0]).toMatchObject({ state: "open", base: "main", sort: "created", direction: "asc" });
+  });
+
+  it("retries a failed listing once", async () => {
+    const o = lister([new Error("unexpected end of JSON input"), [open(1, "alice")]]);
+    expect(await listInScope(o, opts)).toHaveLength(1);
+    expect(o.seen).toHaveLength(2);
+  });
+
+  it("gives up quietly after the retry: undefined, not a throw", async () => {
+    const o = lister([new Error("502"), new Error("502")]);
+    expect(await listInScope(o, opts)).toBeUndefined();
+    expect(o.seen).toHaveLength(2);
+  });
+});
+
+describe("pr-scope: the wrong-bot-login hint", () => {
+  const onAgentBranch = { user: { login: "dan", type: "User" }, head: { ref: "agent/12-fix" } };
+  const opts = { ...base, branchPrefix: "agent/" };
+
+  it("explains an agent-named branch turned away because someone else opened it", async () => {
+    const r = await decide(octokit(onAgentBranch), { ...opts, rollout: { authors: [] }, requireAgentWritten: false });
+    expect(r.run).toBe(false);
+    expect(r.reason).toContain("identity.bot_login should be 'dan'");
+    const w = await decide(octokit(onAgentBranch), { ...opts, requireAgentWritten: true });
+    expect(w.run).toBe(false);
+    expect(w.reason).toContain("identity.bot_login should be 'dan'");
+  });
+
+  it("says nothing for an ordinary branch, the bot's own PR, a draft or a skip label", async () => {
+    const quiet = async (pr: Record<string, unknown>, rollout: object = { authors: [] }) =>
+      (await decide(octokit(pr), { ...opts, rollout, requireAgentWritten: false })).reason;
+    expect(await quiet({ user: { login: "dan", type: "User" }, head: { ref: "dan/feature" } })).not.toContain("bot_login");
+    expect(await quiet({ head: { ref: "agent/12-fix" } })).not.toContain("bot_login");
+    expect(await quiet({ ...onAgentBranch, draft: true })).not.toContain("bot_login");
+    expect(await quiet({ ...onAgentBranch, labels: [{ name: "no" }] }, { authors: [], skipLabel: "no" })).not.toContain("bot_login");
+  });
+});
