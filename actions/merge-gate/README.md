@@ -142,6 +142,17 @@ to that App alone. Anything that requires it downstream (another gate's
 `required-checks`, a ruleset) should name it pinned to the App:
 `<check name>@<app slug>`.
 
+**When it runs.** The compiler wires the gate to evaluate one PR (`pr-number`) when
+something that decides it changes — a review submitted or dismissed, a label, a review
+request, a new commit, ready for review — and to run a scheduled pass over every PR in
+scope. The pass evaluates at most 20 PRs per tick, least recently evaluated first (a
+head with no result yet before all others), and stops early within
+`time-budget-seconds`; an interrupted pass leaves the heads it missed first in line.
+CI finishing and threads being resolved have no usable event and are picked up by the
+pass. Each published result records when its facts were read
+(`<!-- gp-foundry:read-at:… -->`): a run never replaces, or merges on, a result read
+earlier than the one already on the head.
+
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
 

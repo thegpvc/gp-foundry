@@ -110,6 +110,13 @@ inputs:
       can publish one this gate — or a ruleset pinned to the App — accepts.
     required: false
     default: ""
+  time-budget-seconds:
+    description: >
+      With `merge` and no `pr-number` (the scheduled pass): stop starting new
+      evaluations after this many seconds, so the job finishes inside its own
+      timeout. The compiler sets it from the job's timeout.
+    required: false
+    default: ""
   check-name:
     description: "With `merge`, or mode evaluate: the check run to publish on each head (required there)."
     required: false

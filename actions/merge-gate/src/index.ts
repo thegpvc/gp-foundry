@@ -628,6 +628,26 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
  * (one current result per head), create one if there is none, and write nothing
  * when the existing run already says the same thing.
  */
+/**
+ * `<!-- gp-foundry:read-at:<ISO time> -->` — appended to the check's text by the
+ * single gate: when the facts behind this result were read. A run never
+ * replaces a result read later than its own (see publishCheck), and the
+ * scheduled pass visits the heads read longest ago first.
+ */
+const READ_AT = /<!-- gp-foundry:read-at:([0-9T:.\-Z]+) -->/;
+
+/** The read-at time recorded in a check's text, in ms; undefined when there is none. */
+export function readAtOf(text: string | null | undefined): number | undefined {
+  const m = READ_AT.exec(text ?? "");
+  if (!m) return undefined;
+  const t = Date.parse(m[1]!);
+  return Number.isNaN(t) ? undefined : t;
+}
+
+function withoutReadAt(text: string | null | undefined): string {
+  return (text ?? "").replace(READ_AT, "").replace(/\n+$/, "");
+}
+
 export async function publishCheck(
   checksOctokit: Octokit,
   owner: string,
@@ -639,18 +659,27 @@ export async function publishCheck(
   // publishes with GITHUB_TOKEN, the harness's own App when it publishes with
   // that App's token (see the `check-app` input).
   app: string = CHECK_APP,
-): Promise<"created" | "updated" | "unchanged"> {
+  // The single gate passes when its facts were read. Then the check records it,
+  // a result read EARLIER than the one already published is never written (a
+  // slow run cannot replace a fresher one), and an unchanged result is still
+  // re-stamped, so the check always says when the head was last evaluated.
+  readAt?: string,
+): Promise<"created" | "updated" | "unchanged" | "superseded"> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs
     .filter((r) => r.name === name && r.app?.slug === app)
     .sort((a, b) => b.id - a.id)[0];
-  if (
-    mine &&
+  const sameResult =
+    !!mine &&
     mine.status === "completed" &&
     mine.conclusion === out.conclusion &&
     (mine.output?.summary ?? "") === out.summary &&
-    (mine.output?.text ?? "") === out.text
-  ) {
+    withoutReadAt(mine.output?.text) === withoutReadAt(out.text);
+  if (readAt !== undefined) {
+    const theirs = readAtOf(mine?.output?.text);
+    if (theirs !== undefined && theirs > Date.parse(readAt)) return "superseded";
+    out = { ...out, text: `${withoutReadAt(out.text)}\n\n<!-- gp-foundry:read-at:${readAt} -->`.replace(/^\n+/, "") };
+  } else if (sameResult) {
     return "unchanged";
   }
   const output = { title: out.title, summary: out.summary, text: out.text };
@@ -759,6 +788,47 @@ export type MergeSetting = "off" | "agent-only";
  * no comment. The check a person reads on their PR is, by construction, the same
  * decision that merges an agent's.
  */
+/** How many PRs one scheduled pass of the single gate evaluates. Not a setting. */
+export const GATE_TICK_LIMIT = 20;
+
+/**
+ * The scheduled pass's order: PRs in scope (and on the dependabot lane, when
+ * the policy turns it on), least recently evaluated first — a head the gate
+ * has never published a result for (a new head, or one whose evaluation
+ * failed) before all others, then by the read time its check records; ties by
+ * age. No state is stored: the check runs are the record, so a pass that is
+ * interrupted leaves the heads it did not reach at the front of the next one.
+ * One read per PR in scope.
+ */
+export async function scheduleOrder<T extends { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[]; head: { sha: string } }>(
+  open: T[],
+  o: { octokit: Octokit; owner: string; repo: string; checkName: string; checkApp: string; rollout: Rollout | undefined; botLogin?: string; dependabotLane: boolean },
+): Promise<T[]> {
+  const ranked: { pr: T; at: number; i: number }[] = [];
+  for (const [i, p] of open.entries()) {
+    const scope = inScope(
+      { authorLogin: p.user?.login, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => l.name ?? "").filter(Boolean) },
+      o.rollout,
+      o.botLogin,
+    );
+    const dependabot = o.dependabotLane && p.user?.login === DEPENDABOT_LOGIN && !p.draft;
+    if (!scope.inScope && !dependabot) {
+      core.info(`PR #${p.number}: out of scope — ${scope.detail}`);
+      continue;
+    }
+    let at = -Infinity; // never evaluated: first
+    try {
+      const runs = await o.octokit.paginate(o.octokit.rest.checks.listForRef, { owner: o.owner, repo: o.repo, ref: p.head.sha, check_name: o.checkName, per_page: 100 });
+      const mine = runs.filter((r) => r.name === o.checkName && r.app?.slug === o.checkApp).sort((a, b) => b.id - a.id)[0];
+      if (mine) at = readAtOf(mine.output?.text) ?? (Date.parse(mine.completed_at ?? "") || -Infinity);
+    } catch {
+      // Unreadable: treat it as never evaluated, so it is tried first.
+    }
+    ranked.push({ pr: p, at, i });
+  }
+  return ranked.sort((a, b) => a.at - b.at || a.i - b.i).map((r) => r.pr);
+}
+
 export async function runHybridGate(opts: {
   octokit: Octokit;
   checksOctokit: Octokit;
@@ -772,6 +842,10 @@ export async function runHybridGate(opts: {
   rollout: Rollout | undefined;
   prNumber?: number;
   dryRun: boolean;
+  /** Scheduled pass: stop starting new evaluations after this many seconds. */
+  timeBudgetSeconds?: number;
+  /** Injected clock, for tests. */
+  now?: () => number;
 }): Promise<{ evaluated: number; written: number; mergedPr: string }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
@@ -788,15 +862,37 @@ export async function runHybridGate(opts: {
   const botLogin = base.botLogin;
   const dependabotLane = (base.dependabot?.autoMerge?.length ?? 0) > 0;
 
-  const prs =
-    opts.prNumber !== undefined
-      ? [(await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data]
-      : await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
+  const now = opts.now ?? Date.now;
+  const started = now();
+  const deadline = opts.timeBudgetSeconds ? started + opts.timeBudgetSeconds * 1000 : Infinity;
+
+  // A targeted run (an event on one PR) evaluates that PR. The scheduled pass
+  // evaluates a bounded number, least recently evaluated first.
+  let prs: Awaited<ReturnType<typeof octokit.rest.pulls.list>>["data"];
+  if (opts.prNumber !== undefined) {
+    const one = (await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data;
+    if (one.state !== "open") {
+      core.info(`PR #${one.number} is ${one.state} — nothing to evaluate`);
+      return { evaluated: 0, written: 0, mergedPr: "" };
+    }
+    prs = [one as unknown as (typeof prs)[number]];
+  } else {
+    const open = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
+    prs = await scheduleOrder(open, { octokit: checksOctokit, owner, repo, checkName, checkApp: opts.checkApp, rollout, botLogin, dependabotLane });
+  }
 
   let evaluated = 0;
   let written = 0;
   let mergedPr = "";
   for (const p of prs) {
+    if (opts.prNumber === undefined && evaluated >= GATE_TICK_LIMIT) {
+      core.info(`evaluated ${GATE_TICK_LIMIT} PRs this tick — the rest, least recently evaluated first, wait for the next`);
+      break;
+    }
+    if (now() > deadline) {
+      core.info("near the job's time limit — the rest wait for the next tick");
+      break;
+    }
     const n = p.number;
     const author = p.user?.login;
     const scope = inScope(
@@ -813,6 +909,7 @@ export async function runHybridGate(opts: {
     }
     evaluated++;
     try {
+      const readAt = new Date(now()).toISOString();
       const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit);
 
       // Who merges this PR? Only asked when the gate may merge at all.
@@ -842,8 +939,13 @@ export async function runHybridGate(opts: {
       }
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
       if (!opts.dryRun && facts.headSha) {
-        const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
-        if (result !== "unchanged") written++;
+        const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp, readAt);
+        if (result === "superseded") {
+          // A newer evaluation of this head is already published: this one is stale.
+          core.info(`PR #${n}: a fresher result is already on ${facts.headSha.slice(0, 8)} — not replacing it, not acting on this one`);
+          continue;
+        }
+        written++;
         core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
       }
 
@@ -938,6 +1040,7 @@ export async function run(): Promise<void> {
         octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun, rollout,
         merge: mergeSetting,
         checkApp: core.getInput("check-app").trim() || CHECK_APP,
+        timeBudgetSeconds: parseInt(core.getInput("time-budget-seconds"), 10) || undefined,
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));

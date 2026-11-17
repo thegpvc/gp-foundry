@@ -688,6 +688,11 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
       ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
       ...(rollout ? { rollout } : {}),
+      // An event run evaluates the one PR it is about; a scheduled run (empty
+      // here) is the bounded pass over every PR in scope.
+      "pr-number": "${{ github.event.pull_request.number }}",
+      // Leave the job two minutes to finish the PR it is on and exit cleanly.
+      "time-budget-seconds": String(Math.max(60, (timeoutOf(node, 10) - 2) * 60)),
     },
   });
   return {

@@ -1,7 +1,6 @@
 # Gate freshness and human sign-off on a handoff
 
-**Date:** 2026-11-17 · **Status:** In design — decisions below are settled, open items are
-not · Follows [Hybrid pipeline (0.3.0)](./2026-11-16-hybrid-pipeline.md).
+**Date:** 2026-11-17 · **Status:** Built; awaiting release · Follows [Hybrid pipeline (0.3.0)](./2026-11-16-hybrid-pipeline.md).
 
 Two follow-ups to the single gate (`merge=`). Both ship in the next release together with
 the guard fix already on `main` (0.3.2: the reviewer guard mints its App token only for a
@@ -47,20 +46,18 @@ scheduled pass (which runs on the default branch with secrets).
    collapses to one evaluation of the latest state. Skipped quietly for a Dependabot or
    fork PR, the same pattern as the guard fix.
 2. **A bounded scheduled pass that makes progress across ticks**, with no stored state. It
-   evaluates first every head that has **no** gate check yet (a new head, or one whose
-   evaluation failed), oldest PR first; then the rest in an order rotated by the run
-   number, so successive ticks start at different places. At most a fixed, built-in number
-   of PRs per tick (no setting), stopping early if the job nears its own timeout. Every PR
-   in scope is reached within ⌈in-scope PRs ÷ per-tick count⌉ ticks, interrupted ticks
-   included. (Ordering by "when last evaluated" was the first idea, but an unchanged
-   result is deliberately not rewritten, so the check's timestamps do not record it.) An interrupted pass leaves the unvisited heads oldest, so the next tick
+   orders the PRs in scope least recently evaluated first — a head with no gate result yet
+   (new, or its evaluation failed) before all others, then by the read time its result
+   records — and evaluates at most 20 per tick (built in, no setting), stopping early
+   within a time budget the compiler derives from the job's timeout. An interrupted pass
+   leaves the heads it missed first in line for the next. An interrupted pass leaves the unvisited heads oldest, so the next tick
    starts there. This is the backstop for everything the events miss: CI finishing, thread resolution,
    Dependabot and fork PRs, a missed delivery, a failed read.
-3. **No stale result ever replaces a fresher one.** Each published check records, in a
-   hidden marker, when the facts behind it were read. A run does not overwrite a check on
-   the same head that records a later read. Before publishing, the run re-reads the PR's
-   head; if it moved, it publishes nothing (the new head has its own evaluation coming).
-   The merge already pins the SHA it evaluated.
+3. **No stale result ever replaces a fresher one.** Each published result records, in a
+   hidden marker, when the facts behind it were read, and is re-stamped even when the
+   result is unchanged, so it always records the latest read. A run whose read is older
+   than the one already published writes nothing and does not merge. A new commit cannot
+   inherit a result: results are per commit, and the merge pins the SHA it evaluated.
 4. **Per-head decisions and merge policy are unchanged.** Only when and in what order the
    gate evaluates changes.
 
@@ -85,6 +82,18 @@ duplicate event or a superseded SHA never produces a stale approval. Report API 
 tick and ticks to a published decision.
 
 ---
+
+### Measured (synthetic backlog, stub API)
+
+51 PRs in scope, 20 per tick. The first tick is cut short by its time budget after 9
+evaluations; then a ready head is added at the tail and a hold is cleared on an older
+head without a push. Both have current results by the third tick after the change
+(within ⌈51 ÷ 20⌉ + 1 = 4). A full tick makes 192 API calls (1 listing, 51 reads to order
+the pass, ~7 per evaluation); a targeted run makes 8. With an event (a review, a label
+change), the result is published by that one targeted run, not a later tick.
+
+Not covered by an event, so left to the pass: CI finishing, a thread resolved, and any
+PR whose events come from a fork or Dependabot.
 
 ## B. Recognizing a person's sign-off on a policy handoff
 

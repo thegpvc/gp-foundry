@@ -35,7 +35,7 @@ flowchart TD
 | `builder` | issues: labeled |
 | `reviewer` | pull_request: opened, synchronize, ready_for_review |
 | `fixer` | pull_request_review: submitted |
-| `merge_gate` | schedule: `*/30 * * * *` · workflow_dispatch |
+| `merge_gate` | schedule: `*/30 * * * *` · workflow_dispatch · pull_request: synchronize, reopened, ready_for_review, labeled, unlabeled, review_requested, review_request_removed · pull_request_review: submitted, dismissed |
 | `janitor` | schedule: `*/30 * * * *` · workflow_dispatch |
 | `supervisor` | schedule: `17 * * * *` · workflow_dispatch |
 | `retro` | schedule: `0 7 * * 1-5` · workflow_dispatch |
