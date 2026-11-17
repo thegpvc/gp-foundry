@@ -17,7 +17,9 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import yaml from "js-yaml";
 import {
+  escalationLabel,
   sameLogin,
+  standingChangeRequests,
   visibleBody,
   checkConclusion,
   describeCheckRunsFailure,
@@ -301,6 +303,12 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     ...(pr.requested_reviewers ?? []).map((u) => u.login),
     ...(pr.requested_teams ?? []).map((t) => `team:${t.slug}`),
   ];
+  // Whose formal review stands at "changes requested" — read only by the opt-in
+  // require_no_human_changes_requested clause, but cheap: the reviews are in hand.
+  const changesRequestedBy = standingChangeRequests(
+    reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, state: r.state })),
+    policy.botLogin,
+  );
   const headVerdict = latestHeadVerdict(
     reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
     pr.head.sha,
@@ -308,7 +316,7 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     markers,
   );
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, escalated: headVerdict === "escalate", headVerdict };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -483,7 +491,7 @@ export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFac
           : `Not ready: ${decision.code}`;
   const summary =
     conclusion === "action_required"
-      ? `The reviewer escalated this head to a human.\n\nGate: ${gateLine}`
+      ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}`
       : conclusion === "neutral"
         ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;

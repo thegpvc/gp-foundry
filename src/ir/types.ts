@@ -140,6 +140,11 @@ export interface FoundryConfig {
     /** Only pull requests opened by these logins reach the PR lanes (case-insensitive). */
     authors?: string[];
   };
+  /**
+   * The rollout dial: which human PRs the pipeline looks at while it is being
+   * brought to a repo. Absent means every PR. See src/shared/scope.ts.
+   */
+  rollout?: { authors?: string[]; opt_in_label?: string; skip_label?: string };
   /** semantic role -> repo label (the drift-killer). */
   labels: Record<string, string>;
   /** parseable markers shared by prompts + guards + enforcers. */

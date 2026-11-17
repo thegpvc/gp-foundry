@@ -94,6 +94,16 @@ labels:
 # Fail (`review-requested`) while a reviewer or team is still requested.
 # require_no_review_requests: true
 #
+# Fail (`changes-requested`) while any PERSON's review stands at "changes requested".
+# Without it the latest verdict wins, so a later approval from the bot overrides a
+# teammate's block; with it the block holds until they approve or it is dismissed.
+# require_no_human_changes_requested: true
+#
+# Labels that hand a PR to a person outright: never merged, and in evaluate mode the
+# check is `action_required`, whether or not the approver has given a verdict.
+# (`blocking_labels` only hold a merge back; these say who decides.)
+# escalation_labels: [needs-human-decision]
+#
 # The trusted reviewer's latest verdict on the head being an escalation turns the check
 # `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`
 # line; this key only overrides it.

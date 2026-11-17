@@ -95,6 +95,12 @@ export interface PullRequestFacts {
   /** Pending review requests: user logins and `team:<slug>` entries. */
   requestedReviewers?: string[];
   /**
+   * People whose review of this PR currently stands at "changes requested" (see
+   * standingChangeRequests). Supplied by the caller; read only when the policy
+   * sets `requireNoHumanChangesRequested`.
+   */
+  changesRequestedBy?: string[];
+  /**
    * Whether the trusted reviewer's LATEST verdict on the head is an escalation
    * (see latestHeadVerdictIsEscalation). Read only by `checkConclusion`.
    */
@@ -175,6 +181,20 @@ export interface MergePolicy {
   botThreadBlockingRegex?: string;
   /** Block while the PR has pending requested reviewers or teams. Default false. */
   requireNoReviewRequests?: boolean;
+  /**
+   * Block while any person's review stands at "changes requested". Default false.
+   * Without it the latest verdict wins, so a later approval from the bot overrides
+   * a teammate's block; with it, that block holds until the teammate approves or
+   * the review is dismissed.
+   */
+  requireNoHumanChangesRequested?: boolean;
+  /**
+   * Labels that hand a PR to a person outright. A PR carrying one is never
+   * merged, and in evaluate mode its check is `action_required` — whether or not
+   * the approver has given a verdict. Distinct from `blockingLabels`, which only
+   * hold a merge back: this one says who decides.
+   */
+  escalationLabels?: string[];
   /**
    * Evaluate mode: the check's conclusion for a head the approver has given no
    * verdict on yet. `failure` (default) or `neutral` ("awaiting the approver"),
@@ -278,6 +298,8 @@ export type MergeReasonCode =
   | "rebase-needed"
   | "open-threads"
   | "review-requested"
+  | "changes-requested"
+  | "escalated"
   // dependabot lane
   | "dependabot-ready"
   | "dependabot-review"
@@ -1026,6 +1048,17 @@ const AGENT_LANE_CLAUSES: Clause[] = [
     return undefined;
   },
 
+  // 5c') No person's review standing at "changes requested" (opt-in).
+  (pr, policy) => {
+    const who = pr.changesRequestedBy ?? [];
+    if (!policy.requireNoHumanChangesRequested || who.length === 0) return undefined;
+    return {
+      action: "skip",
+      code: "changes-requested",
+      reason: `changes requested by ${who.map((w) => `\`${w}\``).join(", ")}`,
+    };
+  },
+
   // 5d) No open review threads (opt-in).
   (pr, policy) => {
     if (!policy.requireNoOpenThreads) return undefined;
@@ -1086,6 +1119,51 @@ const AGENT_LANE_CLAUSES: Clause[] = [
 ];
 
 /** 1) Blocking labels (needs-human / rebase-needed / …) — shared by both lanes. */
+/** The escalation label a PR carries, if any (see MergePolicy.escalationLabels). */
+export function escalationLabel(pr: Pick<PullRequestFacts, "labels">, policy: MergePolicy): string | undefined {
+  return (policy.escalationLabels ?? []).find((l) => pr.labels.includes(l));
+}
+
+/** An escalation label stops both lanes: a person decides, whatever else holds. */
+function escalationLabelClause(pr: PullRequestFacts, policy: MergePolicy): MergeDecision | undefined {
+  const label = escalationLabel(pr, policy);
+  if (!label) return undefined;
+  return {
+    action: "skip",
+    code: "escalated",
+    reason: `PR #${pr.number} carries escalation label \`${label}\` — a person decides`,
+  };
+}
+
+/** A formal review, reduced to what the standing-state rule reads. */
+export interface ReviewState {
+  at: string;
+  author?: string | null;
+  /** GitHub's review state: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING. */
+  state?: string | null;
+}
+
+/**
+ * Who currently stands at "changes requested" on a PR, the way GitHub's own
+ * merge box counts it: per reviewer, the latest review that carries a decision
+ * (APPROVED, CHANGES_REQUESTED or DISMISSED — a COMMENTED review does not change
+ * a reviewer's standing). The harness bot is left out: its request for changes
+ * is a verdict, handled by the verdict rule, and it clears by a later verdict.
+ */
+export function standingChangeRequests(reviews: ReviewState[], botLogin?: string): string[] {
+  const latest = new Map<string, { at: number; state: string; login: string }>();
+  for (const r of reviews) {
+    const state = (r.state ?? "").toUpperCase();
+    if (!r.author || !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(state)) continue;
+    if (sameLogin(r.author, botLogin)) continue;
+    const at = parseTimestamp(r.at);
+    const key = r.author.toLowerCase();
+    const prev = latest.get(key);
+    if (!prev || at >= prev.at) latest.set(key, { at, state, login: r.author });
+  }
+  return [...latest.values()].filter((v) => v.state === "CHANGES_REQUESTED").map((v) => v.login).sort();
+}
+
 function blockingLabelClause(pr: PullRequestFacts, policy: MergePolicy): MergeDecision | undefined {
   const offendingLabel = (policy.blockingLabels ?? []).find((l) => pr.labels.includes(l));
   if (!offendingLabel) return undefined;
@@ -1115,6 +1193,8 @@ export function evaluateMergeGate(
 ): MergeDecision {
   const blocked = blockingLabelClause(pr, policy);
   if (blocked) return blocked;
+  const escalated = escalationLabelClause(pr, policy);
+  if (escalated) return escalated;
 
   // Lane split: a genuine dependabot PR is scored on its own track (no human
   // approval, but only safe semver bumps). Author, not branch name, is the gate.
@@ -1153,6 +1233,8 @@ export function failingClauses(
   const failing: MergeDecision[] = [];
   const blocked = blockingLabelClause(pr, policy);
   if (blocked) failing.push(blocked);
+  const escalated = escalationLabelClause(pr, policy);
+  if (escalated) failing.push(escalated);
   if (pr.authorLogin === DEPENDABOT_LOGIN) {
     const d = evaluateDependabotLane(pr, policy, policy.labels?.needsHuman, policy.labels?.rebaseNeeded);
     if (d.action !== "merge") failing.push(d);
