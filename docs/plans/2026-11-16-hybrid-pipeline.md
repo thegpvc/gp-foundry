@@ -121,12 +121,34 @@ further 0.2.x releases. Fixes that arrive meanwhile are folded into the branch.
 Each step is its own PR into `release/0.3.0`, and each leaves the branch releasable.
 
 1. **The policy function.** Scope, agent-written and result as one tested function in the
-   merge-gate action, with the `rollout` config block. No workflow changes yet.
+   merge-gate action, with the `rollout` config block. No workflow changes yet. Two policy
+   clauses ride along: `escalation_labels` (a PR carrying one is `action_required` and is
+   never merged, verdict or not) and `require_no_human_changes_requested` (a person's
+   standing "changes requested" holds the check; today a later bot approval overrides it).
 2. **One gate.** `merge="off" | "agent-only"`; `mode=` becomes an alias; the gate publishes
-   the check in both settings and merges through the policy function.
-3. **Lanes read or write.** The guard and the sweep call the policy function; the fixer
-   and the merge are limited to agent-written PRs when a harness opts in; per-node
-   `authors=`, `opt_in_label=` and `skip=` become aliases for the rollout block.
+   the check in both settings and merges through the policy function. The check is
+   published with the harness's App token when there is one, so another workflow's
+   `GITHUB_TOKEN` cannot publish a check that passes for it; the sweep's own markers stay
+   on `GITHUB_TOKEN`.
+3. **Lanes read or write.** The guard and the sweep call the policy function, as actions
+   instead of inline shell; the fixer and the merge are limited to agent-written PRs when a
+   harness opts in; per-node `authors=`, `opt_in_label=` and `skip=` become aliases for the
+   rollout block. The sweep's PR listing retries once and exits neutral, not red, when the
+   API is unavailable.
 4. **Refs.** Exact tags, the compiler's pinned default, the `doctor` warning.
 5. **Compatibility pass.** The regression check above, `init` writing `merge="off"`,
    docs, the starter example.
+
+Small riders, each independent of the steps above: a configurable runner label
+(`runtime.runs_on`, with a per-node `runs_on=`); falling back to the head's harness files,
+with a notice, when the base ref has none at all; a link to the posted review in the job
+summary.
+
+## Deferred past 0.3.0
+
+Each is a feature that needs its own design, and none is needed for the model above:
+
+- A sticky status comment per PR, edited in place as the lanes' state changes.
+- A notice when a branch's compiled workflow is older than the base branch's.
+- Treating a head as undecided again after the PR description is edited.
+- A notification step (chat) for posted reviews and verdicts.
