@@ -18,7 +18,8 @@ const PAT = { auth: { mode: "pat", token_secret: "AGENT_PAT" } } as Partial<Foun
 function mkHarness(dot: string, cfg: Partial<FoundryConfig> = {}): Harness {
   const g = parseDot(dot);
   expect(g.errors).toEqual([]);
-  const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, ...cfg } as FoundryConfig;
+  // `rollout: {}` — a hybrid harness with the dial fully open — unless a test sets its own.
+  const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, rollout: {}, ...cfg } as FoundryConfig;
   return { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "test.dot" };
 }
 const gateDot = (attrs = "") =>
@@ -109,8 +110,16 @@ describe("the rollout dial reaches the gate", () => {
     });
   });
 
-  it("is omitted when there is no dial: every PR is in scope", () => {
+  it("is omitted when the dial is fully open: every PR is in scope", () => {
     expect(gateStep(gateJob('merge="off"')).with.rollout).toBeUndefined();
+  });
+
+  it("merge= needs the rollout block: it is what puts the gate and the lanes on one scope", () => {
+    const noBlock = { rollout: undefined } as Partial<FoundryConfig>;
+    expect(codes(diags('merge="off"', noBlock), "error")).toContain("node.merge-needs-rollout");
+    expect(codes(diags('merge="off"'), "error")).not.toContain("node.merge-needs-rollout");
+    // The original gate needs none.
+    expect(codes(diags("", noBlock), "error")).toEqual([]);
   });
 
   it("a malformed dial compiles to nobody-by-name, never to everybody", () => {

@@ -518,6 +518,11 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
     permissions: { contents: "write", "pull-requests": "write", checks: "read" },
     timeoutMinutes: timeoutOf(node, 35),
     steps,
+    // A hybrid harness lets the Fixer push only to PRs the pipeline wrote: its
+    // guard job runs the agent-written test, and the Fixer runs behind it.
+    ...(hasSkipGuard(node, ctx.config)
+      ? { needs: [preJobId(node)], if: `needs.${preJobId(node)}.outputs.run == 'true'` }
+      : {}),
   };
 }
 
@@ -648,7 +653,7 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   let rollout: string | undefined;
   try {
     const parsed = parseRollout(ctx.config.rollout, ctx.config.labels);
-    rollout = parsed ? JSON.stringify(parsed) : undefined;
+    rollout = parsed && Object.keys(parsed).length ? JSON.stringify(parsed) : undefined;
   } catch {
     rollout = JSON.stringify({ authors: [] });
   }

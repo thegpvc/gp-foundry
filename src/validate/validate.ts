@@ -9,6 +9,9 @@ import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
 import { parsePermissionsAttr } from "../handlers/index.js";
 import {
+  hasSkipGuard,
+  isHybrid,
+  isWritingPrLane,
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
   hasPrContext,
@@ -117,6 +120,76 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
       message: (e as Error).message,
       hint: "rollout: { authors: [alice], opt_in_label: agent-review, skip_label: no-agent-review } — every key optional",
     });
+  }
+
+  // A hybrid harness has ONE scope: the rollout block. Every other way of saying
+  // whose PRs a lane looks at is an error there, not a second opinion — a lane
+  // and the gate that could disagree about a PR is the bug this model removes.
+  const hybrid = isHybrid(ir.config);
+  if (hybrid) {
+    if (ir.config.repo?.authors !== undefined) {
+      diags.push({
+        level: "error",
+        code: "config.authors-and-rollout",
+        message: "repo.authors and rollout are both set — with a rollout block, scope is rollout.authors",
+        hint: "move the logins to rollout.authors and delete repo.authors",
+      });
+    }
+    for (const n of ir.nodes) {
+      const where = { node: n.id, line: n.line };
+      for (const attr of ["authors", "opt_in_label"] as const) {
+        if (n.attrs[attr] !== undefined && n.type !== "merge-gate") {
+          diags.push({
+            level: "error",
+            code: "node.scope-attr-with-rollout",
+            message: `${attr}= on '${n.id}' does not apply in a harness with a rollout block — every lane takes its scope from it`,
+            where,
+            hint: "move it to rollout: { authors, opt_in_label, skip_label } in foundry.config.yaml",
+          });
+        }
+      }
+      if (n.attrs.skip !== undefined && n.type !== "merge-gate") {
+        let conds: ReturnType<typeof parseSkip> = [];
+        try {
+          conds = parseSkip(n);
+        } catch {
+          // reported per node below
+        }
+        const scopeKinds = conds.filter((c) => c.kind !== "unchanged-diff").map((c) => (c.kind === "label" ? `label:${c.label}` : c.kind));
+        if (scopeKinds.length) {
+          diags.push({
+            level: "error",
+            code: "node.scope-attr-with-rollout",
+            message: `skip="${scopeKinds.join(",")}" on '${n.id}' does not apply in a harness with a rollout block — drafts and other bots' PRs are always skipped, and the skip label is rollout.skip_label`,
+            where,
+            hint: `keep only skip="unchanged-diff" on the node, if it is there`,
+          });
+        }
+      }
+      if (isWritingPrLane(n) && !ir.config.identity?.bot_login) {
+        diags.push({
+          level: "error",
+          code: "node.writing-lane-needs-bot-login",
+          message: `'${n.id}' (type ${n.type}) only pushes to PRs the pipeline wrote, but identity.bot_login is unset — no PR could be attributed to it`,
+          where,
+          hint: "set identity.bot_login in foundry.config.yaml to the login that opens the agent PRs",
+        });
+      }
+    }
+  } else {
+    // The gate with merge= takes its scope from the rollout; without the block
+    // the lanes would still be scoped the old way, and the two would disagree.
+    for (const n of ir.nodes) {
+      if (n.type === "merge-gate" && n.attrs.merge !== undefined) {
+        diags.push({
+          level: "error",
+          code: "node.merge-needs-rollout",
+          message: `merge= on '${n.id}' needs a rollout block in foundry.config.yaml — it is what puts the gate and every lane on one scope`,
+          where: { node: n.id, line: n.line },
+          hint: "add `rollout: {}` (every PR), or rollout: { authors: [...], opt_in_label: ..., skip_label: ... }",
+        });
+      }
+    }
   }
 
   // repo.authors (config-wide allowlist) is checked once, not per node.
@@ -776,6 +849,7 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
       // composite the producer uses.
       if (n.type === "producer" || n.type === "scheduled-agent") needed.add("agent-fallback");
       if (n.type === "merge-gate") needed.add("merge-gate");
+      if (hybrid && hasSkipGuard(n, ir.config)) needed.add("pr-scope");
       if (n.type === "pr-review" && n.attrs.gates !== undefined) needed.add("wait-for-checks");
     }
     for (const a of needed) {
