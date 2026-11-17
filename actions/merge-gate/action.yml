@@ -74,13 +74,15 @@ inputs:
     default: ""
   mode:
     description: >
-      "merge" (default): merge the first qualifying PR, or label/skip. "evaluate":
+      "merge": merge the first qualifying PR, or label/skip. "evaluate":
       never merge or label — evaluate every open PR in scope and publish the
       result as one check run per head (named by check-name), updated in place
       each run and left alone when nothing changed. Evaluate mode needs only
       `checks: write`, `pull-requests: read` and `contents: read` on the token.
+      No default here, so the action can tell whether a workflow set it: when
+      neither `mode` nor `merge` is given, the gate runs as "merge". Do not set
+      it together with `merge`.
     required: false
-    default: "merge"
   merge:
     description: >
       The single gate. "off": judge every PR in scope and publish the result as

@@ -3,6 +3,8 @@
  * behaviour is tested in actions/merge-gate/src/index.test.ts; this file pins
  * what the compiler hands it, and what validate() refuses.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import yaml from "js-yaml";
 import { parseDot } from "../src/parser/parse.js";
@@ -52,6 +54,34 @@ describe('merge="off"', () => {
 
   it("takes check_name=", () => {
     expect(gateStep(gateJob('merge="off", check_name="acme/approval"')).with["check-name"]).toBe("acme/approval");
+  });
+});
+
+// What the runner hands the action: action.yml's defaults, overlaid by the step's `with:`.
+const gateAction: any = yaml.load(readFileSync(fileURLToPath(new URL("../actions/merge-gate/action.yml", import.meta.url)), "utf8"));
+const runnerInputs = (w: Record<string, unknown>): Record<string, string> => {
+  const resolved: Record<string, string> = {};
+  for (const [k, v] of Object.entries(gateAction.inputs as Record<string, { default?: string }>)) resolved[k] = v.default ?? "";
+  for (const [k, v] of Object.entries(w)) resolved[k] = String(v);
+  return resolved;
+};
+
+describe("the compiled step meets the action's inputs", () => {
+  // 0.3.0 compiled merge= without mode, but action.yml defaulted mode to "merge",
+  // so the gate saw both and failed on its first run.
+  it("a merge= step reaches the gate with merge set and mode empty", () => {
+    for (const merge of ["off", "agent-only"]) {
+      const resolved = runnerInputs(gateStep(gateJob(`merge="${merge}"`, PAT)).with);
+      expect(resolved.merge, merge).toBe(merge);
+      expect(resolved.mode, merge).toBe("");
+    }
+  });
+
+  it("every input the step passes is one the action declares", () => {
+    const declared = Object.keys(gateAction.inputs);
+    for (const merge of ["off", "agent-only"]) {
+      expect(declared, merge).toEqual(expect.arrayContaining(Object.keys(gateStep(gateJob(`merge="${merge}"`, PAT)).with)));
+    }
   });
 });
 

@@ -1,15 +1,27 @@
 // The action wrapper, run end to end against a stub Octokit: evaluate mode
 // publishes, updates or leaves alone one check run per head, and never merges.
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const inputs: Record<string, string> = {};
+// The runner fills every input the workflow leaves out with its action.yml
+// default, so the stub does too: an input the workflow never set must look the
+// same here as it does on Actions. (0.3.0 shipped `mode` defaulting to "merge",
+// which made every merge= gate fail with "not both"; a stub returning "" hid it.)
+const actionYml = yaml.load(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../action.yml"), "utf8")) as {
+  inputs: Record<string, { default?: string }>;
+};
+const actionDefaults: Record<string, string> = Object.fromEntries(
+  Object.entries(actionYml.inputs).map(([k, v]) => [k, v.default ?? ""]),
+);
 const outputs: Record<string, string> = {};
 const failures: string[] = [];
 vi.mock("@actions/core", () => ({
-  getInput: (name: string) => inputs[name] ?? "",
+  getInput: (name: string) => inputs[name] ?? actionDefaults[name] ?? "",
   setOutput: (name: string, value: string) => {
     outputs[name] = value;
   },
@@ -635,14 +647,49 @@ describe("the single gate (merge=)", () => {
   });
 
   describe("inputs", () => {
-    it("rejects an unknown merge value, and merge together with mode", async () => {
+    it("rejects an unknown merge value", async () => {
       gate("everything");
       await run();
       expect(failures.join(" ")).toContain('merge must be "off" or "agent-only"');
+    });
+
+    it("merge= with no mode input runs the single gate (the step the 0.3.0 compiler writes)", async () => {
+      gate("off");
+      expect("mode" in inputs).toBe(false); // left to action.yml's default, as on the runner
+      await run();
+      expect(failures).toEqual([]);
+      expect(check()?.conclusion).toBe("success");
+      expect(outputs.evaluated).toBe("1");
+    });
+
+    it("merge= together with an explicit mode fails, naming both values", async () => {
       gate("off");
       inputs.mode = "evaluate";
       await run();
       expect(failures.join(" ")).toContain("merge replaces mode");
+      expect(failures.join(" ")).toContain('merge="off" and mode="evaluate"');
+      expect(writes()).toEqual([]);
+    });
+  });
+
+  describe("mode with no merge=", () => {
+    it("neither set: mode defaults to merge, and the original gate merges", async () => {
+      setup({ reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "ok\n\n**Verdict:** APPROVE" }] });
+      delete inputs.mode;
+      await run();
+      expect(failures).toEqual([]);
+      expect(methods()).toContain("pulls.merge");
+      expect(methods()).not.toContain("checks.create");
+    });
+
+    it("mode: evaluate alone still publishes a check and never merges", async () => {
+      setup({});
+      expect(inputs.mode).toBe("evaluate");
+      expect("merge" in inputs).toBe(false);
+      await run();
+      expect(failures).toEqual([]);
+      expect(check()?.conclusion).toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
     });
 
     it("needs a check name", async () => {
