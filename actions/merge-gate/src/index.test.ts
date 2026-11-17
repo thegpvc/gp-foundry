@@ -35,6 +35,8 @@ const CHECK = "fletch/approval";
 
 interface World {
   approved: boolean;
+  /** Labels on the PR. */
+  labels?: string[];
   /** Who opened the PR (default: the harness bot). */
   author?: { login: string; type: string };
   /** When set, the PR's reviews verbatim (overrides `approved`). */
@@ -59,7 +61,7 @@ function makeOctokit(world: World) {
     head: { sha: HEAD, ref: "agent/widget" },
     base: { ref: "main" },
     user: world.author ?? { login: BOT, type: "Bot" },
-    labels: [],
+    labels: (world.labels ?? []).map((name) => ({ name })),
     mergeable: true,
     mergeable_state: "clean",
     requested_reviewers: [],
@@ -403,5 +405,58 @@ describe("nobody approves their own pull request", () => {
     setup({ author: ALICE, reviews: [commentApproval("alice", "COLLABORATOR")] });
     await run();
     expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).not.toBe("success");
+  });
+});
+
+describe("escalation labels and standing change requests, end to end", () => {
+  const botApproval = { submitted_at: "2026-01-02T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "Fine.\n\n**Verdict:** APPROVE" };
+  const aliceBlocks = { submitted_at: "2026-01-01T00:00:00Z", state: "CHANGES_REQUESTED", commit_id: HEAD, user: { login: "alice" }, author_association: "COLLABORATOR", body: "Not like this." };
+  const conclusion = () => stub.calls.find((c) => c.method === "checks.create")?.params.conclusion;
+
+  it("an escalation label publishes action_required on an approved, green head", async () => {
+    setup({ labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\n");
+    await run();
+    expect(conclusion()).toBe("action_required");
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.output.summary).toContain("needs-a-person");
+  });
+
+  it("…and on a head the approver has not looked at, instead of 'awaiting'", async () => {
+    setup({ approved: false, labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\nno_verdict_conclusion: neutral\n");
+    await run();
+    expect(conclusion()).toBe("action_required");
+  });
+
+  it("an escalation label stops a merge in merge mode", async () => {
+    setup({ labels: ["needs-a-person"] }, "escalation_labels: [needs-a-person]\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+  });
+
+  it("without the clause, the bot's later approval overrides a teammate's block (unchanged)", async () => {
+    setup({ reviews: [aliceBlocks, botApproval] });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+
+  it("with require_no_human_changes_requested, the teammate's block holds", async () => {
+    setup({ reviews: [aliceBlocks, botApproval] }, "require_no_human_changes_requested: true\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).not.toContain("pulls.merge");
+
+    setup({ reviews: [aliceBlocks, botApproval] }, "require_no_human_changes_requested: true\n");
+    await run();
+    expect(conclusion()).toBe("failure");
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.output.summary).toContain("alice");
+  });
+
+  it("…until she approves", async () => {
+    const aliceApproves = { ...aliceBlocks, submitted_at: "2026-01-03T00:00:00Z", state: "APPROVED", body: "" };
+    setup({ reviews: [aliceBlocks, botApproval, aliceApproves] }, "require_no_human_changes_requested: true\n");
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
   });
 });

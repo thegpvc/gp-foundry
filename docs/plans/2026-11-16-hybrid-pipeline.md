@@ -51,7 +51,12 @@ convention for agent branches; nothing's safety rests on it in a harness that op
      skip_label: no-agent-review  # never these
    ```
 
-   - **No `rollout` block means every PR is in scope.** Finishing the rollout is deleting it.
+   - **No `rollout` block means every PR is in scope.** Finishing the rollout is deleting
+     it — or keeping only `skip_label`: a block that names neither `authors` nor
+     `opt_in_label` also admits everyone, so the off switch can outlive the rollout.
+     (`authors: []` is different: an admission rule that admits nobody by name.)
+   - **The skip label outranks everything**, the pipeline's own PRs included. It is the
+     off switch a person holds.
    - **Agent-written PRs are always in scope**, whatever the dial says: the pipeline made
      them. What it does with its own work is governed elsewhere — by which issues are
      labelled for the builder, and by the gate's `merge=`.

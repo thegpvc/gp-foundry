@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   evaluateMergeGate,
+  escalationLabel,
+  standingChangeRequests,
   latestAttemptPerCheck,
   globMatch,
   handWrittenAdditions,
@@ -1134,5 +1136,82 @@ describe("filterEvaluateCandidates", () => {
     expect(filterEvaluateCandidates(prs, "agent/", false, { skipLabels: ["agent-review"] })).toEqual([1, 2, 4]);
     const bots = [pr(1), pr(2, { authorLogin: "renovate[bot]" })];
     expect(filterEvaluateCandidates(bots, "agent/", false, { skipBotAuthors: true, botLogin: "fletch-bot[bot]" })).toEqual([1]);
+  });
+});
+
+describe("escalation labels: a person decides, verdict or not", () => {
+  const p: MergePolicy = { ...policy, escalationLabels: ["needs-human-decision"], noVerdictConclusion: "neutral" };
+  const labelled = (over: Partial<PullRequestFacts> = {}) => readyPr({ labels: ["needs-human-decision"], ...over });
+
+  it("never merges a PR that carries one, however ready it is", () => {
+    const d = evaluateMergeGate(labelled(), p, NOW);
+    expect(d.action).toBe("skip");
+    expect(d.code).toBe("escalated");
+    expect(d.reason).toContain("needs-human-decision");
+    // Without the label the same PR merges.
+    expect(evaluateMergeGate(readyPr(), p, NOW).action).toBe("merge");
+  });
+
+  it("stops the dependabot lane too", () => {
+    const d = evaluateMergeGate(labelled({ authorLogin: DEPENDABOT_LOGIN, dependabotUpdateType: "patch" }), { ...p, dependabot: { enabled: true } } as MergePolicy, NOW);
+    expect(d.code).toBe("escalated");
+  });
+
+  it("is listed among the failing clauses, in gate order after blocking labels", () => {
+    const codes = failingClauses(labelled({ ciStatus: "failing" }), p, NOW).map((d) => d.code);
+    expect(codes).toEqual(["escalated", "ci-not-passing"]);
+  });
+
+  it("the check is action_required — not neutral, even with no verdict yet", () => {
+    // The caller sets `escalated` from the label (see gatherFacts); an unapproved
+    // head would otherwise read "awaiting the approver".
+    const facts = labelled({ approvedAt: null, escalated: true });
+    expect(awaitingApprover(facts, p, NOW)).toBeUndefined();
+    const decision = evaluateMergeGate(facts, p, NOW);
+    expect(checkConclusion(decision, facts, { awaitingApprover: false })).toBe("action_required");
+  });
+
+  it("is distinct from a blocking label, and off unless configured", () => {
+    expect(escalationLabel({ labels: ["needs-human"] }, p)).toBeUndefined();
+    expect(escalationLabel({ labels: ["needs-human-decision"] }, policy)).toBeUndefined();
+    expect(evaluateMergeGate(labelled(), policy, NOW).action).toBe("merge");
+  });
+});
+
+describe("standing change requests", () => {
+  const r = (author: string, state: string, at: string) => ({ author, state, at });
+
+  it("is each reviewer's latest decision, the way GitHub's merge box counts it", () => {
+    expect(
+      standingChangeRequests([
+        r("alice", "CHANGES_REQUESTED", "2026-01-01T00:00:00Z"),
+        r("bob", "CHANGES_REQUESTED", "2026-01-01T00:00:00Z"),
+        r("bob", "APPROVED", "2026-01-02T00:00:00Z"), // bob came round
+        r("carol", "APPROVED", "2026-01-01T00:00:00Z"),
+        r("carol", "CHANGES_REQUESTED", "2026-01-03T00:00:00Z"), // carol changed her mind
+      ]),
+    ).toEqual(["alice", "carol"]);
+  });
+
+  it("a later comment does not clear a block; a dismissal does", () => {
+    const blocked = [r("alice", "CHANGES_REQUESTED", "2026-01-01T00:00:00Z"), r("alice", "COMMENTED", "2026-01-02T00:00:00Z")];
+    expect(standingChangeRequests(blocked)).toEqual(["alice"]);
+    expect(standingChangeRequests([...blocked, r("alice", "DISMISSED", "2026-01-03T00:00:00Z")])).toEqual([]);
+  });
+
+  it("leaves the harness bot out: its request is a verdict, cleared by a later verdict", () => {
+    const reviews = [r("Agent-Bot[bot]", "CHANGES_REQUESTED", "2026-01-01T00:00:00Z"), r("alice", "CHANGES_REQUESTED", "2026-01-01T00:00:00Z")];
+    expect(standingChangeRequests(reviews, "agent-bot[bot]")).toEqual(["alice"]);
+    expect(standingChangeRequests(reviews)).toEqual(["Agent-Bot[bot]", "alice"]);
+  });
+
+  it("holds the gate only when the policy asks for it", () => {
+    const facts = readyPr({ changesRequestedBy: ["alice"] });
+    expect(evaluateMergeGate(facts, policy, NOW).action).toBe("merge"); // today's behaviour: latest verdict wins
+    const d = evaluateMergeGate(facts, { ...policy, requireNoHumanChangesRequested: true }, NOW);
+    expect(d.action).toBe("skip");
+    expect(d.code).toBe("changes-requested");
+    expect(d.reason).toContain("`alice`");
+    expect(evaluateMergeGate(readyPr({ changesRequestedBy: [] }), { ...policy, requireNoHumanChangesRequested: true }, NOW).action).toBe("merge");
   });
 });

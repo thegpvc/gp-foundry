@@ -41,6 +41,15 @@ disqualifying first:
    requested reviewer or team, else `review-requested`.
 8. **Open review threads** (opt-in, `requireNoOpenThreads: true`) — no open
    thread, else `open-threads`. See [Open threads](#open-threads).
+   Between those two, opt-in: **standing change requests**
+   (`requireNoHumanChangesRequested: true`) — no person whose latest deciding
+   review is "changes requested", else `changes-requested`. Without it the latest
+   verdict wins, so the bot's later approval overrides a teammate's block.
+
+An **escalation label** (`escalationLabels: [...]`) is checked first, right after
+blocking labels and in both lanes: a PR carrying one is never merged (`escalated`),
+and in evaluate mode its check is `action_required` whether or not the approver
+has given a verdict.
 9. **Hand-written additions** — additions of non-`excludeGlobs` files must be
    `<= maxAdditions`, else apply `labels.needsHuman`.
 10. **Protected paths** — no changed file may match `protectedPaths`, else apply

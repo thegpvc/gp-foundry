@@ -26,6 +26,7 @@ import {
   parseSkip,
   takesAuthors,
 } from "../handlers/attrs.js";
+import { parseRollout } from "../shared/scope.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
 import { roleCanUseGh } from "../handlers/steps.js";
@@ -100,6 +101,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
       code: "config.bad-verdicts",
       message: (e as Error).message,
       hint: "verdicts: [APPROVE, REQUEST_CHANGES, ESCALATE] — approve, request changes, escalate, in that order",
+    });
+  }
+
+  // The rollout dial. A malformed one must stop the build: it decides whose PRs
+  // the pipeline touches, and "everyone" or "no one" by accident is the failure.
+  try {
+    parseRollout(ir.config.rollout, ir.config.labels);
+  } catch (e) {
+    diags.push({
+      level: "error",
+      code: "config.bad-rollout",
+      message: (e as Error).message,
+      hint: "rollout: { authors: [alice], opt_in_label: agent-review, skip_label: no-agent-review } — every key optional",
     });
   }
 
