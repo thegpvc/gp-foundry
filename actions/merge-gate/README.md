@@ -106,6 +106,36 @@ Logins compare case-insensitively and with or without the `[bot]` suffix
 (GraphQL drops it). A failed thread read fails closed: the PR is not evaluated
 that run.
 
+## The single gate (`merge`)
+
+`merge: off | agent-only` is one gate for a repo where people and agents both
+open pull requests. Each tick, for every PR in scope:
+
+1. the result is worked out against the policy;
+2. it is published as the check `check-name` on the PR's head;
+3. with `agent-only`, a PR the pipeline **wrote** — opened by `bot-login`, every
+   commit its own — is acted on: merged when ready, labelled per the policy when
+   not. One merge per run.
+
+A human-written PR gets the check and nothing else: no merge, no label, no
+comment. With `agent-only` the check's text says who merges the PR and, for a
+PR that is not agent-written, why not.
+
+Scope comes from the `rollout` input (the dial in `foundry.config.yaml`), not
+from a branch prefix: a draft never, a PR with the skip label never, a PR
+`bot-login` opened always, another bot only if named in `authors`, then a listed
+author or the opt-in label. With no rollout, every remaining PR. The policy's
+`branchPrefix` clause is not applied. If the policy enables the dependabot lane,
+dependabot's PRs are judged and merged on that lane as before.
+
+`check-app` names the app whose runs the gate adopts. Leave it empty when the
+check is published with `GITHUB_TOKEN`; pass the harness App's slug when
+`checks-token` is that App's token, so a check published by any other workflow
+is never taken for the gate's.
+
+`mode` (below) is the older interface and is unchanged; `merge` and `mode`
+cannot both be set.
+
 ## Evaluate mode
 
 `mode: evaluate` never merges, labels or comments. It evaluates the policy for
