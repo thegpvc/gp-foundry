@@ -38,6 +38,7 @@ inputs:
       and the gate merges nothing. Pass the built-in GITHUB_TOKEN (an App
       installation token) and give the job `permissions: checks: read`. Defaults to `token`,
       which is correct only when that token is a GitHub App installation token.
+      In evaluate mode it also writes the gate's check run (see check-app).
     required: false
     default: ""
   bot-login:
@@ -78,13 +79,23 @@ inputs:
       never merge or label — evaluate every open PR in scope and publish the
       result as one check run per head (named by check-name), updated in place
       each run and left alone when nothing changed. Evaluate mode needs only
-      `checks: write`, `pull-requests: read` and `contents: read` on the token.
+      `pull-requests: read` and `contents: read` on the token, and
+      `checks: write` on checks-token.
     required: false
     default: "merge"
   check-name:
     description: "Evaluate mode: the check run to publish on each head (required in that mode)."
     required: false
     default: ""
+  check-app:
+    description: >
+      Evaluate mode: slug of the app checks-token writes check runs as. The gate
+      updates only its own earlier run, found by check-name and this app. Leave
+      the default for GITHUB_TOKEN; with a GitHub App installation token (which
+      needs Checks: write), pass the App's slug, e.g. "my-app" for "my-app[bot]".
+      An App-owned check cannot be forged by other workflows' GITHUB_TOKEN.
+    required: false
+    default: "github-actions"
   authors:
     description: "Evaluate mode: only PRs by these comma-separated logins (or carrying opt-in-label)."
     required: false

@@ -7,7 +7,7 @@
 import type { Diagnostic, Harness, HarnessEdge, HarnessNode, RoleSpec } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
-import { parsePermissionsAttr } from "../handlers/index.js";
+import { evaluateGateCheckApp, parsePermissionsAttr } from "../handlers/index.js";
 import {
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
@@ -139,6 +139,21 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
       name = parseEvaluateCheckName(n);
     } catch {
       continue; // reported per node below
+    }
+    // Only an App-token check is the gate's alone; see emitEvaluateGate.
+    if (!evaluateGateCheckApp(ir.config)) {
+      const app = resolveAuth(ir.config).mode === "app";
+      diags.push({
+        level: "warning",
+        code: "node.evaluate-check-github-actions",
+        message:
+          `merge gate '${n.id}' publishes '${name}' with GITHUB_TOKEN, so the check belongs to github-actions: ` +
+          "GitHub shows it under an unrelated workflow's name, and any workflow in the repo can publish a check of the same name, so it cannot be trusted as a required check",
+        where: { node: n.id, line: n.line },
+        hint: app
+          ? "set identity.bot_login in foundry.config.yaml to the App's bot login (e.g. my-app[bot]) so the check is published with the App token"
+          : "use auth.mode 'app' (the App needs Checks: write) and set identity.bot_login to its bot login",
+      });
     }
     const other = evalGateByCheck.get(name);
     if (other) {

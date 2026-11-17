@@ -14,6 +14,7 @@ import type {
 } from "../ir/types.js";
 import type { GateSpec } from "./attrs.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
+import { resolveAuth } from "../auth/auth.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
   authorsOf,
@@ -546,6 +547,20 @@ export function humanGateRequiredCheck(node: HarnessNode): string {
 }
 
 /**
+ * The App an evaluate gate publishes its check as: the slug of the harness App
+ * (`identity.bot_login` without its `[bot]` suffix), or undefined when the gate
+ * must fall back to GITHUB_TOKEN — auth is not `app`, the App secrets are
+ * missing, or no bot login names the App. Without the slug the action could not
+ * find its own earlier run, and would add a new one every tick.
+ */
+export function evaluateGateCheckApp(config: EmitContext["config"]): string | undefined {
+  const a = resolveAuth(config);
+  if (a.mode !== "app" || !a.appIdSecret || !a.appKeySecret) return undefined;
+  const slug = config.identity?.bot_login?.trim().replace(/\[bot\]$/i, "");
+  return slug || undefined;
+}
+
+/**
  * The configured verdict words for the merge gate's `verdicts` input, so the
  * gate's approval / rejection / escalation markers come from the same list the
  * sweep reads. Omitted at the defaults (and when malformed: validate reports it).
@@ -612,13 +627,26 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
  * verdict posted once per head goes stale; this check is re-derived each tick
  * at no model cost, and can be made a required check.
  *
- * Everything runs on GITHUB_TOKEN: it is the token the Checks API accepts for a
- * write, and the one a job's `permissions:` block bounds, so this job can read
- * the PRs and write checks but cannot push or merge. No harness token, no App
- * token, no git identity: nothing here commits.
+ * The PR reads run on GITHUB_TOKEN, which the job's `permissions:` block bounds:
+ * this job can read the PRs but cannot push or merge, and has no git identity.
+ *
+ * The check itself is written with the App token when there is one. A
+ * GITHUB_TOKEN check belongs to `github-actions`: GitHub files it under whatever
+ * Actions check suite already sits on the commit (it showed up as "Dependabot
+ * Slack Notification / fletch/approval"), and any workflow in the repo can
+ * publish a run of the same name, so it can never be a required check. An App
+ * token's run belongs to the App alone. Without App auth (or without the bot
+ * login that names the App) the check falls back to GITHUB_TOKEN; validate()
+ * warns.
  */
 function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJobFragment {
   const node = ctx.node;
+  const checkApp = evaluateGateCheckApp(ctx.config);
+  // The App token is narrowed to what the gate does with it: write the check,
+  // and read the check runs, PRs and repo contents that decide it.
+  const app = checkApp
+    ? appTokenStep(ctx, appScope(node, { contents: "read", "pull-requests": "read", checks: "write" }))
+    : undefined;
   const checkout = checkoutStep(ctx, { persistCredentials: false });
   checkout.with = { ...checkout.with, token: "${{ github.token }}" };
   let checkName: string;
@@ -637,9 +665,11 @@ function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJ
   return {
     jobId: node.id,
     name: node.id,
-    permissions: { contents: "read", "pull-requests": "read", checks: "write" },
+    // With an App token writing the check, GITHUB_TOKEN no longer needs checks: write.
+    permissions: { contents: "read", "pull-requests": "read", checks: app ? "read" : "write" },
     timeoutMinutes: timeoutOf(node, 10),
     steps: [
+      ...(app ? [app] : []),
       checkout,
       {
         uses: ctx.actionRef("merge-gate"),
@@ -648,7 +678,8 @@ function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJ
           mode: "evaluate",
           "check-name": checkName,
           token: "${{ github.token }}",
-          "checks-token": "${{ github.token }}",
+          "checks-token": app ? "${{ steps.app-token.outputs.token }}" : "${{ github.token }}",
+          ...(app ? { "check-app": checkApp! } : {}),
           "policy-path": resolveFile(ctx, node.files.policy),
           "base-branch": ctx.config.repo.base_branch,
           "branch-prefix": ctx.config.repo.branch_prefix,

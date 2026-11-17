@@ -191,6 +191,28 @@ describe("merge-gate evaluate mode", () => {
     expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
   });
 
+  it("with check-app, updates its own App-owned run and ignores github-actions' same-named run", async () => {
+    setup({
+      threads: [openThread],
+      existing: [
+        { id: 7, name: CHECK, status: "completed", conclusion: "success", app: { slug: "github-actions" }, output: { summary: "forged", text: "" } },
+        { id: 8, name: CHECK, status: "completed", conclusion: "success", app: { slug: "trajectory-fletch" }, output: { summary: "old", text: "" } },
+      ],
+    });
+    inputs["check-app"] = "trajectory-fletch";
+    await run();
+    expect(failures).toEqual([]);
+    expect(writes().map((c) => c.method)).toEqual(["checks.update"]);
+    expect(stub.calls.find((c) => c.method === "checks.update")?.params).toMatchObject({ check_run_id: 8, conclusion: "failure" });
+  });
+
+  it("with check-app, creates its own run rather than adopt the github-actions one", async () => {
+    setup({ existing: [{ id: 7, name: CHECK, status: "completed", conclusion: "success", app: { slug: "github-actions" }, output: { summary: "", text: "" } }] });
+    inputs["check-app"] = "trajectory-fletch";
+    await run();
+    expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
+  });
+
   it("never merges or labels, even with labels configured and nothing approved", async () => {
     setup({ approved: false }, "labels:\n  awaiting_approval: awaiting-approval\n");
     await run();

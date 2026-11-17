@@ -417,7 +417,11 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
 // Evaluate mode: publish the gate's result as a check run, never merge
 // ────────────────────────────────────────────────────────────────────────────
 
-/** The app GITHUB_TOKEN writes check runs as; an evaluate gate updates only its own run. */
+/**
+ * The app GITHUB_TOKEN writes check runs as: the `check-app` default. An evaluate
+ * gate updates only its own run, so `check-app` must name the app `checks-token`
+ * belongs to (the harness App's slug when that token is an App token).
+ */
 export const CHECK_APP = "github-actions";
 
 export interface CheckOutput {
@@ -533,10 +537,12 @@ export async function publishCheck(
   headSha: string,
   name: string,
   out: CheckOutput,
+  checkApp: string = CHECK_APP,
 ): Promise<"created" | "updated" | "unchanged"> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
+  const app = checkApp.toLowerCase();
   const mine = runs
-    .filter((r) => r.name === name && r.app?.slug === CHECK_APP)
+    .filter((r) => r.name === name && (r.app?.slug ?? "").toLowerCase() === app)
     .sort((a, b) => b.id - a.id)[0];
   if (
     mine &&
@@ -583,6 +589,8 @@ export async function runEvaluate(opts: {
   repo: string;
   policy: PolicyFile;
   checkName: string;
+  /** The app slug `checksOctokit` writes check runs as; defaults to CHECK_APP. */
+  checkApp?: string;
   baseBranch: string;
   selection: CandidateSelection;
   prNumber?: number;
@@ -628,7 +636,7 @@ export async function runEvaluate(opts: {
       const out = renderCheckOutput(decision, facts, policy, checkName);
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
       if (opts.dryRun || !facts.headSha) continue;
-      const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out);
+      const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
       if (result !== "unchanged") written++;
       core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
     } catch (e) {
@@ -688,13 +696,14 @@ export async function run(): Promise<void> {
     if (mode === "evaluate") {
       const checkName = core.getInput("check-name").trim();
       if (!checkName) throw new Error("mode: evaluate needs a check-name");
+      const checkApp = core.getInput("check-app").trim() || CHECK_APP;
       let prNumber: number | undefined;
       if (prNumberInput) {
         prNumber = parseInt(prNumberInput, 10);
         if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
       }
       const { evaluated, written } = await runEvaluate({
-        octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun,
+        octokit, checksOctokit, owner, repo, policy, checkName, checkApp, baseBranch, prNumber, dryRun,
         selection: selectionFromInputs((n) => core.getInput(n), policy.botLogin),
       });
       core.setOutput("evaluated", String(evaluated));

@@ -28,6 +28,7 @@ const gateStep = (j: any) => j.steps.find((s: any) => String(s.uses).includes("m
 const codes = (h: Harness, level = "error") => validate(h).filter((d) => d.level === level).map((d) => d.code);
 
 const EVAL = `  gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/5 * * * *", mode="evaluate", check_name="fletch/approval"]`;
+const APP = { auth: { mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } };
 const MERGE = `  ship [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]`;
 
 describe("merge-gate mode=evaluate compiles", () => {
@@ -48,10 +49,42 @@ describe("merge-gate mode=evaluate compiles", () => {
     expect(j.steps[0].with).toMatchObject({ token: "${{ github.token }}", "persist-credentials": false });
   });
 
-  it("does not mint an App token in app auth mode either", () => {
-    const j = job(EVAL, "gate", { auth: { mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>);
+  it("under app auth, writes the check with a scoped App token as the App", () => {
+    const j = job(EVAL, "gate", { ...APP, identity: { bot_login: "trajectory-fletch[bot]" } } as Partial<FoundryConfig>);
+    const mint = j.steps[0];
+    expect(mint).toMatchObject({ uses: "actions/create-github-app-token@v3", id: "app-token" });
+    expect(mint.with).toEqual({
+      "client-id": "${{ secrets.APP_ID }}",
+      "private-key": "${{ secrets.APP_KEY }}",
+      "permission-contents": "read",
+      "permission-pull-requests": "read",
+      "permission-checks": "write",
+    });
+    const step = gateStep(j);
+    expect(step.with).toMatchObject({
+      token: "${{ github.token }}",
+      "checks-token": "${{ steps.app-token.outputs.token }}",
+      "check-app": "trajectory-fletch",
+      "bot-login": "trajectory-fletch[bot]",
+    });
+    // GITHUB_TOKEN still does the PR reads, but no longer writes checks.
+    expect(j.permissions).toEqual({ contents: "read", "pull-requests": "read", checks: "read" });
+    expect(j.steps.map((s: any) => s.name)).toEqual(["Mint app token", "Checkout", step.name]);
+    expect(j.steps[1].with).toMatchObject({ token: "${{ github.token }}", "persist-credentials": false });
+  });
+
+  it("under app auth without a bot login, falls back to GITHUB_TOKEN", () => {
+    const j = job(EVAL, "gate", { ...APP, identity: {} } as Partial<FoundryConfig>);
     expect(JSON.stringify(j)).not.toContain("create-github-app-token");
-    expect(j.permissions.contents).toBe("read");
+    expect(gateStep(j).with["checks-token"]).toBe("${{ github.token }}");
+    expect(gateStep(j).with["check-app"]).toBeUndefined();
+    expect(j.permissions.checks).toBe("write");
+  });
+
+  it("under token auth, compiles as before: no mint, no check-app", () => {
+    const step = gateStep(job(EVAL, "gate"));
+    expect(step.with["check-app"]).toBeUndefined();
+    expect(step.with["checks-token"]).toBe("${{ github.token }}");
   });
 
   it("defaults the check name from the node id", () => {
@@ -98,6 +131,15 @@ describe("merge-gate mode=evaluate compiles", () => {
 });
 
 describe("validate: mode= and check_name=", () => {
+  it("warns that an evaluate gate's check is github-actions' (forgeable) without App auth", () => {
+    const d = validate(mkHarness(EVAL)).find((x) => x.code === "node.evaluate-check-github-actions");
+    expect(d?.level).toBe("warning");
+    expect(d?.message).toContain("github-actions");
+    expect(codes(mkHarness(EVAL, { ...APP, identity: {} } as Partial<FoundryConfig>), "warning")).toContain("node.evaluate-check-github-actions");
+    expect(codes(mkHarness(EVAL, APP as Partial<FoundryConfig>), "warning")).not.toContain("node.evaluate-check-github-actions");
+    expect(codes(mkHarness(MERGE), "warning")).not.toContain("node.evaluate-check-github-actions");
+  });
+
   it("accepts an evaluate gate beside a merge gate", () => {
     expect(codes(mkHarness(`${EVAL}\n${MERGE}`))).toEqual([]);
   });

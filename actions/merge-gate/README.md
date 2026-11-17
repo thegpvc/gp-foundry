@@ -122,18 +122,31 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | `failure` | anything else (a rejected head, an approved head with a clause failing, or any unverdicted head without `noVerdictConclusion: neutral`); `output.summary` carries the gate's first failing `code` and `reason` |
 
 `output.text` lists the open threads, the checks not passing and the pending
-review requests. The run is written with `checks-token` (GITHUB_TOKEN) and is
-idempotent per head: an existing run of that name from `github-actions` is
-updated in place, and when its conclusion, summary and text already match,
-nothing is written. Gate state that changes without a push (a thread answered,
-CI finished, a review request dropped) therefore flips the check on the next
-run, at no model cost, and the check can be made required.
+review requests. The run is written with `checks-token` and belongs to the app
+that token belongs to, which `check-app` names (default `github-actions`). It is
+idempotent per head: an existing run of that name from `check-app` is updated in
+place, and when its conclusion, summary and text already match, nothing is
+written. Gate state that changes without a push (a thread answered, CI finished,
+a review request dropped) therefore flips the check on the next run, at no model
+cost.
+
+Which app owns the check matters. A run written with GITHUB_TOKEN belongs to
+`github-actions`: GitHub files it under whatever Actions check suite is already
+on the commit, so it displays under an unrelated workflow's name, and any
+workflow in the repository can publish a run with the same name. Such a check
+cannot be trusted as a required check. With a GitHub App installation token as
+`checks-token` and the App's slug as `check-app`, the run belongs to the App:
+it displays under the App's name and no other workflow can forge it, so it can
+be made required. The App needs the **Checks: write** permission. `gp-foundry
+build` does this when `auth.mode` is `app` and `identity.bot_login` is set (the
+slug is the bot login without `[bot]`); a downstream gate then references the
+check as `<check-name>@<app-slug>`, e.g. `fletch/approval@trajectory-fletch`.
 
 In this mode the gate leaves its own check out of the CI rollup (a failing
 verdict would otherwise hold itself failing), and `requireCleanRebase` defaults
 to `false` — mergeability is only settled by a merge attempt, which this mode
-never makes. The token needs only `checks: write`, `pull-requests: read` and
-`contents: read`.
+never makes. `token` needs only `pull-requests: read` and `contents: read`;
+`checks-token` needs `checks: write`.
 
 ## Verdict markers
 
@@ -178,7 +191,8 @@ one identity. A rejection counts from anyone, including the author.
 | `bot-login`   | no       | Login of the reviewer bot whose verdicts are trusted; overrides the policy's `bot_login`. |
 | `required-checks` | no   | Comma/newline-separated check-run names that must be present and green on the head SHA; overrides the policy's `required_checks`. |
 | `clean-rebase`| no       | Override the rebase check with `"true"`/`"false"`; inferred from mergeable state otherwise. |
-| `checks-token` | no      | Token for reading (and, in evaluate mode, writing) check runs; pass GITHUB_TOKEN. |
+| `checks-token` | no      | Token for reading (and, in evaluate mode, writing) check runs; GITHUB_TOKEN, or in evaluate mode an App installation token with Checks: write. |
+| `check-app`   | no       | Evaluate mode: slug of the app `checks-token` writes check runs as (default `github-actions`); the gate updates only its own run from this app. |
 | `verdicts`    | no       | The verdict words, approve / request changes / escalate (default `APPROVE,REQUEST_CHANGES,ESCALATE`). |
 | `mode`        | no       | `merge` (default) or `evaluate` (publish a check run per head, never merge). |
 | `check-name`  | evaluate | The check run evaluate mode publishes. |
