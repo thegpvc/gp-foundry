@@ -50,5 +50,6 @@ labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resol
 runtime: # how generated workflows reference the runtime-core actions
   # vendored — `gp-foundry vendor` copies the actions into .github/actions/ (default;
   #            self-contained, no external dependency, upgrade by re-running vendor).
-  # pinned   — reference <owner_repo>/actions/<name>@<ref> centrally (set a SHA/tag).
+  # pinned   — reference <owner_repo>/actions/<name>@<ref> centrally. With no `ref:` the
+  #            compiler uses its own release tag, so rebuilding upgrades both together.
   mode: vendored

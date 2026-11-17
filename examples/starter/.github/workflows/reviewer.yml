@@ -48,7 +48,7 @@ jobs:
         uses: ./.gp-foundry/harness/.github/agent-setup
       - name: Fetch context
         id: ctx
-        uses: thegpvc/gp-foundry/actions/agent-context@v1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.3.0
         with:
           type: pr-diff
           number: ${{ github.event.pull_request.number }}
@@ -58,7 +58,7 @@ jobs:
           trusted-framing: baseline
       - name: Run agent
         timeout-minutes: 15
-        uses: thegpvc/gp-foundry/actions/run-agent@v1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.3.0
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/reviewer.md
           model: claude-opus-4-8

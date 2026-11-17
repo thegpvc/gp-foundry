@@ -16,6 +16,7 @@ import yaml from "js-yaml";
 import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
+import { releaseTag } from "../src/shared/version.js";
 import { validate } from "../src/validate/validate.js";
 import { parseGates } from "../src/handlers/attrs.js";
 import { staleGeneratedWorkflows } from "../src/cli/common.js";
@@ -1790,7 +1791,7 @@ describe("harness files come from the base ref, not the PR head", () => {
       expect(s.uses).toMatch(/^\.\/\.gp-foundry\/harness\/\.github\/actions\//);
     }
     // Pinned mode references the release, which a PR cannot edit.
-    expect(stepNamed(job(), "Run agent").uses).toBe("thegpvc/gp-foundry/actions/run-agent@v1");
+    expect(stepNamed(job(), "Run agent").uses).toBe(`thegpvc/gp-foundry/actions/run-agent@${releaseTag()}`);
   });
 
   it("a sweep takes the base ref from the selected PR", () => {

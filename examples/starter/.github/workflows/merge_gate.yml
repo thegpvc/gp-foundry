@@ -34,7 +34,7 @@ jobs:
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
       - name: Evaluate merge gate
-        uses: thegpvc/gp-foundry/actions/merge-gate@v1
+        uses: thegpvc/gp-foundry/actions/merge-gate@v0.3.0
         with:
           token: ${{ secrets.AGENT_PAT }}
           checks-token: ${{ github.token }}
