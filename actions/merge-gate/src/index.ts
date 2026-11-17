@@ -811,7 +811,10 @@ export async function run(): Promise<void> {
     const mergeSetting = core.getInput("merge").trim();
     if (mergeSetting) {
       if (mergeSetting !== "off" && mergeSetting !== "agent-only") throw new Error(`merge must be "off" or "agent-only", got "${mergeSetting}"`);
-      if (core.getInput("mode").trim()) throw new Error("set merge or mode, not both: merge replaces mode");
+      // `mode` has no default in action.yml, so a non-empty value here was set by
+      // the workflow. (0.3.0 defaulted it to "merge", which made every merge= gate throw.)
+      const modeSetting = core.getInput("mode").trim();
+      if (modeSetting) throw new Error(`set merge or mode, not both: merge replaces mode (got merge="${mergeSetting}" and mode="${modeSetting}")`);
       const checkName = core.getInput("check-name").trim();
       if (!checkName) throw new Error("merge needs a check-name: the gate publishes its result as a check");
       const rolloutInput = core.getInput("rollout").trim();

@@ -219,7 +219,7 @@ one identity. A rejection counts from anyone, including the author.
 | `clean-rebase`| no       | Override the rebase check with `"true"`/`"false"`; inferred from mergeable state otherwise. |
 | `checks-token` | no      | Token for reading (and, in evaluate mode, writing) check runs; pass GITHUB_TOKEN. |
 | `verdicts`    | no       | The verdict words, approve / request changes / escalate (default `APPROVE,REQUEST_CHANGES,ESCALATE`). |
-| `mode`        | no       | `merge` (default) or `evaluate` (publish a check run per head, never merge). |
+| `mode`        | no       | `merge` (default when `merge` is unset) or `evaluate` (publish a check run per head, never merge). Not together with `merge`. |
 | `check-name`  | evaluate | The check run evaluate mode publishes. |
 | `authors`, `opt-in-label`, `skip-labels`, `skip-bot-authors` | no | Evaluate-mode PR selection (comma-separated logins / labels; `"true"`). |
 | `dry-run`     | no       | `"true"` to evaluate + emit outputs without mutating. |
