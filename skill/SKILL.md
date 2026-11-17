@@ -92,8 +92,17 @@ Listen for:
   a `human-gate` is mandatory — it is a first-class node for exactly this reason. Give it an
   out-edge to the merge gate (`human_gate -> merge_gate`): that is what turns the Environment
   approval into a check the merge requires on that exact commit, instead of a lane running
-  beside the gate. Also confirm `identity.bot_login` — verdict guards and the merge gate use
-  it to tell the reviewer's approval from a stranger's.
+  beside the gate. Also confirm `identity.bot_login` — it must be the account the pipeline
+  actually posts as (under PAT auth, the PAT's owner). Verdict guards and the merge gate use
+  it to tell the reviewer's approval from a stranger's, and it is how the pipeline knows
+  which PRs it wrote.
+- **People and agents share the repo** → ask two things and write them down. *Whose PRs
+  should the pipeline review, besides its own?* → the `rollout` block in
+  `foundry.config.yaml` (`authors: []` to start with only its own; add logins or an
+  `opt_in_label` to widen; `rollout: {}` for everyone). *Should it merge what it writes?* →
+  `merge="off"` (publish the gate's verdict as a check, a person merges — the default) or
+  `merge="agent-only"` on the gate. It never merges or pushes to a person's PR. See
+  "Hybrid harnesses" in `reference/node-types.md`.
 - **Invariants** → `scope.yaml`'s `immutable_paths` (enforced three ways by the generated
   output: a PR guard workflow, the pre-push strip, and the merge gate; agents can never modify —
   e.g. `.github/workflows/`) and `forbidden_paths`/`forbidden_operations` (prompt-enforced).

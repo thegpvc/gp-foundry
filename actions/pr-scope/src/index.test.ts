@@ -169,3 +169,26 @@ describe("pr-scope: listing for a sweep", () => {
     expect(o.seen).toHaveLength(2);
   });
 });
+
+describe("pr-scope: the wrong-bot-login hint", () => {
+  const onAgentBranch = { user: { login: "dan", type: "User" }, head: { ref: "agent/12-fix" } };
+  const opts = { ...base, branchPrefix: "agent/" };
+
+  it("explains an agent-named branch turned away because someone else opened it", async () => {
+    const r = await decide(octokit(onAgentBranch), { ...opts, rollout: { authors: [] }, requireAgentWritten: false });
+    expect(r.run).toBe(false);
+    expect(r.reason).toContain("identity.bot_login should be 'dan'");
+    const w = await decide(octokit(onAgentBranch), { ...opts, requireAgentWritten: true });
+    expect(w.run).toBe(false);
+    expect(w.reason).toContain("identity.bot_login should be 'dan'");
+  });
+
+  it("says nothing for an ordinary branch, the bot's own PR, a draft or a skip label", async () => {
+    const quiet = async (pr: Record<string, unknown>, rollout: object = { authors: [] }) =>
+      (await decide(octokit(pr), { ...opts, rollout, requireAgentWritten: false })).reason;
+    expect(await quiet({ user: { login: "dan", type: "User" }, head: { ref: "dan/feature" } })).not.toContain("bot_login");
+    expect(await quiet({ head: { ref: "agent/12-fix" } })).not.toContain("bot_login");
+    expect(await quiet({ ...onAgentBranch, draft: true })).not.toContain("bot_login");
+    expect(await quiet({ ...onAgentBranch, labels: [{ name: "no" }] }, { authors: [], skipLabel: "no" })).not.toContain("bot_login");
+  });
+});

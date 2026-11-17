@@ -10,7 +10,7 @@ flowchart TD
   builder["builder<br/><small>producer</small>"]
   reviewer["reviewer<br/><small>pr-review</small>"]
   fixer["fixer<br/><small>pr-fix</small>"]
-  merge_gate[/"merge_gate<br/><small>merge-gate</small>"/]
+  merge_gate[/"merge_gate<br/><small>merge-gate · merge off → check gp-foundry/approval (merge_gate)</small>"/]
   janitor["janitor<br/><small>scheduled-agent</small>"]
   supervisor["supervisor<br/><small>scheduled-agent</small>"]
   retro["retro<br/><small>scheduled-agent</small>"]
@@ -33,7 +33,7 @@ flowchart TD
 | `scout` | issues: opened |
 | `planner` | issues: labeled |
 | `builder` | issues: labeled |
-| `reviewer` | pull_request: opened, synchronize |
+| `reviewer` | pull_request: opened, synchronize, ready_for_review |
 | `fixer` | pull_request_review: submitted |
 | `merge_gate` | schedule: `*/30 * * * *` · workflow_dispatch |
 | `janitor` | schedule: `*/30 * * * *` · workflow_dispatch |

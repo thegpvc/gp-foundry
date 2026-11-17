@@ -2,6 +2,11 @@
 
 **Stand up a "dark factory" for your repo: issues in → reviewed, auto-merged PRs out.**
 
+It works alongside people, not instead of them. Agents and humans open pull requests in
+the same repo; the pipeline reviews whichever of them you roll it out to, publishes its
+verdict on each as a check, and merges only the PRs it wrote itself — and only once you
+turn that on. A person's PR is always merged by a person.
+
 `gp-foundry` lets you **declare an autonomous agent pipeline as a directed graph and compile
 it** into a repo. You describe the crew and the flow in one `harness.dot`; a deterministic
 compiler emits plain GitHub Actions workflows. There's no orchestrator to run — **GitHub is
@@ -113,7 +118,7 @@ takes an issue from triage to merge, plus the lanes that keep the factory health
 | 🧹 | janitor | Scheduled sweep: rebase PRs the gate flagged `needs-rebase` so they can merge. |
 | 🧭 | supervisor | Scheduled sweep: re-drive stranded issues/PRs; escalate to `needs-human` after 2 nudges. |
 | ♻️ | retro | Scheduled: mine merged PRs/reviews/CI for recurring lessons; write them to team memory. |
-| 🔀 | merge_gate | **Policy gate, not a persona** — enforces merge policy (approval, CI green, size, protected paths); auto-merges or labels `needs-rebase`/`needs-human`. |
+| 🔀 | merge_gate | **Policy gate, not a persona** — judges every PR in scope against the merge policy (approval, CI green, size, protected paths) and publishes the result as a check. With `merge="agent-only"` it also merges the PRs the pipeline wrote, or labels them `needs-rebase`/`needs-human`. A new harness starts with `merge="off"`. |
 
 Roles are generic; a consumer repo supplies its stack (label strings, build/test commands,
 size thresholds, merge policy) via config and the `roles/*.md` overlay, never baked into the
@@ -151,7 +156,7 @@ digraph harness {
   builder     [type=producer,        role="agents/roles/builder.md", context=issue]
   reviewer    [type=pr-review,       role="agents/roles/reviewer.md", context="pr-diff"]
   fixer       [type=pr-fix,          role="agents/roles/fixer.md",   max_attempts=3]
-  merge_gate  [type=merge-gate,      policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  merge_gate  [type=merge-gate,      policy="agents/policy/merge.yaml", schedule="*/30 * * * *", merge="off"]
   janitor     [type=scheduled-agent, role="agents/roles/janitor.md",    schedule="*/30 * * * *"]
   supervisor  [type=scheduled-agent, role="agents/roles/supervisor.md", schedule="17 * * * *"]
   retro       [type=scheduled-agent, role="agents/roles/retro.md",   schedule="0 7 * * 1-5"]
@@ -172,6 +177,36 @@ digraph harness {
 Every cycle must keep a bounded escape edge to an `exit` node; the model-checker rejects
 unbounded loops at build time. Full vocabulary in
 [skill/reference/node-types.md](./skill/reference/node-types.md).
+
+## People and agents in one repo
+
+A new harness is **hybrid**: its config has a `rollout` block, and that one block is the
+scope every lane and the gate share.
+
+```yaml
+rollout:
+  authors: []                  # nobody's PRs but the pipeline's own — the starting point
+  # authors: [alice, bob]      # ...and these people's
+  # opt_in_label: agent-review # ...and any PR carrying this label
+  # skip_label: no-agent-review
+```
+
+- **What the pipeline looks at.** Its own PRs always; then whoever the rollout admits.
+  Drafts and other bots' PRs never. `rollout: {}` is every PR.
+- **What it may change.** Lanes that read (the reviewer, the gate's check) run on any PR in
+  scope. Lanes that write (the fixer, a merge) act only on a PR the pipeline *wrote*:
+  opened by `identity.bot_login`, every commit its own. One commit from anyone else and a
+  person merges it.
+- **Merging is a switch on the gate.** `merge="off"` (the default for a new harness)
+  publishes the gate's result as a check and merges nothing. `merge="agent-only"` also
+  merges the PRs the pipeline wrote. There is no setting that merges a person's PR.
+
+Set `identity.bot_login` to the account the pipeline actually posts as (under PAT auth, the
+PAT's owner). It is how the pipeline recognizes its own PRs; if it is wrong, the guard job's
+log says so.
+
+A harness without a `rollout` block is the original factory and compiles as it always has:
+lanes scoped to `repo.branch_prefix` branches, and a gate that merges them.
 
 ## Self-healing & self-improving
 

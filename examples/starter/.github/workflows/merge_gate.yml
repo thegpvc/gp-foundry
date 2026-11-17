@@ -14,31 +14,24 @@ jobs:
   merge_gate:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      checks: read
+      contents: read
+      pull-requests: read
+      checks: write
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          token: ${{ secrets.AGENT_PAT }}
-          fetch-depth: 0
-      - name: Configure git identity
-        shell: bash
-        env:
-          GIT_NAME: Agent Bot
-          GIT_EMAIL: agent-bot@users.noreply.github.com
-        run: |-
-          git config user.name "$GIT_NAME"
-          git config user.email "$GIT_EMAIL"
-      - name: Evaluate merge gate
+          token: ${{ github.token }}
+          persist-credentials: false
+      - name: Evaluate merge gate (publish check, never merge)
         uses: thegpvc/gp-foundry/actions/merge-gate@v0.3.0
         with:
-          token: ${{ secrets.AGENT_PAT }}
+          merge: "off"
+          check-name: gp-foundry/approval (merge_gate)
+          token: ${{ github.token }}
           checks-token: ${{ github.token }}
           policy-path: .github/agents/policy/merge.yaml
           base-branch: main
-          branch-prefix: agent/
           bot-login: agent-bot
+          rollout: "{\"authors\":[]}"
