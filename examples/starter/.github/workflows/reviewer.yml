@@ -71,6 +71,23 @@ jobs:
         run: |-
           mkdir -p .git/info
           echo "/.gp-foundry/" >> .git/info/exclude
+      - name: Use this PR's harness files if the base ref has no harness yet
+        shell: bash
+        env:
+          HARNESS: .gp-foundry/harness
+          SPEC: .github/harness.dot
+          DIRS: |-
+            .github/agent-setup
+            .github/agents
+        run: |-
+          if [ -f "$HARNESS/$SPEC" ]; then exit 0; fi
+          echo "::notice::the base ref has no harness yet ($SPEC) — using this pull request's own harness files. This only happens while the harness itself is being installed."
+          while IFS= read -r D; do
+            [ -n "$D" ] && [ -d "$D" ] || continue
+            mkdir -p "$HARNESS/$(dirname "$D")"
+            rm -rf "${HARNESS:?}/$D"
+            cp -R "$D" "$HARNESS/$D"
+          done <<< "$DIRS"
       - name: Setup agent toolchain
         uses: ./.gp-foundry/harness/.github/agent-setup
       - name: Fetch context

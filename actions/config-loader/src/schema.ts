@@ -133,7 +133,12 @@ export const CONFIG_SCHEMA = {
           "type": "string",
           "description": "Pinned mode: the git ref the runtime actions are referenced at. Omit it and the compiler uses its own release tag (v<version>), so the workflows and the actions they call always come from the same release. Name an exact tag or a commit to hold them elsewhere. Do not use v1: that tag has not moved since 0.1.2."
         },
-        "owner_repo": { "type": "string" }
+        "owner_repo": { "type": "string" },
+        "runs_on": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The runner label every generated job uses. Default ubuntu-latest. A node's runs_on= attribute overrides it for that node's jobs."
+        }
       }
     },
     "personas": {

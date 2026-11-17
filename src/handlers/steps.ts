@@ -131,6 +131,28 @@ export function harnessCheckout(ctx: EmitContext, baseRef: string): { ctx: EmitC
       // this a lane that commits (`git add -A`) would sweep it into the PR.
       run: `mkdir -p .git/info\necho "/${HARNESS_DIR.split("/")[0]}/" >> .git/info/exclude`,
     }),
+    runStep({
+      name: "Use this PR's harness files if the base ref has no harness yet",
+      // First install: the PR that ADDS the harness is the only place its files
+      // exist, so the lane would die at setup on the very PR that introduces it.
+      // Only then — the base ref having no spec at all — are the head's files
+      // used. Once the base has a harness, a PR is never judged by its own copy.
+      env: {
+        HARNESS: HARNESS_DIR,
+        SPEC: spec ? `${spec}/${ctx.specFile ?? "harness.dot"}` : (ctx.specFile ?? "harness.dot"),
+        DIRS: sparse.join("\n"),
+      },
+      run: [
+        `if [ -f "$HARNESS/$SPEC" ]; then exit 0; fi`,
+        `echo "::notice::the base ref has no harness yet ($SPEC) — using this pull request's own harness files. This only happens while the harness itself is being installed."`,
+        `while IFS= read -r D; do`,
+        `  [ -n "$D" ] && [ -d "$D" ] || continue`,
+        `  mkdir -p "$HARNESS/$(dirname "$D")"`,
+        `  rm -rf "\${HARNESS:?}/$D"`,
+        `  cp -R "$D" "$HARNESS/$D"`,
+        `done <<< "$DIRS"`,
+      ].join("\n"),
+    }),
   ];
   const actionRef = vendored ? (n: string) => `./${HARNESS_DIR}/.github/actions/${n}` : ctx.actionRef;
   return {

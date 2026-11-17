@@ -157,7 +157,13 @@ export interface FoundryConfig {
   verdicts?: string[];
   size?: { warn_additions?: number; hard_additions?: number; exclude_globs?: string[] };
   /** How generated workflows reference the runtime-core actions. */
-  runtime?: { mode?: "pinned" | "vendored"; ref?: string; owner_repo?: string };
+  runtime?: {
+    mode?: "pinned" | "vendored";
+    ref?: string;
+    owner_repo?: string;
+    /** The runner label every generated job uses (default "ubuntu-latest"); a node's `runs_on=` overrides it. */
+    runs_on?: string;
+  };
   [k: string]: unknown;
 }
 
@@ -274,6 +280,8 @@ export interface EmitContext {
    * the agent-setup composite then resolve under it instead of the PR head.
    */
   harnessRoot?: string;
+  /** File name of the harness spec inside specDir (default "harness.dot"). */
+  specFile?: string;
   /** The `tools:` front-matter of a node's role, when the compiler could read it. */
   roleTools?: (nodeId: string) => string | undefined;
 }

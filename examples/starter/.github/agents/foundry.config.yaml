@@ -65,6 +65,7 @@ labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resol
 # agents/policy/merge.yaml — the merge-gate reads THAT file at runtime, not this one.
 
 runtime: # how generated workflows reference the runtime-core actions
+  # runs_on: ubuntu-latest # the runner label for every generated job (a node's runs_on= overrides it)
   # vendored — `gp-foundry vendor` copies the actions into .github/actions/ (default;
   #            self-contained, no external dependency, upgrade by re-running vendor).
   # pinned   — reference <owner_repo>/actions/<name>@<ref> centrally. With no `ref:` the

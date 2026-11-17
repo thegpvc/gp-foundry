@@ -1,6 +1,6 @@
 # Hybrid pipeline (0.3.0)
 
-**Date:** 2026-11-16 · **Status:** Built on `release/0.3.0` (steps 1–5); riders pending · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
+**Date:** 2026-11-16 · **Status:** Built on `release/0.3.0`, riders included; awaiting release · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
 
 ## What changed from the earlier plan
 

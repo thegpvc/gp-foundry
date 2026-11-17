@@ -22,6 +22,7 @@ import { emitPostJob, emitPreJob } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
 import { releaseTag } from "../shared/version.js";
+import { runnerOf } from "../handlers/attrs.js";
 
 /** First line of every generated workflow — how a stale one is told from a hand-written one. */
 export const GENERATED_MARKER = "# GENERATED FROM harness.dot — DO NOT EDIT.";
@@ -84,7 +85,7 @@ function immutableGuardWorkflow(cfg: FoundryConfig, specDir: string): Record<str
     permissions: { contents: "read" },
     jobs: {
       "immutable-paths": {
-        "runs-on": "ubuntu-latest",
+        "runs-on": runnerOf(undefined, cfg),
         if: `startsWith(github.event.pull_request.head.ref, '${cfg.repo.branch_prefix}')`,
         "timeout-minutes": 5,
         steps: [
@@ -190,13 +191,15 @@ export function assemble(
     actionRef,
     nodeById: (id: string) => byId.get(id),
     specDir,
+    specFile: (ir.sourcePath ?? "harness.dot").split(/[\\/]/).pop() || "harness.dot",
     roleTools: extra.roleTools,
   });
 
-  const fragmentToJob = (fragment: WorkflowJobFragment, guard?: string): Record<string, unknown> => {
+  // `owner` is the node the job belongs to (a guard or mark job follows its lane).
+  const fragmentToJob = (fragment: WorkflowJobFragment, owner: HarnessNode, guard?: string): Record<string, unknown> => {
     const job: Record<string, unknown> = {};
     if (fragment.displayName) job.name = fragment.displayName;
-    job["runs-on"] = "ubuntu-latest";
+    job["runs-on"] = runnerOf(owner, ir.config);
     const g = fragment.if ?? guard;
     if (g) job.if = g;
     if (fragment.environment) job.environment = fragment.environment;
@@ -241,11 +244,11 @@ export function assemble(
         const leg: HarnessNode = { ...byId.get(legId)!, attrs: legAttrs };
         const legFragment = emitNode(leg, ir, mkCtx(leg));
         // The entry-edge guard gates the LEGS; the fan_in is gated by `needs:` instead.
-        if (legFragment) jobs[legFragment.jobId] = fragmentToJob(legFragment, nw.guard);
+        if (legFragment) jobs[legFragment.jobId] = fragmentToJob(legFragment, leg, nw.guard);
       }
       const prScoped = JSON.stringify(nw.triggers).includes('"pull_request"');
       const fragment = emitFanIn(mkCtx(node), diamond.legIds, prScoped);
-      jobs[fragment.jobId] = fragmentToJob(fragment);
+      jobs[fragment.jobId] = fragmentToJob(fragment, node);
       emitFile(node.id, {
         name: displayName(node),
         on: nw.triggers,
@@ -263,10 +266,10 @@ export function assemble(
     // handler sets that `if:`), so a guard the wiring skips skips the lane too.
     const pre = emitPreJob(mkCtx(node));
     const jobs: Record<string, unknown> = pre
-      ? { [pre.jobId]: fragmentToJob(pre, nw.guard), [fragment.jobId]: fragmentToJob(fragment) }
-      : { [fragment.jobId]: fragmentToJob(fragment, nw.guard) };
+      ? { [pre.jobId]: fragmentToJob(pre, node, nw.guard), [fragment.jobId]: fragmentToJob(fragment, node) }
+      : { [fragment.jobId]: fragmentToJob(fragment, node, nw.guard) };
     const post = emitPostJob(mkCtx(node));
-    if (post) jobs[post.jobId] = fragmentToJob(post);
+    if (post) jobs[post.jobId] = fragmentToJob(post, node);
     emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,
