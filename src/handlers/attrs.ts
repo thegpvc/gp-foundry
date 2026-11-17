@@ -23,7 +23,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "gates", "skip", "select", "authors", "max_attempts", "agent_attempts",
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
-  "title", "harness_ref", "persist_credentials", "repo_guides", "opt_in_label",
+  "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
   "mode", "merge", "check_name", "requires_review", "post", "post_marker",
 ]);
 
@@ -419,6 +419,40 @@ export function hasSkipGuard(node: HarnessNode, cfg: FoundryConfig): boolean {
     node.attrs.schedule === undefined &&
     (skipOf(node).length > 0 || authorsOf(node, cfg) !== undefined)
   );
+}
+
+// ── runs_on= / runtime.runs_on ───────────────────────────────────────────────
+
+export const DEFAULT_RUNNER = "ubuntu-latest";
+
+/** One runner label. Strict: it is written into `runs-on:` as is. */
+const RUNNER = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Throws unless `raw` is a single runner label (`ubuntu-latest`, `blacksmith-4vcpu-ubuntu-2404`). */
+export function parseRunner(raw: unknown, where: string): string {
+  if (typeof raw !== "string" || !RUNNER.test(raw)) {
+    throw new Error(`${where} must be one runner label like "ubuntu-latest", got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
+/**
+ * The runner a node's jobs use: its own `runs_on=`, else `runtime.runs_on`, else
+ * ubuntu-latest. A malformed value is validate()'s to report and falls through.
+ */
+export function runnerOf(node: HarnessNode | undefined, cfg: FoundryConfig): string {
+  for (const [raw, where] of [
+    [node?.attrs.runs_on, "runs_on="],
+    [cfg.runtime?.runs_on, "runtime.runs_on"],
+  ] as const) {
+    if (raw === undefined) continue;
+    try {
+      return parseRunner(raw, where);
+    } catch {
+      // fall through to the next source
+    }
+  }
+  return DEFAULT_RUNNER;
 }
 
 // ── the hybrid harness: rollout scope, reading and writing lanes ─────────────

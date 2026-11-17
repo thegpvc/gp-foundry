@@ -9,6 +9,7 @@ import { AGENT_TYPES } from "../ir/types.js";
 import { resolveAuth } from "../auth/auth.js";
 import { parsePermissionsAttr } from "../handlers/index.js";
 import {
+  parseRunner,
   hasSkipGuard,
   isHybrid,
   isWritingPrLane,
@@ -362,6 +363,14 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     const bad = (code: string, message: string, hint?: string): void => {
       diags.push({ level: "error", code, message, where: { node: n.id, line: n.line }, ...(hint ? { hint } : {}) });
     };
+    if (n.attrs.runs_on !== undefined) {
+      try {
+        parseRunner(n.attrs.runs_on, `runs_on= on '${n.id}'`);
+        if (!emitsJob) bad("node.runs-on-unsupported", `runs_on= on '${n.id}' (type ${n.type}) does not apply — this node emits no job`);
+      } catch (e) {
+        bad("node.bad-runs-on", (e as Error).message, `one runner label, e.g. runs_on="ubuntu-latest"; the default for every job is runtime.runs_on in foundry.config.yaml`);
+      }
+    }
     if (n.attrs.title !== undefined) {
       // Emitted as a workflow `name:`; a `${{` would be evaluated there.
       if (typeof n.attrs.title !== "string" || !n.attrs.title.trim() || n.attrs.title.includes("${{")) {
@@ -837,6 +846,19 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   };
   scanPlaceholders(ir.config, "");
+
+  if (ir.config.runtime?.runs_on !== undefined) {
+    try {
+      parseRunner(ir.config.runtime.runs_on, "runtime.runs_on");
+    } catch (e) {
+      diags.push({
+        level: "error",
+        code: "config.bad-runs-on",
+        message: (e as Error).message,
+        hint: "one runner label; a node's runs_on= overrides it for that lane",
+      });
+    }
+  }
 
   // Pinned to the old floating tag. It still resolves — to 0.1.2 — so nothing
   // fails loudly: the workflows simply run actions months older than they expect.

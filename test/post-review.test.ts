@@ -137,6 +137,7 @@ if [ "$method" != "GET" ]; then
     echo '{"message":"Unprocessable Entity","errors":["Line could not be resolved"]}' >&2
     exit 1
   fi
+  [ -n "\${STUB_NO_URL:-}" ] || echo '{"id":99,"html_url":"https://github.com/o/r/pull/7#pullrequestreview-99"}'
   exit 0
 fi
 file="$FIXTURES/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
@@ -148,6 +149,8 @@ interface Ran {
   status: number;
   stdout: string;
   posts: any[];
+  /** What the step appended to the job summary. */
+  summary: string;
 }
 
 function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: Record<string, string> = {}): Ran {
@@ -161,13 +164,15 @@ function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: R
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
   const out = join(dir, "stdout.txt");
   writeFileSync(out, agentStdout);
+  const summaryFile = join(dir, "summary.md");
+  writeFileSync(summaryFile, "### Agent output\n\n(the agent's text)\n");
   const literal: Record<string, string> = {};
   for (const [k, v] of Object.entries(step.env as Record<string, string>)) if (!String(v).includes("${{")) literal[k] = String(v);
   let status = 0;
   let stdout = "";
   try {
     stdout = execFileSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", step.run], {
-      env: { PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: "o/r", FIXTURES: fx, ...literal, PR: "7", HEAD_SHA: "head1", STDOUT_FILE: out, GH_TOKEN: "t", ...env },
+      env: { PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: "o/r", FIXTURES: fx, ...literal, PR: "7", HEAD_SHA: "head1", STDOUT_FILE: out, GH_TOKEN: "t", GITHUB_STEP_SUMMARY: summaryFile, ...env },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -182,7 +187,7 @@ function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: R
         .filter((s) => s.trim())
         .map((s) => JSON.parse(s))
     : [];
-  return { status, stdout, posts };
+  return { status, stdout, posts, summary: readFileSync(summaryFile, "utf8").replace("### Agent output\n\n(the agent's text)\n", "") };
 }
 
 const fence = (obj: unknown) => "```json\n" + JSON.stringify(obj) + "\n```\n";
@@ -434,5 +439,47 @@ describe("run-agent: output contract and stdout-file", () => {
     expect(action.outputs["stdout-file"].value).toBe("${{ steps.run.outputs.stdout-file }}");
     expect(action.runs.steps.find((s: any) => s.name === "Run agent").id).toBe("run");
     expect(stepRun("Run agent")).toContain('echo "stdout-file=${STDOUT_LOG}"');
+  });
+});
+
+describe("the job summary says what became of the review", () => {
+  const plain = () => stepNamed(job(lane('post="review"'), "reviewer"), "Post the review");
+  const verdictLane = () => stepNamed(job(SWEEP, "approver"), "Post the review");
+
+  it("links to the posted review, under the agent's output", () => {
+    const r = runPost(plain(), fence(REVIEW));
+    expect(r.posts).toHaveLength(1);
+    expect(r.summary.trim()).toBe("**Review posted:** https://github.com/o/r/pull/7#pullrequestreview-99");
+  });
+
+  it("still says it was posted when the response carries no URL", () => {
+    const r = runPost(plain(), fence(REVIEW), [], { STUB_NO_URL: "1" });
+    expect(r.summary).toContain("**Review posted** on head1.");
+  });
+
+  it("links to the review posted by the 422 retry", () => {
+    const r = runPost(plain(), fence(REVIEW), [], { STUB_422_IF_COMMENTS: "1" });
+    expect(r.posts).toHaveLength(2);
+    expect(r.summary).toContain("**Review posted:** https://github.com/o/r/pull/7#pullrequestreview-99");
+  });
+
+  it("says plainly when nothing was posted, and why", () => {
+    expect(runPost(plain(), "").summary).toContain("No review was posted: the agent printed nothing");
+    expect(runPost(plain(), "Just prose, no block.").summary).toContain("No review was posted: the agent's output held no review block");
+    expect(runPost(plain(), fence({ body: 7 })).summary).toContain("No review was posted: the review block was not valid");
+    expect(runPost(verdictLane(), fence({ body: "No verdict here." })).summary).toContain("its last line is not one of the verdict lines");
+  });
+
+  it("says so when this head's review was already posted", () => {
+    const existing = [{ user: { login: BOT }, commit_id: "head1", body: "PR #7 head head1\n\nEarlier.\n\n<!-- gp-foundry:posted:reviewer:head1 -->" }];
+    const r = runPost(plain(), fence(REVIEW), existing);
+    expect(r.posts).toEqual([]);
+    expect(r.summary).toContain("already posted");
+  });
+
+  it("writes nothing when there is no job summary to write to", () => {
+    const r = runPost(plain(), fence(REVIEW), [], { GITHUB_STEP_SUMMARY: "" });
+    expect(r.status).toBe(0);
+    expect(r.posts).toHaveLength(1);
   });
 });
