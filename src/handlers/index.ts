@@ -693,9 +693,14 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   return {
     jobId: node.id,
     name: node.id,
-    permissions: merging
-      ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write" }
-      : { contents: "read", "pull-requests": "read", checks: "write" },
+    // Under App auth the App token does everything the gate does — reads the PRs,
+    // writes the check, merges — so the job's GITHUB_TOKEN is left with the one
+    // thing it is used for: checking out the policy file.
+    permissions: app
+      ? { contents: "read" }
+      : merging
+        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write" }
+        : { contents: "read", "pull-requests": "read", checks: "write" },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
   };

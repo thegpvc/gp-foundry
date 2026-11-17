@@ -75,6 +75,9 @@ describe("under App auth the check is the App's, not github-actions'", () => {
       expect(w["checks-token"], merge).toBe("${{ steps.app-token.outputs.token }}");
       expect(w["check-app"], merge).toBe("${{ steps.app-token.outputs.app-slug }}");
       expect(w.token, merge).toBe("${{ steps.app-token.outputs.token }}");
+      // The App token does all of it, so GITHUB_TOKEN keeps only the checkout:
+      // it can neither write a check nor merge.
+      expect(job.permissions, merge).toEqual({ contents: "read" });
     }
   });
 

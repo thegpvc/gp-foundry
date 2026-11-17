@@ -133,6 +133,15 @@ check is published with `GITHUB_TOKEN`; pass the harness App's slug when
 `checks-token` is that App's token, so a check published by any other workflow
 is never taken for the gate's.
 
+Which app owns the check matters twice over. A `GITHUB_TOKEN` check belongs to
+`github-actions`, so any workflow in the repo can publish one under the same
+name — it cannot safely be a required check — and GitHub files it under whatever
+Actions check suite is already on the commit, so it can show up beneath an
+unrelated workflow's name. A check written with the harness's App token belongs
+to that App alone. Anything that requires it downstream (another gate's
+`required-checks`, a ruleset) should name it pinned to the App:
+`<check name>@<app slug>`.
+
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
 
