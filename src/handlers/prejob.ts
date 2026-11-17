@@ -270,9 +270,15 @@ function emitHybridGuard(ctx: EmitContext): WorkflowJobFragment {
   ];
   unchangedDiffLines(ctx, env, lines);
   lines.push(``, `finish`);
+  // The App token is only for marking the covering review, which only happens for
+  // a PR in scope. Mint it only then: an event the scope check turns away — a
+  // Dependabot PR, whose runs get no access to the repo's secrets — must not fail
+  // here, before the decision step can record why the lane is skipped. (The
+  // decision exits on the scope result before it reads a diff or the token.) An
+  // in-scope PR whose mint fails still fails the job, visibly.
   const app = appTokenStep(ctx, { "pull-requests": "write" });
   const writesWithGithubToken = tokenExpr(ctx) === "${{ github.token }}";
-  if (app) steps.push(app);
+  if (app) steps.push({ ...app, if: "${{ steps.scope.outputs.run == 'true' }}" });
   steps.push(runStep({ id: "decide", name: "Decide whether to run", env, run: lines.join("\n") }));
   return {
     ...base,
