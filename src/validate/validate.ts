@@ -32,6 +32,7 @@ import {
   takesAuthors,
 } from "../handlers/attrs.js";
 import { parseRollout } from "../shared/scope.js";
+import { STALE_DEFAULT_REF, releaseTag } from "../shared/version.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
 import { roleCanUseGh } from "../handlers/steps.js";
@@ -836,6 +837,17 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   };
   scanPlaceholders(ir.config, "");
+
+  // Pinned to the old floating tag. It still resolves — to 0.1.2 — so nothing
+  // fails loudly: the workflows simply run actions months older than they expect.
+  if ((ir.config.runtime?.mode ?? "pinned") === "pinned" && ir.config.runtime?.ref === STALE_DEFAULT_REF) {
+    diags.push({
+      level: "warning",
+      code: "runtime.stale-ref",
+      message: `runtime.ref is '${STALE_DEFAULT_REF}', a tag that has not moved since 0.1.2 — the generated workflows would call actions far older than this compiler (${releaseTag()})`,
+      hint: `delete runtime.ref to pin the actions to this compiler's own release (${releaseTag()}), or name an exact tag or commit`,
+    });
+  }
 
   // Vendored runtime: the generated `uses: ./.github/actions/<n>` refs (and the
   // consumer-owned ./.github/agent-setup shim) must actually exist in the repo.

@@ -129,7 +129,10 @@ export const CONFIG_SCHEMA = {
       "additionalProperties": false,
       "properties": {
         "mode": { "type": "string", "enum": ["pinned", "vendored"] },
-        "ref": { "type": "string" },
+        "ref": {
+          "type": "string",
+          "description": "Pinned mode: the git ref the runtime actions are referenced at. Omit it and the compiler uses its own release tag (v<version>), so the workflows and the actions they call always come from the same release. Name an exact tag or a commit to hold them elsewhere. Do not use v1: that tag has not moved since 0.1.2."
+        },
         "owner_repo": { "type": "string" }
       }
     },

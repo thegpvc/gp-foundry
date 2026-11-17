@@ -21,6 +21,7 @@ import { emitFanIn, emitNode } from "../handlers/index.js";
 import { emitPostJob, emitPreJob } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
+import { releaseTag } from "../shared/version.js";
 
 /** First line of every generated workflow — how a stale one is told from a hand-written one. */
 export const GENERATED_MARKER = "# GENERATED FROM harness.dot — DO NOT EDIT.";
@@ -33,7 +34,10 @@ export function makeActionRef(cfg: FoundryConfig): (name: string) => string {
   const rt = cfg.runtime ?? {};
   if (rt.mode === "vendored") return (n) => `./.github/actions/${n}`;
   const ownerRepo = rt.owner_repo ?? "thegpvc/gp-foundry";
-  const ref = rt.ref ?? "v1";
+  // No ref named: this compiler's own release tag, so the generated workflows and
+  // the actions they call always come from the same version. (It used to be a
+  // floating "v1", which let the two drift apart by months.)
+  const ref = rt.ref ?? releaseTag();
   return (n) => `${ownerRepo}/actions/${n}@${ref}`;
 }
 

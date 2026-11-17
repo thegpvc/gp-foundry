@@ -13,6 +13,7 @@ import yaml from "js-yaml";
 import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
+import { releaseTag } from "../src/shared/version.js";
 import { validate } from "../src/validate/validate.js";
 import type { Diagnostic, FoundryConfig, Harness } from "../src/ir/types.js";
 
@@ -57,7 +58,7 @@ describe("a reading lane in a hybrid harness", () => {
     const w = wf();
     expect(Object.keys(w.jobs)).toEqual(["reviewer_guard", "reviewer"]);
     const scope = w.jobs.reviewer_guard.steps.find((s: any) => s.id === "scope");
-    expect(scope.uses).toBe("thegpvc/gp-foundry/actions/pr-scope@v1");
+    expect(scope.uses).toBe(`thegpvc/gp-foundry/actions/pr-scope@${releaseTag()}`);
     expect(scope.with.number).toBe("${{ github.event.pull_request.number }}");
     expect(scope.with.token).toBe("${{ github.token }}");
     expect(scope.with["bot-login"]).toBe(BOT);
@@ -220,7 +221,7 @@ describe("a sweep in a hybrid harness", () => {
   it("takes its candidates from the shared scope rule, not from a filter of its own", () => {
     const job = select();
     const scope = job.steps.find((s: any) => s.id === "scope");
-    expect(scope.uses).toBe("thegpvc/gp-foundry/actions/pr-scope@v1");
+    expect(scope.uses).toBe(`thegpvc/gp-foundry/actions/pr-scope@${releaseTag()}`);
     expect(scope.with).toMatchObject({ list: "true", "base-branch": "main", "bot-login": BOT });
     expect(JSON.parse(scope.with.rollout)).toEqual({ authors: ["alice", "bob"], optInLabel: "bot:review", skipLabel: "no-agent-review" });
     const step = job.steps.find((s: any) => s.id === "select");

@@ -152,7 +152,9 @@ Each step is its own PR into `release/0.3.0`, and each leaves the branch releasa
    harness opts in; per-node `authors=`, `opt_in_label=` and `skip=` become aliases for the
    rollout block. The sweep's PR listing retries once and exits neutral, not red, when the
    API is unavailable.
-4. **Refs.** Exact tags, the compiler's pinned default, the `doctor` warning.
+4. **Refs.** Exact tags, the compiler's pinned default, and a `validate` warning for a
+   config that names `v1` (`doctor` reports validate's warnings). The release steps,
+   including cutting the tag, are in `docs/RELEASING.md`.
 5. **Compatibility pass.** The regression check above, `init` writing `merge="off"`,
    docs, the starter example.
 

@@ -43,8 +43,8 @@ lessons → team memory that every agent reads before working).
 
 ## Notes on this copy
 
-- **Runtime mode is `pinned`** (`uses: thegpvc/gp-foundry/actions/<n>@v1`) so the example
-  stays small. `gp-foundry init` defaults to **`vendored`**, which copies the runtime
+- **Runtime mode is `pinned`** (`uses: thegpvc/gp-foundry/actions/<n>@v<version>`, the
+  release tag of the gp-foundry that built it) so the example stays small. `gp-foundry init` defaults to **`vendored`**, which copies the runtime
   actions into `.github/actions/` for a self-contained repo. Everything else is the default.
 - To stand your own up: `npm i -g @thegpvc/gp-foundry && gp-foundry init && gp-foundry up`
   (or point any coding agent at `https://unpkg.com/@thegpvc/gp-foundry/AGENTS.md`).
