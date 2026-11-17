@@ -104,6 +104,13 @@ labels:
 # (`blocking_labels` only hold a merge back; these say who decides.)
 # escalation_labels: [needs-human-decision]
 #
+# Policy handoffs (the gate's check only). These clauses mean "a person should look",
+# not "something is broken": while one fails on its own the check is action_required.
+# A formal approval of the head from anyone other than identity.bot_login, with
+# GitHub's own review decision met (required approvals, code owners), signs it off and
+# the check reports whatever else the policy says. The gate never merges on a sign-off.
+# handoff_clauses: [protected-path, too-large]
+#
 # The trusted reviewer's latest verdict on the head being an escalation turns the check
 # `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`
 # line; this key only overrides it.

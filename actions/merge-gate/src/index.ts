@@ -19,6 +19,9 @@ import yaml from "js-yaml";
 import {
   escalationLabel,
   sameLogin,
+  checkVerdict,
+  validateHandoffClauses,
+  parseTimestamp,
   standingChangeRequests,
   visibleBody,
   checkConclusion,
@@ -162,6 +165,61 @@ interface ThreadsQueryResult {
 }
 
 /** Every review thread of a PR. Throws on any failure: the caller fails closed. */
+/** One formal review, as the sign-off rule reads it. */
+export interface SignoffReview {
+  at: string;
+  author?: string | null;
+  state?: string | null;
+  sha?: string | null;
+}
+
+/**
+ * The candidates for signing off a policy handoff on `headSha`: reviewers whose
+ * latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED — a COMMENTED
+ * review changes no one's standing) is an APPROVED review of this exact commit,
+ * from anyone but the harness's identity and the PR's author. Most recent first.
+ * A bot other than the harness counts like a person.
+ */
+export function signoffCandidates(
+  reviews: SignoffReview[],
+  headSha: string,
+  harness: string | undefined,
+  prAuthor: string | undefined,
+): { reviewer: string; at: string }[] {
+  const latest = new Map<string, SignoffReview & { login: string }>();
+  for (const r of reviews) {
+    const state = (r.state ?? "").toUpperCase();
+    if (!r.author || !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(state)) continue;
+    const key = r.author.toLowerCase();
+    const prev = latest.get(key);
+    if (!prev || parseTimestamp(r.at) >= parseTimestamp(prev.at)) latest.set(key, { ...r, state, login: r.author });
+  }
+  return [...latest.values()]
+    .filter((r) => r.state === "APPROVED" && r.sha === headSha && !sameLogin(r.login, harness) && !sameLogin(r.login, prAuthor))
+    .sort((a, b) => parseTimestamp(b.at) - parseTimestamp(a.at))
+    .map((r) => ({ reviewer: r.login, at: r.at }));
+}
+
+const REVIEW_DECISION_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewDecision } }
+}`;
+
+/**
+ * GitHub's own review decision for the PR — the result of branch protection's
+ * required approvals and code owners, which the gate does not re-implement.
+ * `null` when the branch requires no review. Throws when it cannot be read.
+ */
+export async function fetchReviewDecision(octokit: Octokit, owner: string, repo: string, number: number): Promise<string | null> {
+  const r = await octokit.graphql<{ repository: { pullRequest: { reviewDecision: string | null } | null } | null }>(REVIEW_DECISION_QUERY, {
+    owner,
+    repo,
+    number,
+  });
+  const pr = r.repository?.pullRequest;
+  if (!pr) throw new Error(`PR #${number} not found`);
+  return pr.reviewDecision ?? null;
+}
+
 export async function fetchReviewThreads(octokit: Octokit, owner: string, repo: string, number: number): Promise<ReviewThreadFact[]> {
   const threads: ReviewThreadFact[] = [];
   let cursor: string | null = null;
@@ -317,7 +375,32 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     markers,
   );
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict };
+  // A sign-off on a policy handoff. Only when the policy names handoff clauses,
+  // and GitHub's review decision is read only when there is a candidate.
+  let signoff: PullRequestFacts["signoff"];
+  let signoffUnavailable: string | undefined;
+  if (policy.handoffClauses?.length) {
+    const candidates = signoffCandidates(
+      reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, state: r.state, sha: r.commit_id })),
+      pr.head.sha,
+      policy.botLogin,
+      authorLogin,
+    );
+    if (candidates.length) {
+      let decision: string | null | undefined;
+      try {
+        decision = await fetchReviewDecision(octokit, owner, repo, prNumber);
+      } catch (e) {
+        signoffUnavailable = `GitHub's review decision for this PR could not be read (${(e as Error).message}), so ${candidates[0]!.reviewer}'s approval cannot be accepted as a sign-off yet`;
+      }
+      if (decision === null || decision === "APPROVED") signoff = { reviewer: candidates[0]!.reviewer, sha: pr.head.sha };
+      else if (decision !== undefined) {
+        signoffUnavailable = `${candidates[0]!.reviewer} approved this head, but GitHub's review requirements are not met yet (review decision: ${decision})`;
+      }
+    }
+  }
+
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}) };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -475,27 +558,45 @@ function awaitingSummary(alsoFailing: MergeDecision[], facts: PullRequestFacts, 
  * it — so the next tick can tell nothing changed and skip the write. (The
  * ready-to-merge reason carries "approved Nm ago", so success gets fixed text.)
  */
-export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
-  const alsoFailing = policy.noVerdictConclusion === "neutral" ? awaitingApprover(facts, policy) : undefined;
-  const conclusion = checkConclusion(decision, facts, { awaitingApprover: alsoFailing !== undefined });
+export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
+  const verdict = checkVerdict(facts, policy);
+  const { decision, conclusion, outstanding, signedOff } = verdict;
+  const alsoFailing = verdict.alsoFailing;
+  const handoffOnly = conclusion === "action_required" && !facts.escalated;
   const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
-  const title =
-    conclusion === "action_required"
+  const signed = signedOff.length && facts.signoff
+    ? `Policy handoff signed off: ${signedOff.map((d) => `\`${d.code}\``).join(", ")} by @${facts.signoff.reviewer} on \`${facts.signoff.sha.slice(0, 7)}\`.` +
+      (facts.headVerdict ? ` The reviewer's own verdict on this head stands: ${facts.headVerdict}.` : "")
+    : "";
+  const title = handoffOnly
+    ? `A person decides: ${outstanding.map((d) => d.code).join(", ")}`
+    : conclusion === "action_required"
       ? "Escalated: a human decides"
       : conclusion === "success"
-        ? "Ready to merge"
+        ? signed ? `Ready to merge — signed off by @${facts.signoff!.reviewer}` : "Ready to merge"
         : conclusion === "neutral"
           ? "Awaiting the approver"
           : `Not ready: ${decision.code}`;
-  const summary =
-    conclusion === "action_required"
+  const handoffSummary = [
+    ...outstanding.map((d) => `\`${d.code}\` — ${d.reason}.`),
+    "",
+    `This change needs a person. A formal approval of this head from someone other than \`${policy.botLogin ?? "the pipeline"}\`, once GitHub's own review requirements are met, signs it off here.`,
+    ...(facts.signoffUnavailable ? ["", `Not yet: ${facts.signoffUnavailable}.`] : []),
+  ].join("\n");
+  const base =
+    handoffOnly
+      ? handoffSummary
+      : conclusion === "action_required"
       ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}`
       : conclusion === "neutral"
         ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;
+  const summary = [base, signed, !signed && !handoffOnly && facts.signoffUnavailable ? `Policy handoff not signed off: ${facts.signoffUnavailable}.` : ""]
+    .filter(Boolean)
+    .join("\n\n");
 
   const sections: string[] = [];
   const threads = openThreads(facts, policy);
@@ -771,6 +872,8 @@ export async function run(): Promise<void> {
     const dryRun = core.getInput("dry-run") === "true";
 
     const policy = loadPolicy(policyPath);
+    // Fail loudly on a policy handoff that is not one: it would otherwise be ignored.
+    validateHandoffClauses(policy.handoffClauses);
     if (branchPrefixInput) policy.branchPrefix = branchPrefixInput; // input overrides policy file
     // The compiler passes these from foundry.config.yaml / the graph, so a
     // consumer's identity and human-gate wiring don't have to be restated in the

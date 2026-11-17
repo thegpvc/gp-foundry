@@ -145,6 +145,26 @@ to that App alone. Anything that requires it downstream (another gate's
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
 
+## Policy handoffs (`handoffClauses`)
+
+Opt-in, and only for the check (`merge`, or mode evaluate). `handoffClauses:
+[protected-path, too-large]` makes those clauses mean "a person should look":
+
+- While a handoff clause is the only thing failing, the check is `action_required`
+  ("A person decides: protected-path") instead of `failure`.
+- A **sign-off** clears it: a standing formal `APPROVED` review of the exact head
+  commit (that reviewer's latest decisive review — not dismissed, not followed by
+  their own change request) from anyone other than `bot-login`, with GitHub's own
+  review decision `APPROVED`, or empty where the branch requires no review. That
+  decision is how required approvals and code owners are respected. If it cannot be
+  read, the handoff stays outstanding and the check says why.
+- A sign-off clears **only** the handoff clauses. CI, open threads, review requests,
+  change requests and holds still decide the result. An agent `ESCALATE` (a judgment
+  call) and an escalation label (an explicit hold) are never cleared by it.
+- The check names who signed off and on which commit, and keeps the agent's verdict.
+- Merging never reads a sign-off: with `merge: agent-only` a handoff clause still
+  holds the merge, and the gate posts no review of its own.
+
 ## Evaluate mode
 
 `mode: evaluate` never merges, labels or comments. It evaluates the policy for

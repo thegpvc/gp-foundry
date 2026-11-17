@@ -55,6 +55,8 @@ interface World {
   headRef?: string;
   /** Who authored each commit on the head, as GitHub attributes it (default: all the bot's). */
   commits?: (string | null)[];
+  /** GitHub's review decision for the PR; an Error makes the read fail. */
+  reviewDecision?: string | null | Error;
   /** Who opened the PR (default: the harness bot). */
   author?: { login: string; type: string };
   /** When set, the PR's reviews verbatim (overrides `approved`). */
@@ -91,9 +93,14 @@ function makeOctokit(world: World) {
       const { data } = await fn(params);
       return data;
     },
-    graphql: async () => ({
-      repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: world.threads } } },
-    }),
+    graphql: async (query: string) => {
+      if (query.includes("reviewDecision")) {
+        calls.push({ method: "graphql.reviewDecision", params: {} });
+        if (world.reviewDecision instanceof Error) throw world.reviewDecision;
+        return { repository: { pullRequest: { reviewDecision: world.reviewDecision === undefined ? "APPROVED" : world.reviewDecision } } };
+      }
+      return { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: world.threads } } } };
+    },
     rest: {
       pulls: {
         list: rec("pulls.list", [pr]),
@@ -708,3 +715,156 @@ describe("the single gate (merge=)", () => {
     expect(methods()).not.toContain("checks.create");
   });
 });
+
+// A policy handoff: some changes need a person (here, a protected path). The check
+// says so, and recognizes a person's sign-off — without ever merging on it.
+describe("sign-off on a policy handoff (handoff_clauses)", () => {
+  const ALICE = { login: "alice", type: "User" };
+  const HANDOFF = "protected_paths: [src/]\nhandoff_clauses: [protected-path]\n";
+  const at = (n: number) => `2026-01-0${n}T00:00:00Z`;
+  const botVerdict = (word: string, n = 1) => ({ submitted_at: at(n), state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: `ok\n\n**Verdict:** ${word}` });
+  const formal = (login: string, state: string, n: number, sha = HEAD) => ({ submitted_at: at(n), state, commit_id: sha, user: { login }, author_association: "MEMBER", body: "" });
+  const evaluate = async (world: Partial<World>, extra = "") => {
+    setup(world, HANDOFF + extra);
+    delete inputs.mode;
+    inputs.merge = "off";
+    await run();
+    expect(failures).toEqual([]);
+    return stub.calls.find((c) => c.method === "checks.create")?.params;
+  };
+
+  it("an outstanding handoff is action_required and says what would sign it off", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE")] });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.title).toBe("A person decides: protected-path");
+    expect(c.output.summary).toContain("touches protected path `src/`");
+    expect(c.output.summary).toContain(`someone other than \`${BOT}\``);
+  });
+
+  it("a person's formal approval on the head signs it off — after the bot's verdict", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2)] });
+    expect(c.conclusion).toBe("success");
+    expect(c.output.title).toBe("Ready to merge — signed off by @bob");
+    expect(c.output.summary).toContain("Policy handoff signed off: `protected-path` by @bob on `aaaaaaa`.");
+    expect(c.output.summary).toContain("The reviewer's own verdict on this head stands: approve.");
+  });
+
+  it("…and before it", async () => {
+    const c = await evaluate({ reviews: [formal("bob", "APPROVED", 1), botVerdict("APPROVE", 2)] });
+    expect(c.conclusion).toBe("success");
+  });
+
+  it("another bot's formal approval counts like a person's", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("review-app[bot]", "APPROVED", 2)] });
+    expect(c.conclusion).toBe("success");
+    expect(c.output.summary).toContain("by @review-app[bot]");
+  });
+
+  it("the harness's own formal approval does not: it declined to clear its own handoff", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal(BOT, "APPROVED", 2)] });
+    expect(c.conclusion).toBe("action_required");
+  });
+
+  it("a dismissed approval, or one followed by the reviewer's own change request, does not stand", async () => {
+    expect((await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "DISMISSED", 2)] })).conclusion).toBe("action_required");
+    // A change request is itself an independent failure: it governs, and nothing is signed off.
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2), formal("bob", "CHANGES_REQUESTED", 3)] });
+    expect(c.conclusion).toBe("failure");
+    expect(c.output.title).toBe("Not ready: not-approved");
+    expect(c.output.summary).not.toContain("signed off");
+    // A later COMMENTED review is not a decision: the approval still stands.
+    expect((await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2), formal("bob", "COMMENTED", 3)] })).conclusion).toBe("success");
+  });
+
+  it("someone else's later change request holds it through GitHub's review decision", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2), formal("carol", "CHANGES_REQUESTED", 3)], reviewDecision: "CHANGES_REQUESTED" });
+    expect(c.conclusion).toBe("failure");
+    expect(c.output.summary).not.toContain("signed off: `protected-path`");
+    expect(c.output.summary).toContain("Policy handoff not signed off: bob approved this head, but GitHub's review requirements are not met yet (review decision: CHANGES_REQUESTED)");
+  });
+
+  it("an approval of an older head is not a sign-off on this one", async () => {
+    // (The gate's own rule then also finds no approval of this head: the latest one is of another.)
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2, "b".repeat(40))] });
+    expect(c.conclusion).not.toBe("success");
+    expect(c.output.summary).not.toContain("signed off");
+    expect(methods()).not.toContain("graphql.reviewDecision");
+  });
+
+  it("code owners and required counts are GitHub's call: REVIEW_REQUIRED keeps it outstanding", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)], reviewDecision: "REVIEW_REQUIRED" });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).toContain("bob approved this head, but GitHub's review requirements are not met yet (review decision: REVIEW_REQUIRED)");
+  });
+
+  it("a branch with no review requirement (decision null) accepts the approval", async () => {
+    expect((await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)], reviewDecision: null })).conclusion).toBe("success");
+  });
+
+  it("missing eligibility data keeps the handoff outstanding", async () => {
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)], reviewDecision: new Error("502") });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).toContain("GitHub's review decision for this PR could not be read");
+  });
+
+  it("an agent ESCALATE is a judgment call: a sign-off never clears it", async () => {
+    const c = await evaluate({ reviews: [botVerdict("ESCALATE", 1), formal("bob", "APPROVED", 2)] });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.title).toBe("Escalated: a human decides");
+  });
+
+  it("an escalation label is an explicit hold: a sign-off never clears it", async () => {
+    const c = await evaluate({ labels: ["hold"], reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)] }, "escalation_labels: [hold]\n");
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.title).toBe("Escalated: a human decides");
+  });
+
+  it("an independent blocker still governs: a signed-off handoff with an open thread fails on the thread", async () => {
+    const thread = { isResolved: false, path: "src/w.ts", line: 4, originalLine: 4, firstComment: { nodes: [{ reactions: { nodes: [] } }] }, comments: { nodes: [{ author: { login: "carol" }, body: "Leaks." }] } };
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)], threads: [thread] });
+    expect(c.conclusion).toBe("failure");
+    expect(c.output.summary).toContain("open-threads");
+    expect(c.output.summary).toContain("signed off: `protected-path` by @bob");
+  });
+
+  it("…and so does one with the handoff still outstanding: failure, not action_required", async () => {
+    const thread = { isResolved: false, path: "src/w.ts", line: 4, originalLine: 4, firstComment: { nodes: [{ reactions: { nodes: [] } }] }, comments: { nodes: [{ author: { login: "carol" }, body: "Leaks." }] } };
+    const c = await evaluate({ reviews: [botVerdict("APPROVE")], threads: [thread] });
+    expect(c.conclusion).toBe("failure");
+  });
+
+  it("never merges on a sign-off: agent-only still holds the protected path", async () => {
+    setup({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)] }, HANDOFF);
+    delete inputs.mode;
+    inputs.merge = "agent-only";
+    await run();
+    expect(stub.calls.find((c) => c.method === "checks.create")?.params.conclusion).toBe("success");
+    expect(methods()).not.toContain("pulls.merge");
+    expect(methods()).not.toContain("pulls.createReview");
+  });
+
+  it("without handoff_clauses nothing changes: a protected path is a failure, and no decision is read", async () => {
+    setup({ reviews: [botVerdict("APPROVE"), formal("bob", "APPROVED", 2)] }, "protected_paths: [src/]\n");
+    delete inputs.mode;
+    inputs.merge = "off";
+    await run();
+    const c = stub.calls.find((x) => x.method === "checks.create")?.params;
+    expect(c.conclusion).toBe("failure");
+    expect(c.output.title).toBe("Not ready: protected-path");
+    expect(methods()).not.toContain("graphql.reviewDecision");
+  });
+
+  it("the review decision is only read when someone could sign off", async () => {
+    await evaluate({ reviews: [botVerdict("APPROVE")] });
+    expect(methods()).not.toContain("graphql.reviewDecision");
+  });
+
+  it("rejects a clause that cannot be a handoff", async () => {
+    setup({}, "handoff_clauses: [ci-not-passing]\n");
+    delete inputs.mode;
+    inputs.merge = "off";
+    await run();
+    expect(failures.join(" ")).toContain("'ci-not-passing' cannot be a handoff");
+  });
+});
+

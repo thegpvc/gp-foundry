@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   evaluateMergeGate,
+  checkVerdict,
+  validateHandoffClauses,
   escalationLabel,
   standingChangeRequests,
   latestAttemptPerCheck,
@@ -1213,5 +1215,60 @@ describe("standing change requests", () => {
     expect(d.code).toBe("changes-requested");
     expect(d.reason).toContain("`alice`");
     expect(evaluateMergeGate(readyPr({ changesRequestedBy: [] }), { ...policy, requireNoHumanChangesRequested: true }, NOW).action).toBe("merge");
+  });
+});
+
+describe("checkVerdict: policy handoffs", () => {
+  const p: MergePolicy = { ...policy, handoffClauses: ["protected-path", "too-large"] };
+  const touching = (over: Partial<PullRequestFacts> = {}) =>
+    readyPr({ files: [{ path: "db/migrations/1.sql", additions: 3, deletions: 0 }], ...over });
+  const signoff = { reviewer: "bob", sha: "abc1234def" };
+
+  it("without handoff_clauses it is exactly the original rule", () => {
+    const v = checkVerdict(touching(), policy, NOW);
+    expect(v.conclusion).toBe("failure");
+    expect(v.decision.code).toBe("protected-path");
+    expect(v.outstanding).toEqual([]);
+    expect(checkVerdict(readyPr(), policy, NOW).conclusion).toBe("success");
+  });
+
+  it("an outstanding handoff on its own is action_required", () => {
+    const v = checkVerdict(touching(), p, NOW);
+    expect(v.conclusion).toBe("action_required");
+    expect(v.outstanding.map((d) => d.code)).toEqual(["protected-path"]);
+  });
+
+  it("a sign-off clears only the handoff clauses", () => {
+    const v = checkVerdict(touching({ signoff }), p, NOW);
+    expect(v.conclusion).toBe("success");
+    expect(v.signedOff.map((d) => d.code)).toEqual(["protected-path"]);
+    const red = checkVerdict(touching({ signoff, ciStatus: "failing" }), p, NOW);
+    expect(red.conclusion).toBe("failure");
+    expect(red.decision.code).toBe("ci-not-passing");
+  });
+
+  it("covers both handoff clauses at once", () => {
+    const big = touching({ files: [{ path: "db/migrations/1.sql", additions: 5000, deletions: 0 }] });
+    expect(checkVerdict(big, p, NOW).outstanding.map((d) => d.code)).toEqual(["too-large", "protected-path"]);
+    expect(checkVerdict({ ...big, signoff }, p, NOW).conclusion).toBe("success");
+  });
+
+  it("never clears an escalation", () => {
+    expect(checkVerdict(touching({ signoff, escalated: true }), p, NOW).conclusion).toBe("action_required");
+  });
+
+  it("an outstanding handoff with another failure is a failure", () => {
+    expect(checkVerdict(touching({ ciStatus: "failing" }), p, NOW).conclusion).toBe("failure");
+  });
+
+  it("does not change the merge decision", () => {
+    expect(evaluateMergeGate(touching({ signoff }), p, NOW).action).not.toBe("merge");
+  });
+
+  it("validates the clause list", () => {
+    expect(validateHandoffClauses(undefined)).toBeUndefined();
+    expect(validateHandoffClauses(["too-large"])).toEqual(["too-large"]);
+    expect(() => validateHandoffClauses(["not-approved"])).toThrow(/cannot be a handoff/);
+    expect(() => validateHandoffClauses("protected-path")).toThrow(/must be a list/);
   });
 });
