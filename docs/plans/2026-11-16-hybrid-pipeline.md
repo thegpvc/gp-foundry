@@ -1,6 +1,6 @@
 # Hybrid pipeline (0.3.0)
 
-**Date:** 2026-11-16 · **Status:** Design settled; not yet built · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
+**Date:** 2026-11-16 · **Status:** Built on `release/0.3.0` (steps 1–5); riders pending · Supersedes [Native merge, one policy](./2026-11-16-native-merge-and-one-policy.md).
 
 ## What changed from the earlier plan
 
@@ -126,8 +126,10 @@ further 0.2.x releases. Fixes that arrive meanwhile are folded into the branch.
 
 ## Open
 
-1. A regression check for the compatibility rule. Decided: against this repo's own
-   fixtures and the starter example, not against other consumers' harnesses.
+1. ~~A regression check for the compatibility rule.~~ Done against this repo's own
+   fixtures (not other consumers' harnesses, by decision): the 0.2.16 starter example and
+   the `dixie` fixture were each compiled with the published 0.2.16 and with this branch.
+   The only difference in any generated file is the pinned ref, `@v1` → `@v0.3.0`.
 2. The gate's check can still be published by any workflow in the repo. Unchanged from
    0.2.15, and less pressing while a person is the last step on human PRs.
 3. Whether a human may opt a PR in to the fixer. Not built until asked for; if built, the

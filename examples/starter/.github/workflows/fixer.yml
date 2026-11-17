@@ -11,14 +11,41 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  fixer_guard:
+    name: fixer guard
+    runs-on: ubuntu-latest
+    if: (contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES') && github.event.review.user.login == 'agent-bot') && github.event.pull_request.draft == false && github.event.pull_request.user.login == 'agent-bot'
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+      head_sha: ""
+      diff_hash: ""
+      started_at: ""
+    steps:
+      - name: Is this a PR the pipeline wrote?
+        id: scope
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.3.0
+        with:
+          number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          rollout: "{\"authors\":[]}"
+          bot-login: agent-bot
+          branch-prefix: agent/
+          require-agent-written: "true"
   fixer:
     runs-on: ubuntu-latest
-    if: (contains(github.event.review.body, '**Verdict:** REQUEST_CHANGES') && github.event.review.user.login == 'agent-bot') && startsWith(github.event.pull_request.head.ref, 'agent/')
+    if: needs.fixer_guard.outputs.run == 'true'
     permissions:
       contents: write
       pull-requests: write
       checks: read
     timeout-minutes: 35
+    needs:
+      - fixer_guard
     steps:
       - name: Checkout
         uses: actions/checkout@v5

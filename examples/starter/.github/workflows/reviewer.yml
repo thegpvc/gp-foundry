@@ -6,20 +6,47 @@ name: reviewer
     types:
       - opened
       - synchronize
+      - ready_for_review
 concurrency:
   group: reviewer-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 permissions:
   contents: read
 jobs:
+  reviewer_guard:
+    name: reviewer guard
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false && github.event.pull_request.user.login == 'agent-bot'
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+      head_sha: ""
+      diff_hash: ""
+      started_at: ""
+    steps:
+      - name: Is this PR in scope?
+        id: scope
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.3.0
+        with:
+          number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          rollout: "{\"authors\":[]}"
+          bot-login: agent-bot
+          branch-prefix: agent/
   reviewer:
     runs-on: ubuntu-latest
-    if: startsWith(github.event.pull_request.head.ref, 'agent/')
+    if: needs.reviewer_guard.outputs.run == 'true'
     permissions:
       contents: read
       pull-requests: write
       checks: read
     timeout-minutes: 25
+    needs:
+      - reviewer_guard
     steps:
       - name: Checkout
         uses: actions/checkout@v5

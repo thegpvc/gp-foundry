@@ -167,7 +167,7 @@ digraph harness {
   builder     [type=producer,    role="roles/builder.md",   context=issue]
   reviewer      [type=pr-review,   role="roles/reviewer.md",    context="pr-diff", gates="ci.yml"]
   fixer       [type=pr-fix,      role="roles/fixer.md",     max_attempts=3]
-  merge_gate     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *"]
+  merge_gate     [type=merge-gate,  policy="policy/merge.yaml", schedule="*/30 * * * *", merge="off"]
   needs_human [type=exit]
 
   start     -> scout       [on="issues.opened"]

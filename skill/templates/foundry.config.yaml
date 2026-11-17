@@ -21,6 +21,10 @@ auth: # how the harness authenticates to GitHub for writes
   token_secret: AGENT_PAT # gh secret set AGENT_PAT --body <fine-grained-pat>
 
 identity: # git author for the agent's commits/PRs
+  # bot_login MUST be the account the pipeline actually posts as: under `pat` auth the
+  # PAT's owner, under `app` auth `<app-slug>[bot]`. It is how the pipeline recognizes the
+  # PRs it wrote (the only ones the fixer pushes to and the gate may merge) and its own
+  # reviews. If it is wrong, the pipeline ignores its own work.
   bot_login: agent-bot
   git_name: Agent Bot
   git_email: agent-bot@users.noreply.github.com
@@ -35,7 +39,20 @@ agent: # the coding-agent CLI + default model
 repo:
   base_branch: main
   branch_prefix: agent/ # branches look like agent/<issue>-slug (matches policy branch_prefix)
-  # authors: [your-login] # only PRs opened by these logins reach the PR lanes (or authors="…" per node)
+
+# Which pull requests the pipeline looks at. Its OWN (opened by identity.bot_login) are
+# always in scope; this dial is for bringing it to people's PRs gradually. Drafts and
+# other bots' PRs are never in scope.
+#   authors: []            nobody's PRs but the pipeline's own  (the starting point)
+#   authors: [alice, bob]  ...and these people's
+#   opt_in_label: <label>  ...and any PR carrying this label
+#   skip_label: <label>    never a PR carrying this one
+#   rollout: {}            every PR — the end of a rollout. Keep the key: it is what makes
+#                          the reviewer, the fixer and the gate share one scope.
+rollout:
+  authors: []
+  # opt_in_label: agent-review
+  # skip_label: no-agent-review
 
 labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resolve
   # through this map, so renaming a repo label is a one-line change HERE —

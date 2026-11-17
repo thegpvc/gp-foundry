@@ -209,6 +209,8 @@ function emitHybridGuard(ctx: EmitContext): WorkflowJobFragment {
       token: "${{ github.token }}",
       ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
       ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
+      // For a hint only: an agent-named branch turned away usually means bot_login is wrong.
+      ...(ctx.config.repo?.branch_prefix ? { "branch-prefix": ctx.config.repo.branch_prefix } : {}),
       ...(writing ? { "require-agent-written": "true" } : {}),
     },
   });

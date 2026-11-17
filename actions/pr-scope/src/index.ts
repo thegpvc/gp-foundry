@@ -27,7 +27,7 @@ export interface ScopeResult {
 
 export async function decide(
   octokit: Octokit,
-  opts: { owner: string; repo: string; number: number; rollout?: Rollout; botLogin?: string; requireAgentWritten: boolean },
+  opts: { owner: string; repo: string; number: number; rollout?: Rollout; botLogin?: string; requireAgentWritten: boolean; branchPrefix?: string },
 ): Promise<ScopeResult> {
   const { owner, repo, number, botLogin } = opts;
   let pr;
@@ -37,12 +37,24 @@ export async function decide(
     return { inScope: false, run: false, reason: `could not read PR #${number} (${(e as Error).message}) — not running on a PR whose scope is unknown` };
   }
   const author = pr.user?.login;
+  // The commonest way for a new harness to do nothing at all: identity.bot_login
+  // names one account and the pipeline posts as another (under PAT auth it posts
+  // as the PAT's owner). Its own PRs then look like a stranger's. Say so, on the
+  // one signal available — an agent-named branch opened by someone else.
+  const looksLikeAgentPr =
+    !!opts.branchPrefix && !!pr.head?.ref?.startsWith(opts.branchPrefix) && !!author && !sameLogin(author, botLogin);
+  const hint = looksLikeAgentPr
+    ? ` — note: its branch '${pr.head.ref}' has the agent prefix but ${author} opened it; if the pipeline did, identity.bot_login should be '${author}', not '${botLogin ?? "(unset)"}'`
+    : "";
   const scope = inScope(
     { authorLogin: author, authorType: pr.user?.type, draft: pr.draft, labels: pr.labels.map((l) => l.name ?? "").filter(Boolean) },
     opts.rollout,
     botLogin,
   );
-  if (!scope.inScope) return { inScope: false, run: false, reason: scope.detail };
+  if (!scope.inScope) {
+    const explain = scope.reason === "not-in-rollout" || scope.reason === "other-bot" ? hint : "";
+    return { inScope: false, run: false, reason: scope.detail + explain };
+  }
   if (!opts.requireAgentWritten) return { inScope: true, run: true, reason: scope.detail };
 
   // Commits are only worth reading for a PR the bot opened; anything else is
@@ -62,7 +74,7 @@ export async function decide(
     inScope: true,
     agentWritten: writer.agentWritten,
     run: writer.agentWritten,
-    reason: writer.agentWritten ? writer.detail : `this lane only acts on PRs the pipeline wrote: ${writer.detail}`,
+    reason: writer.agentWritten ? writer.detail : `this lane only acts on PRs the pipeline wrote: ${writer.detail}${hint}`,
   };
 }
 
@@ -178,6 +190,7 @@ export async function run(): Promise<void> {
       rollout,
       botLogin: core.getInput("bot-login").trim() || undefined,
       requireAgentWritten: core.getInput("require-agent-written").trim() === "true",
+      branchPrefix: core.getInput("branch-prefix").trim() || undefined,
     });
     core.setOutput("in-scope", String(result.inScope));
     core.setOutput("agent-written", result.agentWritten === undefined ? "" : String(result.agentWritten));

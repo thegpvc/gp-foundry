@@ -4,9 +4,11 @@
 // `when=` GitHub-observable guard. Compile with `gp-foundry build`. NEVER hand-edit the
 // generated .github/workflows/*.yml — edit this graph and rebuild.
 //
-// This default graph is a complete "dark factory": issues in → reviewed, auto-merged PRs
-// out, with self-healing (janitor + supervisor) and self-improving (retro) lanes. Every
-// cycle MUST keep a bounded escape edge to an `exit` node.
+// This default graph is a complete "dark factory": issues in → reviewed PRs out, with
+// self-healing (janitor + supervisor) and self-improving (retro) lanes. It starts with
+// merging OFF: the gate publishes its verdict as a check on each PR and a person merges.
+// Set merge="agent-only" on the gate when you want the PRs the pipeline wrote merged for
+// you. Every cycle MUST keep a bounded escape edge to an `exit` node.
 
 digraph harness {
   // ── nodes ─────────────────────────────────────────────────────────────────
@@ -28,8 +30,10 @@ digraph harness {
   // bounded fix loop with the reviewer
   fixer       [type=pr-fix,      role="agents/roles/fixer.md",   max_attempts=3]
 
-  // approval: automated merge policy (swap for a human-gate if approval must be human)
-  merge_gate  [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *"]
+  // the gate: judges every PR in scope against the merge policy and publishes the result
+  // as a check. merge="off" never merges; merge="agent-only" also merges the PRs the
+  // pipeline wrote (opened by the bot, every commit its own). A person's PR is never merged.
+  merge_gate  [type=merge-gate,  policy="agents/policy/merge.yaml", schedule="*/30 * * * *", merge="off"]
 
   // self-healing: rebase conflicted PRs; re-drive stranded issues/PRs
   janitor     [type=scheduled-agent, role="agents/roles/janitor.md",    schedule="*/30 * * * *"]

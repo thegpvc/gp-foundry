@@ -37,6 +37,13 @@ inputs:
     description: "The harness bot's login: the author of the PRs the pipeline writes."
     required: false
     default: ""
+  branch-prefix:
+    description: >-
+      The harness's agent-branch prefix. Used only for a hint: a PR on such a
+      branch that is turned away because bot-login did not open it usually means
+      bot-login is not the account the pipeline actually posts as.
+    required: false
+    default: ""
   require-agent-written:
     description: >-
       "true" for a lane that WRITES to the pull request (pushes commits, merges):
