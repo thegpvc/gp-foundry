@@ -36,6 +36,8 @@ interface FakePr {
   ci?: "success" | "in_progress";
   /** pulls.get throws this many more times. */
   failReads?: number;
+  /** More check runs on the current head (other workflows' jobs, the gate's own job). */
+  extra?: { name: string; status: string; conclusion: string | null; details_url?: string; app?: string }[];
 }
 
 /** A fake GitHub: PRs, CI and the gate's own check runs, kept between ticks. */
@@ -45,6 +47,9 @@ class World {
   merged: { pr: number; sha: string }[] = [];
   calls: Record<string, number> = {};
   failSearch = false;
+  /** The search honours `-label:"…"` (real GitHub does); off, only the gate's own scope test filters. */
+  honourLabelExclusion = true;
+  queries: string[] = [];
   clock = Date.parse("2026-11-17T00:00:00Z");
   /** Fake time each full evaluation takes (charged when the PR is read). */
   evalMs = 2000;
@@ -100,8 +105,12 @@ class World {
           w.count("graphql.search");
           if (w.failSearch) throw new Error("secondary rate limit");
           const q: string = vars.q;
+          w.queries.push(q);
           const open = [...w.prs.values()].filter((p) => (p.state ?? "open") === "open");
-          const hits = q.includes("reviewed-by:") ? open.filter((p) => p.reviewed) : q.includes("author:app/dependabot") ? open.filter((p) => p.user === "dependabot[bot]") : open;
+          const excluded = w.honourLabelExclusion ? [...q.matchAll(/-label:"([^"]+)"/g)].map((m) => m[1]!) : [];
+          const hits = (q.includes("reviewed-by:") ? open.filter((p) => p.reviewed) : q.includes("author:app/dependabot") ? open.filter((p) => p.user === "dependabot[bot]") : open).filter(
+            (p) => !p.labels.some((l) => excluded.includes(l)),
+          );
           const start = vars.cursor ? Number(vars.cursor) : 0;
           const page = hits.slice(start, start + 100);
           return {
@@ -167,7 +176,8 @@ class World {
             const gate = w.checks
               .filter((c) => c.sha === ref)
               .map((c) => ({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, app: { slug: c.app }, output: c.output }));
-            const all = [ci, ...gate];
+            const extra = (pr?.extra ?? []).map((c, i) => ({ id: 1000 + i, ...c, app: { slug: c.app ?? "github-actions" }, output: {} }));
+            const all = [ci, ...extra, ...gate];
             return { check_runs: check_name ? all.filter((c) => c.name === check_name) : all };
           }),
           create: call("checks.create", ({ head_sha, name, status, conclusion, output }: any) => {
@@ -188,6 +198,10 @@ class World {
   }
 }
 
+/** The gate's own run, as the action reads it from the runner and the compiler. */
+const SELF = { runId: "7001", jobCheckName: "gate" };
+const runUrl = (id: string | number) => `https://github.com/o/r/actions/runs/${id}/job/${Number(id) + 1}`;
+
 const POLICY = {
   botLogin: BOT,
   approvalBodyRegex: "(?:^|\\n)[ \\t]*\\*\\*Verdict:\\*\\* APPROVE[ \\t]*$",
@@ -196,7 +210,10 @@ const POLICY = {
 };
 
 let run = 0;
-function tick(w: World, opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number } = {}) {
+function tick(
+  w: World,
+  opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rollout?: { skipLabel?: string; authors?: string[] }; self?: { runId?: string; jobCheckName?: string } } = {},
+) {
   const o = w.octokit();
   const before = w.total();
   return runHybridGate({
@@ -209,10 +226,11 @@ function tick(w: World, opts: { prNumber?: number; budgetSeconds?: number; merge
     checkApp: APP,
     baseBranch: "main",
     merge: opts.merge ?? "off",
-    rollout: undefined,
+    rollout: opts.rollout,
     prNumber: opts.prNumber,
     dryRun: false,
     timeBudgetSeconds: opts.budgetSeconds,
+    self: opts.self ?? SELF,
     rotation: opts.rotation ?? run++,
     now: () => w.clock,
   }).then((r) => ({ ...r, calls: w.total() - before }));
@@ -330,7 +348,8 @@ describe("the scheduled pass", () => {
     // The approver posts its verdict: the event runs the gate for that PR alone.
     const t = await tick(w, { prNumber: 801 });
     expect(t.calls).toBeLessThanOrEqual(8);
-    expect(current(w, 801, "failure")).toBe(true); // CI still running
+    // CI still running: an event run publishes nothing rather than a failure.
+    expect(w.result(801)).toBeUndefined();
     // CI finishes — no event. The pass reaches it within ⌈84 ÷ 20⌉ ticks.
     w.prs.get(801)!.ci = "success";
     let ticks = 0;
@@ -397,3 +416,209 @@ describe("API calls", () => {
   });
 });
 
+
+describe("the gate's own run is not CI", () => {
+  // On a pull_request or pull_request_review event the gate's own job is a check
+  // run on the PR's head, in progress while the gate reads that head.
+  const ownJob = { name: "gate", status: "in_progress", conclusion: null, details_url: runUrl(SELF.runId) };
+
+  it("an event run whose own job is in progress publishes success on a ready head", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [ownJob] });
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("this run is recognised by its run id alone, whatever its job is called", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ ...ownJob, name: "Fletch gate" }] });
+    await tick(w, { prNumber: 1, self: { runId: SELF.runId } });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it.each(["cancelled", "timed_out", "failure"])("an earlier run of the gate that ended %s never counts as failing CI", async (conclusion) => {
+    for (const prNumber of [1, undefined]) {
+      const w = new World();
+      w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion, details_url: runUrl(6999) }, ownJob] });
+      await tick(w, { prNumber });
+      expect(current(w, 1, "success"), `pr-number ${prNumber}`).toBe(true);
+    }
+  });
+
+  it("an earlier run of the gate still in progress does not count either", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "in_progress", conclusion: null, details_url: runUrl(6999) }] });
+    await tick(w); // the scheduled pass: its own job is on the default branch, not here
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("an unrelated check still in progress is still pending CI", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [ownJob, { name: "rerun", status: "in_progress", conclusion: null, details_url: runUrl(8123) }] });
+    await tick(w);
+    expect(current(w, 1, "failure")).toBe(true);
+    expect(w.result(1)!.output.text).toContain("`rerun`: in_progress");
+    expect(w.result(1)!.output.text).not.toContain("`gate`");
+  });
+
+  it("a job of another run whose id merely starts with this run's is not this run", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "build", status: "completed", conclusion: "failure", details_url: runUrl(`${SELF.runId}1`) }] });
+    await tick(w);
+    expect(current(w, 1, "failure")).toBe(true);
+  });
+
+  it("a check named like the gate's job from another app still counts", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion: "failure", app: "some-ci", details_url: runUrl(SELF.runId) }] });
+    await tick(w);
+    expect(current(w, 1, "failure")).toBe(true);
+  });
+
+  it("the scheduled pass is unaffected: a ready head is success, failed CI is failure", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    w.add({ number: 2, reviewed: true, verdict: "APPROVE", extra: [{ name: "test", status: "completed", conclusion: "failure" }] });
+    await tick(w);
+    expect(current(w, 1, "success")).toBe(true);
+    expect(current(w, 2, "failure")).toBe(true);
+  });
+});
+
+describe("an event run while other workflows are still starting on the head", () => {
+  // A review or label starts other workflows too (Trajectory's Promotion Approval
+  // Rerun runs on pull_request_review), so at the moment of a verdict their jobs
+  // are queued on the head.
+  const starting = { name: "rerun", status: "queued", conclusion: null, details_url: runUrl(8123) };
+
+  it("publishes nothing when pending CI is all that stands between the head and success", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [starting] });
+    await tick(w, { prNumber: 1 });
+    expect(w.result(1)).toBeUndefined();
+  });
+
+  it("leaves the head's existing result as it is — no success → formal approval → failure loop", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    await tick(w); // the scheduled pass: success
+    expect(current(w, 1, "success")).toBe(true);
+    // A person's formal approval is a review event: it starts this run and other workflows.
+    w.prs.get(1)!.extra = [starting, { name: "gate", status: "in_progress", conclusion: null, details_url: runUrl(SELF.runId) }];
+    const before = w.checks.map((c) => ({ ...c }));
+    await tick(w, { prNumber: 1 });
+    expect(w.checks).toEqual(before);
+    // The pass settles it once they finish.
+    w.prs.get(1)!.extra = [{ ...starting, status: "completed", conclusion: "success" }];
+    await tick(w);
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("still publishes failure for failed CI, and for another failing clause while CI is pending", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ ...starting, status: "completed", conclusion: "failure" }] });
+    w.add({ number: 2, reviewed: true, verdict: "APPROVE", labels: ["hold"], extra: [starting] });
+    w.add({ number: 3, reviewed: true, verdict: "REQUEST_CHANGES", extra: [starting] });
+    for (const n of [1, 2, 3]) await tick(w, { prNumber: n });
+    expect(current(w, 1, "failure")).toBe(true);
+    expect(current(w, 2, "failure")).toBe(true);
+    expect(current(w, 3, "failure")).toBe(true);
+  });
+
+  it("the scheduled pass still reports pending CI as failure", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [starting] });
+    await tick(w);
+    expect(current(w, 1, "failure")).toBe(true);
+  });
+});
+
+describe("a leftover 0.3 neutral result", () => {
+  it("is not superseded by an in-progress run on a head with no verdict", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true }); // no verdict
+    w.checks.push({ id: 0, sha: w.headSha(1), name: CHECK, app: APP, status: "completed", conclusion: "neutral", output: { title: "Awaiting the approver", summary: "awaiting the approver" } });
+    const before = w.checks.map((c) => ({ ...c }));
+    await tick(w, { prNumber: 1 });
+    await tick(w);
+    expect(w.checks).toEqual(before);
+    expect(w.checks.some((c) => c.status === "in_progress")).toBe(false);
+    // A verdict then replaces it like any result.
+    w.prs.get(1)!.verdict = "APPROVE";
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it.each(["success", "failure", "action_required"])("a %s result whose verdict is gone is still withdrawn", async (conclusion) => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    w.checks.push({ id: 0, sha: w.headSha(1), name: CHECK, app: APP, status: "completed", conclusion, output: { title: "t", summary: "s" } });
+    await tick(w, { prNumber: 1 });
+    expect(w.result(1)!.status).toBe("in_progress");
+  });
+});
+
+describe("the window holds only PRs in scope", () => {
+  const SKIP = "fletch:skip";
+  /** `total` reviewed PRs, the first `skipped` of them carrying the skip label. */
+  const repo = (total: number, skipped: number) => {
+    const w = new World();
+    for (let n = 1; n <= total; n++) w.add({ number: n, user: `dev${n % 7}`, reviewed: true, verdict: "APPROVE", labels: n <= skipped ? [SKIP] : [] });
+    return w;
+  };
+  const seenIn = async (w: World, rotation: number) => {
+    const seen: number[] = [];
+    const o = w.octokit();
+    const get = o.rest.pulls.get;
+    o.rest.pulls.get = async (p: any) => {
+      seen.push(p.pull_number);
+      return get(p);
+    };
+    const r = await runHybridGate({
+      octokit: o, checksOctokit: o, owner: "o", repo: "r", policy: { ...POLICY }, checkName: CHECK, checkApp: APP, baseBranch: "main", merge: "off", rollout: { skipLabel: SKIP }, dryRun: false, rotation,
+    });
+    return { seen, evaluated: r.evaluated };
+  };
+
+  it("the search itself leaves out the skip label", async () => {
+    const w = repo(10, 3);
+    await tick(w, { rollout: { skipLabel: SKIP } });
+    expect(w.queries).toEqual([`repo:o/r is:pr is:open base:main reviewed-by:${BOT} -label:"${SKIP}"`]);
+  });
+
+  it("100 candidates, 90 skipped: one tick evaluates all 10 in scope, even when the search returns the skipped ones", async () => {
+    const w = repo(100, 90);
+    w.honourLabelExclusion = false;
+    for (const rotation of [0, 1, 7]) {
+      const { seen, evaluated } = await seenIn(w, rotation);
+      expect(evaluated).toBe(10);
+      expect(seen.sort((a, b) => a - b)).toEqual([91, 92, 93, 94, 95, 96, 97, 98, 99, 100]);
+    }
+  });
+
+  it("a tick evaluates up to 20 in scope, and covers every in-scope PR within ⌈n ÷ 20⌉ ticks", async () => {
+    const w = repo(200, 150); // 50 in scope
+    w.honourLabelExclusion = false;
+    const all = new Set<number>();
+    const ticks = Math.ceil(50 / GATE_TICK_LIMIT);
+    for (let t = 0; t < ticks; t++) {
+      const { seen, evaluated } = await seenIn(w, 40 + t);
+      expect(evaluated).toBe(GATE_TICK_LIMIT);
+      expect(seen.every((n) => n > 150)).toBe(true);
+      seen.forEach((n) => all.add(n));
+    }
+    expect(all.size).toBe(50);
+  });
+
+  it("dependabot's lane is searched without the exclusion: the skip label does not stop that lane", async () => {
+    const w = new World();
+    w.add({ number: 1, user: "dependabot[bot]", labels: [SKIP] });
+    const o = w.octokit();
+    const r = await runHybridGate({
+      octokit: o, checksOctokit: o, owner: "o", repo: "r", checkName: CHECK, checkApp: APP, baseBranch: "main", merge: "off", rollout: { skipLabel: SKIP }, dryRun: false,
+      policy: { ...POLICY, dependabot: { autoMerge: ["patch"] } } as any,
+    });
+    expect(w.queries[1]).toBe("repo:o/r is:pr is:open base:main author:app/dependabot");
+    expect(r.evaluated).toBe(1);
+  });
+});

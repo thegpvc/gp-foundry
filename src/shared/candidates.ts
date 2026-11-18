@@ -79,6 +79,16 @@ export function reviewedByQualifier(botLogin: string): string {
 }
 
 /**
+ * A search qualifier that leaves out PRs carrying `label` — none when there is
+ * no label, or one search syntax cannot quote. Narrows only: callers still
+ * apply the scope rule to every result.
+ */
+export function excludeLabelQualifier(label: string | undefined): string[] {
+  if (!label || /["\\\r\n]/.test(label)) return [];
+  return [`-label:"${label}"`];
+}
+
+/**
  * Open PRs into `base` that match `qualifier` (one search per qualifier,
  * results merged). Throws when a search fails, or when one would be truncated
  * by GitHub's 1,000-result cap: an incomplete candidate list is reported, not

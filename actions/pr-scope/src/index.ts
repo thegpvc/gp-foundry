@@ -14,7 +14,7 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { inScope, isAgentWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
-import { reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
+import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
@@ -118,7 +118,13 @@ export async function listInScope(
   // Only PRs the bot has reviewed: one search, retried once.
   if (opts.reviewedBy) {
     const search = () =>
-      searchCandidates((q, v) => octokit.graphql(q, v), { owner, repo, base: opts.baseBranch, qualifiers: [reviewedByQualifier(opts.reviewedBy!)] });
+      searchCandidates((q, v) => octokit.graphql(q, v), {
+        owner,
+        repo,
+        base: opts.baseBranch,
+        // The skip label is left out by the search too; `keep` still decides scope.
+        qualifiers: [[reviewedByQualifier(opts.reviewedBy!), ...excludeLabelQualifier(opts.rollout?.skipLabel)].join(" ")],
+      });
     let found: Candidate[];
     try {
       found = await search();
@@ -132,6 +138,7 @@ export async function listInScope(
         return undefined;
       }
     }
+    // Scope first, then the round-robin: an author's out-of-scope PRs take no place in it.
     return roundRobinByAuthor(found.filter(keep)).map(toScoped);
   }
   const list = () =>

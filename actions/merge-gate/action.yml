@@ -110,6 +110,17 @@ inputs:
       can publish one this gate — or a ruleset pinned to the App — accepts.
     required: false
     default: ""
+  job-check-name:
+    description: >
+      The check-run name GitHub Actions gives the gate's own job (its `name:`,
+      else its job id); the compiler writes it. The gate's job sits on the PR's
+      head during an event run, so the CI rollup leaves out every check run of
+      this name written by github-actions — earlier runs of the gate, in
+      progress, cancelled or timed out — as well as every job of the current
+      workflow run (GITHUB_RUN_ID). A CI job of the same name in another
+      workflow is left out too: keep the gate's job name distinct.
+    required: false
+    default: ""
   rotation-period-seconds:
     description: >
       With `merge` and no `pr-number`: the schedule's period. The pass's window
