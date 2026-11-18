@@ -8,6 +8,7 @@
 import type { EmitContext, StepSpec } from "../ir/types.js";
 import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
+import { LABEL_EVENTS_JQ } from "../shared/rereview.js";
 
 const SCRIPT = `set -euo pipefail
 # post="review": the agent printed its review; this step posts it with the lane's
@@ -103,16 +104,21 @@ MARKER="\${MARKER//<sha>/$HEAD_SHA}"
 POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
 SINCE=""
 if [ -n "\${REREVIEW_LABEL:-}" ]; then
-  if ! SINCE=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '
-      .[] | select(.event == "labeled" and .label.name == env.REREVIEW_LABEL) | .created_at' | sort | tail -n 1); then
-    echo "::error::could not read the PR's label history — not posting, so a re-run cannot post the review twice"
-    exit 1
+  # The request time: the label's last "labeled" event, if that is its latest
+  # event (removed by hand, there is no request). See src/shared/rereview.ts.
+  if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '__LABEL_EVENTS_JQ__' | sort | tail -n 1); then
+    case "$LAST_EVENT" in *" labeled") SINCE="\${LAST_EVENT%% *}" ;; esac
+  else
+    # Unknown: post. On a first run nothing is lost either way; on a re-run of a
+    # re-review the worst case is the review posted twice, not a request dropped.
+    echo "::warning::could not read the PR's label history — posting without the re-review check"
+    SINCE="9999"
   fi
 fi
 export MARKER POSTED SINCE
 if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100" --paginate --jq '
   [.[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)
-   | select(env.SINCE == "" or (.submitted_at // "") >= env.SINCE)
+   | select(env.SINCE == "" or (.submitted_at // "") > env.SINCE)
    | (.body // "") as $b
    | select(($b | contains(env.POSTED))
        or ((($b | contains(env.POSTED_PREFIX)) | not)
@@ -240,7 +246,7 @@ export function postReviewStep(
       VERDICT_LINES: verdictLinesOf(ctx.config),
       ...(rereviewLabelOf(ctx.config) ? { REREVIEW_LABEL: rereviewLabelOf(ctx.config)! } : {}),
     },
-    run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ),
+    run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ).replaceAll("__LABEL_EVENTS_JQ__", () => LABEL_EVENTS_JQ),
   });
 }
 

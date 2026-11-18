@@ -15,7 +15,7 @@ import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
 import { evalGuard } from "../src/sim/gh-expr.js";
-import { lastLabeledAt, isFresh } from "../src/shared/rereview.js";
+import { requestedAt, isFresh } from "../src/shared/rereview.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
 const BOT = "agent-bot[bot]";
@@ -40,21 +40,25 @@ const DOT = `digraph t {
   start    -> reviewer [on="pull_request.opened, pull_request.synchronize"]
 }`;
 
-describe("lastLabeledAt / isFresh", () => {
-  it("is the LAST time that label was added", () => {
-    const at = lastLabeledAt(
-      [
-        { event: "labeled", label: { name: "re-review" }, created_at: "2026-01-01T00:00:00Z" },
-        { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-01-02T00:00:00Z" },
-        { event: "labeled", label: { name: "re-review" }, created_at: "2026-01-03T00:00:00Z" },
-        { event: "labeled", label: { name: "other" }, created_at: "2026-01-04T00:00:00Z" },
-      ],
-      "re-review",
-    );
-    expect(at).toBe("2026-01-03T00:00:00Z");
-    expect(lastLabeledAt([], "re-review")).toBeUndefined();
+describe("requestedAt / isFresh: the one rule", () => {
+  const ev = (event: string, name: string, at: string) => ({ event, label: { name }, created_at: at });
+  it("is the label's LAST labeled event, while that is still its latest event", () => {
+    const events = [
+      ev("labeled", "re-review", "2026-01-01T00:00:00Z"),
+      ev("unlabeled", "re-review", "2026-01-02T00:00:00Z"),
+      ev("labeled", "re-review", "2026-01-03T00:00:00Z"),
+      ev("labeled", "other", "2026-01-04T00:00:00Z"),
+    ];
+    expect(requestedAt(events, "re-review")).toBe("2026-01-03T00:00:00Z");
+    // Removed by hand afterwards: no request.
+    expect(requestedAt([...events, ev("unlabeled", "re-review", "2026-01-05T00:00:00Z")], "re-review")).toBeUndefined();
+    expect(requestedAt([], "re-review")).toBeUndefined();
+  });
+  it("fresh is strictly after, at GitHub's second precision", () => {
+    const at = "2026-01-03T00:00:00Z";
     expect(isFresh("2026-01-03T00:00:01Z", at)).toBe(true);
-    expect(isFresh("2026-01-02T00:00:00Z", at)).toBe(false);
+    expect(isFresh(at, at)).toBe(false); // the label's own second is not fresh
+    expect(isFresh("2026-01-02T23:59:59Z", at)).toBe(false);
     expect(isFresh("anything", undefined)).toBe(true);
   });
 });
@@ -79,29 +83,14 @@ describe("the reviewer starts on the re-review label", () => {
     expect(g).toContain("reviewer-noop-{0}");
   });
 
-  it("the label's own event is never skipped as an unchanged diff", () => {
+  it("the label's own run is never skipped as an unchanged diff, and still stamps its review", () => {
+    // Only a push is ever skipped as unchanged; a labeled run goes through the
+    // whole decision, so it hashes the diff and its fresh review gets the stamp a
+    // later rebase's also-head marker needs (no early exit before that).
     const decide = wf().jobs.reviewer_guard.steps.find((s: any) => s.id === "decide");
-    const dir = mkdtempSync(join(tmpdir(), "gpf-rr-guard-"));
-    const out = join(dir, "out");
-    writeFileSync(out, "");
-    const run = (action: string, label: string) => {
-      writeFileSync(out, "");
-      try {
-        execFileSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", decide.run], {
-          // No gh on PATH: reaching the unchanged-diff test would fail to read the PR.
-          env: { PATH: "/usr/bin:/bin", GITHUB_OUTPUT: out, GITHUB_REPOSITORY: "o/r", PR: "7", NODE: "reviewer", SCOPE_RUN: "true", REREVIEW_LABEL: "re-review", EVENT_ACTION: action, EVENT_LABEL: label },
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-      } catch {
-        // fall through
-      }
-      return readFileSync(out, "utf8");
-    };
-    const r = run("labeled", "re-review");
-    expect(r).toContain("run=true");
-    expect(r).toContain("head_sha=\n");
-    expect(decide.env.EVENT_LABEL).toBe("${{ github.event.label.name }}");
+    expect(decide.env.EVENT_ACTION).toBe("${{ github.event.action }}");
+    expect(decide.run).toContain('[ "$EVENT_ACTION" = "synchronize" ]');
+    expect(decide.run).not.toContain("REREVIEW_LABEL");
   });
 
   it("is off without labels.re_review", () => {

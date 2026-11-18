@@ -41,6 +41,10 @@ interface FakePr {
   draft?: boolean;
   /** When the re-review label was added, if it is on the PR. */
   rereviewAt?: string;
+  /** The label history read fails. */
+  eventsFail?: boolean;
+  /** The label is on, but its history has no labeled event for it. */
+  undated?: boolean;
   /** When the verdict was posted (default before any re-review request). */
   verdictAt?: string;
 }
@@ -51,6 +55,8 @@ class World {
   checks: { id: number; sha: string; name: string; app: string; status: string; conclusion: string | null; output: { title: string; summary: string; text?: string } }[] = [];
   merged: { pr: number; sha: string }[] = [];
   calls: Record<string, number> = {};
+  /** Every call, in order. */
+  order: string[] = [];
   failSearch = false;
   /** The search honours `-label:"…"` (real GitHub does); off, only the gate's own scope test filters. */
   honourLabelExclusion = true;
@@ -76,6 +82,7 @@ class World {
   }
   private count(k: string) {
     this.calls[k] = (this.calls[k] ?? 0) + 1;
+    this.order.push(k);
   }
   private prJson(p: FakePr) {
     return {
@@ -169,7 +176,8 @@ class World {
         issues: {
           listEvents: call("issues.listEvents", ({ issue_number }: any) => {
             const p = w.prs.get(issue_number)!;
-            return p.rereviewAt ? [{ event: "labeled", label: { name: "re-review" }, created_at: p.rereviewAt }] : [];
+            if (p.eventsFail) throw new Error("HTTP 502");
+            return p.rereviewAt && !p.undated ? [{ event: "labeled", label: { name: "re-review" }, created_at: p.rereviewAt }] : [];
           }),
           listComments: call("issues.listComments", () => []),
           addLabels: call("issues.addLabels", () => ({})),
@@ -549,15 +557,13 @@ describe("an event run while other workflows are still starting on the head", ()
 });
 
 describe("a leftover 0.3 neutral result", () => {
-  it("is not superseded by an in-progress run on a head with no verdict", async () => {
+  it("is withdrawn on a head with no verdict — a neutral would pass a required check", async () => {
     const w = new World();
     w.add({ number: 1, reviewed: true }); // no verdict
     w.checks.push({ id: 0, sha: w.headSha(1), name: CHECK, app: APP, status: "completed", conclusion: "neutral", output: { title: "Awaiting the approver", summary: "awaiting the approver" } });
-    const before = w.checks.map((c) => ({ ...c }));
     await tick(w, { prNumber: 1 });
-    await tick(w);
-    expect(w.checks).toEqual(before);
-    expect(w.checks.some((c) => c.status === "in_progress")).toBe(false);
+    expect(w.result(1)!.status).toBe("in_progress");
+    // (The approver is not held up by it: its select job ignores the gate's checks — see reviewer-controls.)
     // A verdict then replaces it like any result.
     w.prs.get(1)!.verdict = "APPROVE";
     await tick(w, { prNumber: 1 });
@@ -671,6 +677,47 @@ describe("0.4.1: the re-review label at the gate", () => {
     expect(w.prs.get(1)!.labels).toEqual([]);
     expect(current(w, 1, "success")).toBe(true);
     expect(w.merged).toEqual([{ pr: 1, sha: w.headSha(1) }]);
+  });
+
+  it("an unreadable label history holds the result (never skips the PR, leaving a stale success)", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before });
+    await tick(w, { prNumber: 1, rereview: true });
+    expect(current(w, 1, "success")).toBe(true);
+    Object.assign(w.prs.get(1)!, { labels: ["re-review"], rereviewAt: LABELLED, eventsFail: true });
+    await tick(w, { prNumber: 1, merge: "agent-only", rereview: true });
+    expect(w.result(1)!.status).toBe("in_progress");
+    expect(w.result(1)!.output.summary).toContain("could not read");
+    expect(w.merged).toEqual([]);
+    expect(w.prs.get(1)!.labels).toEqual(["re-review"]);
+  });
+
+  it("a request that cannot be dated has no cutoff: judged as usual, and the label comes off", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before, labels: ["re-review"], rereviewAt: LABELLED, undated: true });
+    await tick(w, { prNumber: 1, rereview: true });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.prs.get(1)!.labels).toEqual([]);
+  });
+
+  it("the label comes off only AFTER the merge: its unlabeled event's run cannot cancel a merge halfway", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: after, labels: ["re-review"], rereviewAt: LABELLED });
+    await tick(w, { prNumber: 1, merge: "agent-only", rereview: true });
+    expect(w.merged).toHaveLength(1);
+    expect(w.order.lastIndexOf("issues.removeLabel")).toBeGreaterThan(w.order.lastIndexOf("pulls.merge"));
+  });
+
+  it("means nothing on the dependabot lane, which never gets a verdict: no hold", async () => {
+    const w = new World();
+    w.add({ number: 1, user: "dependabot[bot]", labels: ["re-review"], rereviewAt: LABELLED });
+    const o = w.octokit();
+    await runHybridGate({
+      octokit: o, checksOctokit: o, owner: "o", repo: "r", checkName: CHECK, checkApp: APP, baseBranch: "main", merge: "off", rollout: {}, dryRun: false, prNumber: 1,
+      rereviewLabel: "re-review",
+      policy: { ...POLICY, rereviewLabel: "re-review", dependabot: { autoMerge: ["patch"] } } as any,
+    });
+    expect(w.result(1)?.output.title ?? "").not.toBe("Re-review requested");
   });
 
   it("is off without the label configured: an old verdict still counts", async () => {

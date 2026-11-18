@@ -27,6 +27,8 @@ export interface PrFile {
   path: string;
   additions: number;
   deletions?: number;
+  /** A renamed file's old path: a rename touches both. */
+  previousPath?: string;
 }
 
 /** A check-run observed on the head SHA, as summarized by the caller. */
@@ -116,10 +118,12 @@ export interface PullRequestFacts {
   /** Why a sign-off that looked present could not be accepted (shown on the check). */
   signoffUnavailable?: string;
   /**
-   * The re-review label is on the PR, added at this time: only reviews from after
-   * it count towards the head's verdict (see src/shared/rereview.ts).
+   * The re-review label is on the PR (src/shared/rereview.ts). `since`: when it
+   * was added — only reviews after it count towards the head's verdict; absent
+   * when the request cannot be dated (no cutoff). `unreadable`: the label's
+   * history could not be read, so whether a verdict is fresh is unknown.
    */
-  rereviewSince?: string;
+  rereview?: { since?: string; unreadable?: boolean };
 }
 
 export type HeadVerdict = "approve" | "reject" | "escalate";
@@ -156,6 +160,12 @@ export interface MergePolicy {
    * ["db/migrations/", ".github/workflows/", "terraform/**"].
    */
   protectedPaths?: string[];
+  /**
+   * Globs whose matching files are left out of the protected-path check only
+   * (e.g. tests under a protected package: ["**\/*_test.go"]). They still count
+   * towards maxAdditions unless excludeGlobs also covers them. Default: none.
+   */
+  protectedPathExcludeGlobs?: string[];
   /**
    * Labels that disqualify a PR outright (e.g. ["needs-human",
    * "rebase-needed"]). A PR carrying any of these is skipped.
@@ -502,11 +512,18 @@ export function handWrittenAdditions(files: PrFile[], excludeGlobs?: string[]): 
   }, 0);
 }
 
-/** First protected path a changed file touches, or undefined. */
-export function firstProtectedPath(files: PrFile[], protectedPaths?: string[]): string | undefined {
+/**
+ * First protected path a changed file touches, or undefined. Files matching
+ * `excludeGlobs` (the policy's protectedPathExcludeGlobs) are not considered.
+ */
+export function firstProtectedPath(files: PrFile[], protectedPaths?: string[], excludeGlobs?: string[]): string | undefined {
   if (!protectedPaths || protectedPaths.length === 0) return undefined;
+  // A rename touches both its paths: moving a file out of a protected path, or
+  // renaming it to a name the excludes cover, is still a change to that file.
+  const paths = files.flatMap((f) => (f.previousPath && f.previousPath !== f.path ? [f.path, f.previousPath] : [f.path]));
+  const considered = paths.filter((p) => !anyGlobMatches(excludeGlobs, p));
   for (const pattern of protectedPaths) {
-    if (files.some((f) => globMatch(pattern, f.path))) return pattern;
+    if (considered.some((p) => globMatch(pattern, p))) return pattern;
   }
   return undefined;
 }
@@ -970,7 +987,7 @@ function evaluateDependabotLane(
       detail: { handAdditions },
     };
   }
-  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths, policy.protectedPathExcludeGlobs);
   if (protectedPath) {
     return {
       action: needsHumanLabel ? "label" : "skip",
@@ -1171,7 +1188,7 @@ const AGENT_LANE_CLAUSES: Clause[] = [
   // 7) Protected paths untouched
   (pr, policy) => {
     const needsHumanLabel = policy.labels?.needsHuman;
-    const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+    const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths, policy.protectedPathExcludeGlobs);
     if (!protectedPath) return undefined;
     return {
       action: needsHumanLabel ? "label" : "skip",

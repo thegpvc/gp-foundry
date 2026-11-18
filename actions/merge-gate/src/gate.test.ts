@@ -522,6 +522,34 @@ describe("firstProtectedPath", () => {
   it("returns undefined when nothing is protected", () => {
     expect(firstProtectedPath([{ path: "src/x.ts", additions: 1 }], ["terraform/"])).toBeUndefined();
   });
+
+  describe("protectedPathExcludeGlobs", () => {
+    const tests = ["**/*_test.go", "**/testdata/**"];
+    it("a diff only of excluded files under a protected path is not protected", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 40 }, { path: "pkg/auth/testdata/a.json", additions: 5 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"], tests)).toBeUndefined();
+    });
+    it("one non-excluded file under the protected path still is", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 40 }, { path: "pkg/auth/token.go", additions: 1 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"], tests)).toBe("pkg/auth/");
+    });
+    it("is read from merge.yaml as protected_path_exclude_globs", () => {
+      const policy = normalizePolicyKeys({ protected_paths: ["pkg/auth/"], protected_path_exclude_globs: tests }) as MergePolicy;
+      expect(policy.protectedPathExcludeGlobs).toEqual(tests);
+      expect(firstProtectedPath([{ path: "pkg/auth/x_test.go", additions: 1 }], policy.protectedPaths, policy.protectedPathExcludeGlobs)).toBeUndefined();
+    });
+    it("a rename counts both paths: out of a protected path, or onto an excluded name, is still protected", () => {
+      expect(firstProtectedPath([{ path: "src/init.sql", previousPath: "db/migrations/0001_init.sql", additions: 0 }], ["db/migrations/"])).toBe("db/migrations/");
+      expect(firstProtectedPath([{ path: "pkg/auth/x_test.go", previousPath: "pkg/auth/x.go", additions: 0 }], ["pkg/auth/"], tests)).toBe("pkg/auth/");
+      // A test file renamed to another test file stays excluded.
+      expect(firstProtectedPath([{ path: "pkg/auth/y_test.go", previousPath: "pkg/auth/x_test.go", additions: 0 }], ["pkg/auth/"], tests)).toBeUndefined();
+    });
+    it("empty or absent: unchanged", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 1 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"])).toBe("pkg/auth/");
+      expect(firstProtectedPath(files, ["pkg/auth/"], [])).toBe("pkg/auth/");
+    });
+  });
 });
 
 describe("parseTimestamp", () => {

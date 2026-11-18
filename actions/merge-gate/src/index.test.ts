@@ -31,6 +31,7 @@ vi.mock("@actions/core", () => ({
   info: () => {},
   debug: () => {},
   warning: () => {},
+  notice: () => {},
 }));
 
 let stub: ReturnType<typeof makeOctokit>;
@@ -187,6 +188,23 @@ const openThread = {
   firstComment: { nodes: [{ reactions: { nodes: [] } }] },
   comments: { nodes: [{ author: { login: "alice" }, body: "This leaks." }] },
 };
+
+describe("the single gate on the PR that adds the harness", () => {
+  it("an event run with no policy on the base branch yet is a notice, not a failure", async () => {
+    setup({});
+    Object.assign(inputs, { mode: "", merge: "off", "pr-number": "7", "policy-path": join(tmpdir(), "no-such-dir-gpf", "merge.yaml") });
+    await run();
+    expect(failures).toEqual([]);
+    expect(stub.calls).toEqual([]);
+  });
+
+  it("…but a scheduled run without one still fails loudly", async () => {
+    setup({});
+    Object.assign(inputs, { mode: "", merge: "off", "pr-number": "", "policy-path": join(tmpdir(), "no-such-dir-gpf", "merge.yaml") });
+    await run();
+    expect(failures.length).toBe(1);
+  });
+});
 
 describe("merge-gate evaluate mode", () => {
   beforeEach(() => vi.clearAllMocks());

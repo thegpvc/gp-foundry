@@ -9,6 +9,7 @@
  * Everything gh-dependent degrades to a "skip" with a hint when gh is missing or
  * unauthenticated — the local (offline) checks still run.
  */
+import { rereviewLabelOf } from "../handlers/attrs.js";
 import type { Command } from "commander";
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -61,9 +62,8 @@ function requiredLabels(configPath: string | undefined): { name: string; descrip
   labels.push({ name: "needs-human", description: "agents are blocked; a human should take over", color: "b60205" });
   labels.push({ name: "needs-rebase", description: "PR conflicts with base; the janitor sweep rebases it", color: "d93f0b" });
   // The re-review label, when the config names one (it works in hybrid harnesses).
-  if (config.labels?.re_review && config.rollout !== undefined && config.rollout !== null) {
-    labels.push({ name: config.labels.re_review, description: "ask the pipeline for a fresh review and verdict on this head", color: "fbca04" });
-  }
+  const rereview = rereviewLabelOf(config);
+  if (rereview) labels.push({ name: rereview, description: "ask the pipeline for a fresh review and verdict on this head", color: "fbca04" });
   return labels;
 }
 

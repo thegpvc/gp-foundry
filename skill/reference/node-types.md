@@ -119,8 +119,10 @@ labels:
 - The gate holds while the label is on: its check goes back to in progress ("Re-review
   requested"), which never passes a required check, and nothing is merged. Once there is a
   verdict newer than the label, the gate removes the label and judges the head as usual.
-- "When the label was added" is the last `labeled` event for it. Removing the label by hand
-  cancels the request. `up` creates the label. It works only in a hybrid harness
+- "When the label was added" is the last `labeled` event for it, and only something posted
+  after that second counts as fresh. Removing the label by hand cancels the request. A
+  request that cannot be dated holds nothing; if the label's history cannot be read the
+  gate holds its check until it can. The label means nothing on the Dependabot lane. `up` creates the label. It works only in a hybrid harness
   (`validate` warns otherwise); under App auth the gate's token gains **Issues: write** to
   remove it.
 

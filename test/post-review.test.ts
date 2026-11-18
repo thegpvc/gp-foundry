@@ -596,9 +596,15 @@ describe("a re-review request: the post step posts a fresh review on the same he
     expect(r.posts).toEqual([]);
   });
 
-  it("an unreadable label history: posts nothing, fails red", () => {
+  it("an unreadable label history: posts anyway, with a warning (a duplicate at worst, never a dropped request)", () => {
     const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"]);
-    expect(r.status).not.toBe(0);
+    expect(r.status).toBe(0);
+    expect(r.posts).toHaveLength(1);
+  });
+
+  it("the label removed by hand since: no request, idempotent as before", () => {
+    const removed = [...labelled, { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-11-17T12:10:00Z" }];
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], removed);
     expect(r.posts).toEqual([]);
   });
 });
