@@ -74,7 +74,7 @@ The first version ordered the pass by "least recently evaluated", which needed a
 per open PR and a timestamp written into every result, and published a neutral result on
 every in-scope PR. Both are gone.
 
-### Fixed in 0.4.1 (pre-integration review on Trajectory)
+### Fixed in 0.4.1 (pre-integration review)
 
 - **An event run counted its own job as pending CI.** On a PR event the gate's job
   is a check run on the head, in progress while it reads. Every event run published

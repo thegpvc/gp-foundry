@@ -486,8 +486,8 @@ describe("the gate's own run is not CI", () => {
 });
 
 describe("an event run while other workflows are still starting on the head", () => {
-  // A review or label starts other workflows too (Trajectory's Promotion Approval
-  // Rerun runs on pull_request_review), so at the moment of a verdict their jobs
+  // A review or label starts other workflows too (a repo may re-run checks on
+  // pull_request_review), so at the moment of a verdict their jobs
   // are queued on the head.
   const starting = { name: "rerun", status: "queued", conclusion: null, details_url: runUrl(8123) };
 

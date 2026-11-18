@@ -942,7 +942,7 @@ export async function runHybridGate(opts: {
   type Pr = { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[] };
   // Scope is decided from what the listing already carries, BEFORE a scheduled
   // pass takes its window: a window taken first spends its places on PRs it then
-  // turns away (on Trajectory, 89 of 109 reviewed PRs carried the skip label).
+  // turns away (in a busy repo most reviewed PRs can carry the skip label).
   const scopeOf = (p: Pr) => {
     const author = p.user?.login;
     const scope = inScope(

@@ -731,7 +731,7 @@ describe("the single gate (merge=)", () => {
     });
   });
 
-  // Trajectory's formal-approval workflow calls the original gate for one PR with
+  // A consumer's own workflow (e.g. a formal-approval step) may call the original gate for one PR with
   // dry-run, from its OWN workflow run: the gate's job never shares its run id,
   // so only the name rule (job-check-name) can leave that job out of CI.
   describe("the original gate for one PR, called from another workflow", () => {
