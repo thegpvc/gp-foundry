@@ -18,6 +18,8 @@ import { parseRollout } from "../shared/scope.js";
 import type { MergeSetting } from "./attrs.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
+  quietVerdictsOf,
+  verdictChecksOf,
   rereviewLabelOf,
   authorsOf,
   diffMarkerPrefix,
@@ -173,7 +175,10 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   const prHeadSha = sweep ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
 
   const steps: StepSpec[] = [];
-  const app = appTokenStep(ctx, appScope(node, permissions));
+  // quiet_verdicts=: the post step delivers such a verdict as a check run, which
+  // the App token must be allowed to write (the job's own token is untouched).
+  const quiet = quietVerdictsOf(node, ctx.config);
+  const app = appTokenStep(ctx, appScope(node, quiet ? { ...permissions, checks: "write" } : permissions));
   if (app) steps.push(app);
 
   // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
@@ -600,6 +605,7 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
       "checks-token": "${{ github.token }}",
       "policy-path": resolveFile(ctx, node.files.policy),
       "base-branch": ctx.config.repo.base_branch,
+      ...verdictCheckInputs(ctx),
       "branch-prefix": ctx.config.repo.branch_prefix,
       ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
       ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
@@ -656,6 +662,12 @@ export function cronPeriodSeconds(cron: string): number {
   if (rest && /^\d+$/.test(min!) && every.test(hour!)) return Number(every.exec(hour!)![1]) * 3600;
   if (rest && /^\d+$/.test(min!) && /^\d+$/.test(hour!)) return 86400;
   return 300;
+}
+
+/** quiet_verdicts= anywhere in the graph: the checks the gate reads as verdicts. Off: nothing. */
+function verdictCheckInputs(ctx: EmitContext): Record<string, string> {
+  const v = verdictChecksOf(ctx.nodes ?? [], ctx.config);
+  return v ? { "verdict-checks": v.checks.join("\n"), "verdict-app": v.app } : {};
 }
 
 /** The single gate's job name — and so its check run's name on a PR head. */
@@ -718,6 +730,7 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ...(app ? { "check-app": "${{ steps.app-token.outputs.app-slug }}" } : {}),
       "policy-path": resolveFile(ctx, node.files.policy),
       "base-branch": ctx.config.repo.base_branch,
+      ...verdictCheckInputs(ctx),
       ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
       ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
       ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
@@ -783,6 +796,7 @@ function emitEvaluateGate(ctx: EmitContext, requiredChecks: string[]): WorkflowJ
           "checks-token": "${{ github.token }}",
           "policy-path": resolveFile(ctx, node.files.policy),
           "base-branch": ctx.config.repo.base_branch,
+      ...verdictCheckInputs(ctx),
           "branch-prefix": ctx.config.repo.branch_prefix,
           ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
           ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),

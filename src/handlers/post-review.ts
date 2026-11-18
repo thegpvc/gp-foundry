@@ -6,7 +6,7 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 import { LABEL_EVENTS_JQ } from "../shared/rereview.js";
 
@@ -128,6 +128,7 @@ if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100"
   echo "::error::could not read the PR's reviews — not posting, so a re-run cannot post the review twice"
   exit 1
 fi
+__QUIET_EXISTING__
 if [ "$EXISTING" != "0" ]; then
   echo "$NODE has already posted its review on $HEAD_SHA — not posting it again"
   note "_The review for this head was already posted; nothing new was posted._"
@@ -173,6 +174,7 @@ flatten() {
       end' "$1"
 }
 
+__QUIET_POST__
 # GitHub rejects the whole review when one inline comment is on a file outside
 # the PR's diff. Move those into the body before posting, from one read of the
 # changed files. If that read fails, post as is: the 422 retry below still holds.
@@ -219,11 +221,60 @@ note "_No review was posted: GitHub rejected it. See the job log._"
 exit 1
 `;
 
+/**
+ * quiet_verdicts=: the lane's earlier quiet verdict on this head (a check run from
+ * the harness App, after any re-review request) counts as posted, like a review.
+ */
+const QUIET_EXISTING = `# quiet_verdicts: a verdict delivered as a check run counts as posted too — this
+# lane's check on this head, from the harness App, after any re-review request.
+if ! QUIET_EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '
+  [.check_runs[] | select(.app.slug == env.BOT_APP and .head_sha == env.HEAD_SHA)
+   | select(env.SINCE == "" or (.completed_at // "") > env.SINCE)] | length' \\
+  | awk '{s+=$1} END {print s+0}'); then
+  echo "::error::could not read the head's check runs — not posting, so a re-run cannot deliver the verdict twice"
+  exit 1
+fi
+EXISTING=$((EXISTING + QUIET_EXISTING))
+`;
+
+/**
+ * quiet_verdicts=: a quiet verdict is delivered as a completed check run on the
+ * head instead of a review. Its summary is the review's visible body without the
+ * verdict line (inline findings moved into it as a list); the verdict is in the
+ * title and the conclusion. Signed by the lane's token — the harness App's.
+ */
+const QUIET_POST = `# quiet_verdicts: a verdict that needs nothing from the author is delivered as a
+# check run on the head, owned by the harness App — no timeline entry, no
+# notification. The gate and the sweep read it like a verdict review.
+if jq -e '__IS_QUIET_JQ__' <<< "$REVIEW" > /dev/null; then
+  QUIET=$(mktemp)
+  printf '%s' "$REVIEW" > "$QUIET"
+  flatten "$QUIET" null > "$QUIET.flat"
+  jq -c --arg name "$VERDICT_CHECK" --arg sha "$HEAD_SHA" --arg ext "gp-foundry:verdict:$NODE:$HEAD_SHA" '
+    (.body | gsub("<!--[\\\\s\\\\S]*?-->"; "") | sub("\\\\s+$"; "") | split("\\n")) as $l
+    | ($l[-1] | gsub("^\\\\s+|\\\\s+$"; "")) as $v
+    | ($l[:-1] | join("\\n") | sub("\\\\s+$"; "")) as $b
+    | {name: $name, head_sha: $sha, status: "completed", conclusion: "success", external_id: $ext,
+       output: {title: ("Verdict: " + ($v | split(" ") | last)),
+                summary: (if ($b | length) == 0 then "(no findings)" else $b[0:65000] end)}}' "$QUIET.flat" > "$QUIET.check"
+  if gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input "$QUIET.check" > "$RESP" 2> "$ERR"; then
+    echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
+    URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
+    if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \\\`$VERDICT_CHECK\\\` on $HEAD_SHA."; fi
+    exit 0
+  fi
+  echo "::error::could not deliver the verdict as a check: $(why)"
+  note "_No verdict was delivered: GitHub rejected the check run. See the job log._"
+  exit 1
+fi
+`;
+
 /** The post step: after run-agent (`id: agent`), only when the agent succeeded. */
 export function postReviewStep(
   ctx: EmitContext,
   opts: { prNumber: string; headSha: string; verdictLane: boolean },
 ): StepSpec {
+  const quiet = opts.verdictLane ? quietVerdictsOf(ctx.node, ctx.config) : undefined;
   let marker = DEFAULT_POST_MARKER;
   try {
     marker = parsePostMarker(ctx.node);
@@ -245,8 +296,14 @@ export function postReviewStep(
       REQUIRE_VERDICT: String(opts.verdictLane),
       VERDICT_LINES: verdictLinesOf(ctx.config),
       ...(rereviewLabelOf(ctx.config) ? { REREVIEW_LABEL: rereviewLabelOf(ctx.config)! } : {}),
+      ...(quiet ? { QUIET_LINES: quiet.lines, VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
     },
-    run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ).replaceAll("__LABEL_EVENTS_JQ__", () => LABEL_EVENTS_JQ),
+    // Off, the quiet blocks vanish with their lines: the script is byte-identical.
+    run: SCRIPT.replace("__QUIET_EXISTING__\n", () => (quiet ? QUIET_EXISTING : ""))
+      .replace("__QUIET_POST__\n", () => (quiet ? QUIET_POST : ""))
+      .replaceAll("__IS_QUIET_JQ__", () => IS_VERDICT_JQ.replace("env.VERDICT_LINES", "env.QUIET_LINES"))
+      .replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ)
+      .replaceAll("__LABEL_EVENTS_JQ__", () => LABEL_EVENTS_JQ),
   });
 }
 

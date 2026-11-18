@@ -152,6 +152,8 @@ interface Ran {
   status: number;
   stdout: string;
   posts: any[];
+  /** Every write, in order: `<METHOD> <path>` and its JSON body. */
+  writes: { call: string; body: any }[];
   /** What the step appended to the job summary. */
   summary: string;
 }
@@ -165,6 +167,8 @@ function runPost(
   files: string[] | null = ["src/a.ts"],
   /** The PR's issue events (label history); omitted: the read fails. */
   events?: unknown[],
+  /** The head's runs of the quiet verdict check (quiet_verdicts=); omitted: the read fails. */
+  verdictChecks?: unknown[],
 ): Ran {
   const dir = mkdtempSync(join(tmpdir(), "gpf-post-"));
   const bin = join(dir, "bin");
@@ -175,6 +179,10 @@ function runPost(
   chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
   if (events) writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
+  if (verdictChecks && step.env.VERDICT_CHECK) {
+    const q = `repos/o/r/commits/head1/check-runs?check_name=${encodeURIComponent(step.env.VERDICT_CHECK).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())}&filter=all&per_page=100`;
+    writeFileSync(join(fx, q.replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify({ check_runs: verdictChecks }));
+  }
   if (files) {
     writeFileSync(
       join(fx, "repos/o/r/pulls/7/files?per_page=100".replace(/[^A-Za-z0-9]/g, "_")),
@@ -200,13 +208,16 @@ function runPost(
     stdout = (e.stdout ?? "") + (e.stderr ?? "");
   }
   const log = join(fx, "writes.log");
-  const posts = existsSync(log)
-    ? readFileSync(log, "utf8")
-        .split(/^POST repos\/o\/r\/pulls\/7\/reviews\n/m)
-        .filter((s) => s.trim())
-        .map((s) => JSON.parse(s))
-    : [];
-  return { status, stdout, posts, summary: readFileSync(summaryFile, "utf8").replace("### Agent output\n\n(the agent's text)\n", "") };
+  const writes: Ran["writes"] = [];
+  if (existsSync(log)) {
+    // Each write is "<METHOD> <path>" then its JSON body (one line; blank lines between).
+    const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.trim());
+    for (let i = 0; i < lines.length; i++) {
+      if (/^(POST|PUT|PATCH|DELETE) /.test(lines[i]!)) writes.push({ call: lines[i]!, body: JSON.parse(lines[++i]!) });
+    }
+  }
+  const posts = writes.filter((w) => w.call === "POST repos/o/r/pulls/7/reviews").map((w) => w.body);
+  return { status, stdout, posts, writes, summary: readFileSync(summaryFile, "utf8").replace("### Agent output\n\n(the agent's text)\n", "") };
 }
 
 const fence = (obj: unknown) => "```json\n" + JSON.stringify(obj) + "\n```\n";
@@ -606,5 +617,68 @@ describe("a re-review request: the post step posts a fresh review on the same he
     const removed = [...labelled, { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-11-17T12:10:00Z" }];
     const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], removed);
     expect(r.posts).toEqual([]);
+  });
+});
+
+describe("quiet_verdicts: a verdict that needs nothing from the author is a check run, not a review", () => {
+  const APP_CFG = { identity: { bot_login: BOT, app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>;
+  const QUIET_SWEEP = SWEEP.replace('post="review"', 'post="review", quiet_verdicts="APPROVE"');
+  const quietStep = () => {
+    const { files } = compile(mkHarness(QUIET_SWEEP, APP_CFG));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/approver.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.approver, "Post the review");
+  };
+  const CHECK = "gp-foundry/verdict (approver)";
+  const approve = { body: "Looks right.\n\n**Verdict:** APPROVE", comments: [{ path: "src/a.ts", line: 4, body: "Nit: name." }] };
+  const reject = { body: "One blocker.\n\n**Verdict:** REQUEST_CHANGES", comments: [] };
+  const ours = (over: object = {}) => ({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-bot" }, ...over });
+
+  it("an APPROVE is delivered as the App's completed check on the head — no review", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.posts).toEqual([]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+    const c = r.writes[0]!.body;
+    expect(c).toMatchObject({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", external_id: "gp-foundry:verdict:approver:head1" });
+    expect(c.output.title).toBe("Verdict: APPROVE");
+    // The visible body without the verdict line; inline findings moved into it.
+    expect(c.output.summary).toContain("Looks right.");
+    expect(c.output.summary).toContain("`src/a.ts:4` — Nit: name.");
+    expect(c.output.summary).not.toContain("**Verdict:**");
+    expect(r.summary).toContain("Verdict delivered as a check");
+  });
+
+  it("any other verdict still posts a review, exactly as before", () => {
+    const r = runPost(quietStep(), fence(reject), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.posts).toHaveLength(1);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/pulls/7/reviews"]);
+  });
+
+  it("a retried post step creates no second check: the App's check on this head counts as posted", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours()]);
+    expect(r.status).toBe(0);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("a check of the same name from another App does not", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ app: { slug: "someone-else" } })]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("an unreadable check history: nothing posted, red (a retry must not deliver twice)", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"]);
+    expect(r.status).not.toBe(0);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("output without a verdict line is still refused", () => {
+    const r = runPost(quietStep(), fence({ body: "No verdict here." }), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("off: the step is the one it always was", () => {
+    const off = stepNamed(job(SWEEP, "approver"), "Post the review");
+    expect(off.run).not.toContain("quiet_verdicts");
+    expect(off.env.VERDICT_CHECK).toBeUndefined();
   });
 });

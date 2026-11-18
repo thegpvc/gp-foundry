@@ -20,6 +20,8 @@ import {
   parseMergeSetting,
   publishesCheck,
   isSweep,
+  quietVerdictsRaw,
+  botAppSlug,
   parsePostMarker,
   postsReview,
   parseOptInLabel,
@@ -635,6 +637,43 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         } catch (e) {
           diags.push({ level: "error", code: "node.bad-post-marker", message: (e as Error).message, where: { node: n.id, line: n.line } });
         }
+      }
+    }
+    if (n.attrs.quiet_verdicts !== undefined || n.attrs.verdict_check !== undefined) {
+      const at = { node: n.id, line: n.line };
+      const words = quietVerdictsRaw(n);
+      let approve = "APPROVE";
+      try {
+        approve = parseVerdictWords(ir.config.verdicts).approve;
+      } catch {
+        // malformed verdicts: reported elsewhere
+      }
+      if (n.attrs.quiet_verdicts === undefined) {
+        diags.push({ level: "error", code: "node.verdict-check-without-quiet", message: `verdict_check= on '${n.id}' names the check quiet_verdicts= delivers to; set quiet_verdicts too`, where: at });
+      } else if (!words.length) {
+        diags.push({ level: "error", code: "node.bad-quiet-verdicts", message: `quiet_verdicts= on '${n.id}' is empty`, hint: `quiet_verdicts="${approve}"`, where: at });
+      } else if (!(postsReview(n) && isSweep(n))) {
+        diags.push({
+          level: "error",
+          code: "node.quiet-verdicts-not-verdict-lane",
+          message: `quiet_verdicts= on '${n.id}' needs a verdict lane: a pr-review sweep (select="sweep") with post="review"`,
+          where: at,
+        });
+      } else if (words.some((w) => w !== approve)) {
+        diags.push({
+          level: "error",
+          code: "node.bad-quiet-verdicts",
+          message: `quiet_verdicts= on '${n.id}' may list only the approve word ('${approve}'): ${words.filter((w) => w !== approve).join(", ")} asks something of the author, so it stays a review`,
+          hint: `quiet_verdicts="${approve}"`,
+          where: at,
+        });
+      } else if (resolveAuth(ir.config).mode !== "app" || !botAppSlug(ir.config)) {
+        diags.push({
+          level: "error",
+          code: "node.quiet-verdicts-needs-app",
+          message: `quiet_verdicts= on '${n.id}' needs App auth with identity.bot_login set to the App's bot (\`<app>[bot]\`): the verdict is a check run the App owns, and only the App's runs count`,
+          where: at,
+        });
       }
     }
     if (n.attrs.requires_review !== undefined) {

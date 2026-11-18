@@ -50,7 +50,7 @@ import {
   type VerdictEvent,
   type VerdictTrustPolicy,
 } from "./gate.js";
-import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
+import { parseVerdictWords, verdictLine, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
 import { isFresh, requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 import { excludeLabelQualifier, reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
@@ -66,6 +66,12 @@ interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   rebaseLabel?: string;
   /** Evaluate mode: a trusted verdict on the head matching this is an escalation (check `action_required`). */
   escalationBodyRegex?: string;
+  /**
+   * From the `verdict-checks` / `verdict-app` inputs: the check runs a lane with
+   * quiet_verdicts delivers a verdict as, and the App whose runs alone count.
+   */
+  verdictChecks?: string[];
+  verdictApp?: string;
   /** From the `rereview-label` input: the label that asks for a fresh review and verdict. */
   rereviewLabel?: string;
   /** From the `verdicts` input (not the policy file): the words the default markers are built from. */
@@ -305,6 +311,34 @@ export async function fetchReviewThreads(octokit: Octokit, owner: string, repo: 
   return threads;
 }
 
+/**
+ * The quiet verdicts on a head (quiet_verdicts=), as review-shaped records: the
+ * named check runs, completed, owned by the harness App (any other app's run of
+ * the same name is ignored), whose title is `Verdict: <WORD>`. Each becomes the
+ * bot's COMMENTED review on the head, submitted when the check completed, whose
+ * body ends in that verdict line.
+ */
+export async function quietVerdictReviews(
+  checksOctokit: Octokit,
+  owner: string,
+  repo: string,
+  headSha: string,
+  policy: PolicyFile,
+): Promise<{ submitted_at: string; commit_id: string; state: string; user: { login: string }; author_association: string; body: string }[]> {
+  if (!policy.verdictChecks?.length || !policy.verdictApp) return [];
+  const author = policy.botLogin ?? `${policy.verdictApp}[bot]`;
+  const out: Awaited<ReturnType<typeof quietVerdictReviews>> = [];
+  for (const name of policy.verdictChecks) {
+    const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
+    for (const r of runs) {
+      const word = /^Verdict: (\S+)$/.exec((r.output?.title ?? "").trim())?.[1];
+      if (r.name !== name || r.app?.slug !== policy.verdictApp || r.status !== "completed" || !r.completed_at || r.head_sha !== headSha || !word) continue;
+      out.push({ submitted_at: r.completed_at, commit_id: headSha, state: "COMMENTED", user: { login: author }, author_association: "NONE", body: `${r.output?.summary ?? ""}\n\n${verdictLine(word)}` });
+    }
+  }
+  return out;
+}
+
 export async function gatherFacts(
   octokit: Octokit,
   owner: string,
@@ -328,6 +362,10 @@ export async function gatherFacts(
   // (or, for comments, postdate the head commit). See gate.latestValidApproval.
   const rawEvents: VerdictEvent[] = [];
   const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
+  // quiet_verdicts: a verdict delivered as a check run joins the reviews as the
+  // bot's verdict on the head, at the time it completed — so "latest verdict
+  // wins" orders the two kinds together.
+  reviews.push(...((await quietVerdictReviews(checksOctokit, owner, repo, pr.head.sha, policy)) as typeof reviews));
   // Approval is tested FIRST: per the reviewer contract the verdict is the body's
   // final "**Verdict:** …" line, and an approval may legitimately quote or discuss
   // the earlier REQUEST_CHANGES items in its prose. A body matching the approval
@@ -384,7 +422,8 @@ export async function gatherFacts(
   const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions, ...(f.previous_filename ? { previousPath: f.previous_filename } : {}) }));
 
-  const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
+  // A quiet verdict is a check run on the head, but not CI.
+  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ...(policy.verdictChecks ?? [])]);
   type CheckRunRaw = {
     id?: number | null;
     name?: string | null;
@@ -1203,6 +1242,12 @@ export async function run(): Promise<void> {
     // consumer's identity and human-gate wiring don't have to be restated in the
     // policy file. Inputs win over the policy file, same as branch-prefix.
     // The verdict words the compiler passes from foundry.config.yaml (`verdicts:`).
+    const verdictChecksInput = core.getInput("verdict-checks").trim();
+    const verdictAppInput = core.getInput("verdict-app").trim();
+    if (verdictChecksInput && verdictAppInput) {
+      policy.verdictChecks = verdictChecksInput.split(/\n/).map((s) => s.trim()).filter(Boolean);
+      policy.verdictApp = verdictAppInput;
+    }
     const rereviewInput = core.getInput("rereview-label").trim();
     if (rereviewInput) policy.rereviewLabel = rereviewInput;
     const verdictsInput = core.getInput("verdicts").trim();

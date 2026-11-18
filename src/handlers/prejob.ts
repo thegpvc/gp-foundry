@@ -13,6 +13,7 @@
  */
 import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
+  quietVerdictsOf,
   rereviewLabelOf,
   isHybrid,
   parseEvaluateCheckName,
@@ -422,6 +423,7 @@ function emitSkipGuard(ctx: EmitContext): WorkflowJobFragment {
 // ── select="sweep" selector ──────────────────────────────────────────────────
 
 function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
+  const quiet = quietVerdictsOf(ctx.node, ctx.config);
   const node = ctx.node;
   const authors = authorsOf(node, ctx.config);
   const optIn = optInLabelOf(node, ctx.config);
@@ -561,9 +563,19 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
     `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
-    `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length) ] | @tsv' \\`,
-    `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
-    `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
+    `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length)${quiet ? "," : " ] | @tsv' \\"}`,
+    ...(quiet
+      ? [
+          `      ([.[] | select(.name == env.VERDICT_CHECK and .app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length) ] | @tsv' \\`,
+          `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5; q+=$6} END {print t+0, r+0, s+0, f+0, i+0, q+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
+          `  read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET <<< "$CHECKS"`,
+          `  # quiet_verdicts: a verdict delivered as a check run by the harness App decides the head too.`,
+          `  if [ "$QUIET" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi`,
+        ]
+      : [
+          `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
+          `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
+        ]),
     `  if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
     `  if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then`,
     `    echo "#$NUM: no check-run on $SHA yet and the PR changed \${QUIET}s ago — waiting for CI to register"`,
@@ -631,6 +643,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(gateChecks.length ? { GATE_CHECKS: gateChecks.join("\n") } : {}),
+          ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),
           ...skipLabels,
@@ -659,6 +672,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
  * the head up again.
  */
 function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
+  const quiet = quietVerdictsOf(ctx.node, ctx.config);
   const node = ctx.node;
   const select = preJobId(node);
   return {
@@ -687,6 +701,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           RUN_ID: "${{ github.run_id }}",
           RUN_ATTEMPT: "${{ github.run_attempt }}",
+          ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
         },
         run: [
           `JOBS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --paginate --jq '`,
@@ -713,6 +728,16 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `      VERDICTS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
           ...VERDICT_REVIEWS_JQ.map((l) => `        ${l}`),
           `      ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""`,
+          ...(quiet
+            ? [
+                `      # quiet_verdicts: a verdict delivered as the harness App's check run counts too.`,
+                `      if [ -n "$VERDICTS" ]; then`,
+                `        QUIET=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '`,
+                `          [.check_runs[] | select(.app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length' | awk '{s+=$1} END {print s+0}') || QUIET=""`,
+                `        if [ -z "$QUIET" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET)); fi`,
+                `      fi`,
+              ]
+            : []),
           `      if [ -z "$VERDICTS" ]; then`,
           `        echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"`,
           `      elif [ "$VERDICTS" = "0" ]; then`,

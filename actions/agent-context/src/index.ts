@@ -68,6 +68,7 @@ async function run(): Promise<void> {
       type,
       includeDiff,
       checksOctokit,
+      ...verdictChecksInput(),
     });
     // Best-effort fetches that degraded. The context file says so in its own
     // words; the detail (API error text) belongs in the log, not the prompt.
@@ -126,3 +127,10 @@ async function run(): Promise<void> {
 }
 
 run();
+
+/** `verdict-checks` / `verdict-app`: quiet verdict checks to list with the reviews. */
+function verdictChecksInput(): { verdictChecks?: { checks: string[]; app: string } } {
+  const checks = core.getInput("verdict-checks").split("\n").map((s) => s.trim()).filter(Boolean);
+  const app = core.getInput("verdict-app").trim();
+  return checks.length && app ? { verdictChecks: { checks, app } } : {};
+}

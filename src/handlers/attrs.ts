@@ -7,7 +7,7 @@
  */
 import type { FoundryConfig, HarnessNode } from "../ir/types.js";
 import { parseRollout, type Rollout } from "../shared/scope.js";
-import { parseVerdictWords, verdictLinesEnv } from "../shared/verdicts.js";
+import { parseVerdictWords, verdictLine, verdictLinesEnv } from "../shared/verdicts.js";
 
 // ── the attribute vocabulary ─────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
-  "mode", "merge", "check_name", "requires_review", "post", "post_marker",
+  "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -390,6 +390,72 @@ export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
  */
 export function postsReview(node: HarnessNode): boolean {
   return node.attrs.post === "review" && (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);
+}
+
+// ── quiet_verdicts= ─────────────────────────────────────────────────────────
+
+/**
+ * `quiet_verdicts="APPROVE"` on a verdict lane (a sweep with post="review"): a
+ * verdict that needs nothing from the author is delivered as a completed check
+ * run on the head, owned by the harness App, instead of a review — no timeline
+ * entry, no notification. Every other verdict still posts a review.
+ *
+ * The check: name `verdict_check=` (default `gp-foundry/verdict (<node>)`),
+ * conclusion `success`, title `Verdict: <WORD>`, summary the review's body
+ * without its verdict line, external_id `gp-foundry:verdict:<node>:<sha>`.
+ * Only a check whose app is the harness App counts as a verdict (the App's slug
+ * is identity.bot_login without `[bot]`).
+ *
+ * Only the approve word may be quiet: the others ask something of the author.
+ */
+export interface QuietVerdicts {
+  /** The verdict words delivered as a check (today: the approve word only). */
+  words: string[];
+  /** Their exact verdict lines, newline-joined (what the post step compares). */
+  lines: string;
+  /** The check run's name. */
+  check: string;
+  /** The harness App's slug: the only app whose check counts. */
+  app: string;
+}
+
+export function quietVerdictsRaw(node: HarnessNode): string[] {
+  const raw = node.attrs.quiet_verdicts;
+  if (raw === undefined || raw === null || raw === "") return [];
+  return String(raw).split(",").map((w) => w.trim()).filter(Boolean);
+}
+
+export function verdictCheckName(node: HarnessNode): string {
+  const raw = node.attrs.verdict_check;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : `gp-foundry/verdict (${node.id})`;
+}
+
+/** The harness App's slug, from identity.bot_login (`my-app[bot]` → `my-app`). */
+export function botAppSlug(cfg: FoundryConfig): string | undefined {
+  const login = cfg.identity?.bot_login ?? "";
+  return login.endsWith("[bot]") ? login.slice(0, -"[bot]".length) : undefined;
+}
+
+/** A node's quiet verdicts, when it has any that apply; validate() reports the rest. */
+export function quietVerdictsOf(node: HarnessNode, cfg: FoundryConfig): QuietVerdicts | undefined {
+  const words = quietVerdictsRaw(node);
+  const app = botAppSlug(cfg);
+  if (!words.length || !app || !postsReview(node) || !isSweep(node)) return undefined;
+  let approve: string;
+  try {
+    approve = parseVerdictWords(cfg.verdicts).approve;
+  } catch {
+    approve = parseVerdictWords(undefined).approve;
+  }
+  const quiet = words.filter((w) => w === approve);
+  if (!quiet.length) return undefined;
+  return { words: quiet, lines: quiet.map(verdictLine).join("\n"), check: verdictCheckName(node), app };
+}
+
+/** Every quiet verdict check in the graph — what the gate and the context read. */
+export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { checks: string[]; app: string } | undefined {
+  const qs = nodes.map((n) => quietVerdictsOf(n, cfg)).filter((q): q is QuietVerdicts => !!q);
+  return qs.length ? { checks: [...new Set(qs.map((q) => q.check))], app: qs[0]!.app } : undefined;
 }
 
 /** Default heading the post step puts on line 1 of the review: placeholders `<n>` and `<sha>`. */

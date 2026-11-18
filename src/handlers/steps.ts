@@ -7,7 +7,7 @@
  * as "$VAR" inside run: — never interpolated directly into a run script.
  */
 import type { EmitContext, HarnessNode, Permission, RunStep, StepSpec, UsesStep } from "../ir/types.js";
-import { hasPrContext } from "./attrs.js";
+import { verdictChecksOf, hasPrContext } from "./attrs.js";
 import { resolveAuth } from "../auth/auth.js";
 
 export function secretRef(name: string): string {
@@ -239,6 +239,12 @@ export function contextStep(
   // Check-run conclusions are read with GITHUB_TOKEN (the job declares
   // `checks: read`): the Checks permission has no fine-grained-PAT equivalent.
   if (opts.checks) withBlock["checks-token"] = "${{ github.token }}";
+  // quiet_verdicts= in the graph: those verdicts are check runs, listed with the reviews.
+  const quiet = opts.checks ? verdictChecksOf(ctx.nodes ?? [], ctx.config) : undefined;
+  if (quiet) {
+    withBlock["verdict-checks"] = quiet.checks.join("\n");
+    withBlock["verdict-app"] = quiet.app;
+  }
   // The reviewer bot's own posts are the harness talking to itself. Without this
   // the Fixer reads its own work item under a banner telling it never to follow
   // the instructions inside — see agent-context's trusted-authors input.

@@ -1,4 +1,5 @@
 import type { getOctokit } from "@actions/github";
+import { verdictLine } from "../../../src/shared/verdicts.js";
 import type {
   ChangedFileData,
   CheckRunData,
@@ -6,6 +7,7 @@ import type {
   ContextType,
   InlineCommentData,
   PullRequestData,
+  ReviewData,
   ReviewThreadData,
 } from "./formatters.js";
 
@@ -26,6 +28,11 @@ export interface FetchOptions {
    * Omit to skip check conclusions entirely.
    */
   checksOctokit?: Octokit;
+  /**
+   * quiet_verdicts=: check runs that carry a lane's verdict instead of a review,
+   * and the App whose runs alone count. Listed with the reviews (needs checksOctokit).
+   */
+  verdictChecks?: { checks: string[]; app: string };
 }
 
 /**
@@ -35,14 +42,14 @@ export async function fetchContext(
   octokit: Octokit,
   opts: FetchOptions
 ): Promise<ContextData> {
-  const { owner, repo, number, type, includeDiff, checksOctokit } = opts;
+  const { owner, repo, number, type, includeDiff, checksOctokit, verdictChecks } = opts;
 
   switch (type) {
     case "issue":
       return fetchIssue(octokit, owner, repo, number);
     case "pr-review":
     case "pr-full":
-      return fetchPRFull(octokit, owner, repo, number, includeDiff, checksOctokit);
+      return fetchPRFull(octokit, owner, repo, number, includeDiff, checksOctokit, verdictChecks);
     case "pr-diff":
       return fetchPRDiff(octokit, owner, repo, number, includeDiff, checksOctokit);
     default:
@@ -69,20 +76,55 @@ async function fetchIssue(
   return { issue: issue as unknown as ContextData["issue"], comments: comments as unknown as ContextData["comments"] };
 }
 
+/**
+ * The quiet verdicts among a head's check runs, as review records: completed runs
+ * of a named verdict check, owned by the harness App (another app's run of the
+ * same name is ignored), titled `Verdict: <WORD>`. The body is the check's
+ * summary followed by the verdict line, as a verdict review would read.
+ */
+export function quietVerdictReviews(
+  checkRuns: CheckRunData[] | undefined,
+  verdictChecks: FetchOptions["verdictChecks"],
+  headSha: string | undefined,
+): ReviewData[] {
+  if (!checkRuns || !verdictChecks?.checks.length) return [];
+  const out: ReviewData[] = [];
+  for (const r of checkRuns) {
+    const word = /^Verdict: (\S+)$/.exec((r.output?.title ?? "").trim())?.[1];
+    if (!verdictChecks.checks.includes(r.name) || r.app?.slug !== verdictChecks.app || r.status !== "completed" || !word) continue;
+    out.push({
+      user: { login: `${verdictChecks.app}[bot]` } as ReviewData["user"],
+      state: `VERDICT (check run \`${r.name}\`)`,
+      submitted_at: r.completed_at ?? undefined,
+      body: `${r.output?.summary ?? ""}\n\n${verdictLine(word)}`,
+      commit_id: r.head_sha ?? headSha ?? null,
+    });
+  }
+  return out;
+}
+
 async function fetchPRFull(
   octokit: Octokit,
   owner: string,
   repo: string,
   number: number,
   includeDiff: boolean,
-  checksOctokit: Octokit | undefined
+  checksOctokit: Octokit | undefined,
+  verdictChecks?: FetchOptions["verdictChecks"],
 ): Promise<ContextData> {
   const base = await fetchPRDiff(octokit, owner, repo, number, includeDiff, checksOctokit);
-  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
+  const reviews = (await octokit.paginate(octokit.rest.pulls.listReviews, {
     owner,
     repo,
     pull_number: number,
-  });
+  })) as unknown as ReviewData[];
+  // A verdict delivered as a check run (quiet_verdicts=) sits with the reviews,
+  // in time order, so a later lane reads the decision where it reads the others.
+  const quiet = quietVerdictReviews(base.checkRuns, verdictChecks, base.pr?.head?.sha);
+  if (quiet.length) {
+    reviews.push(...quiet);
+    reviews.sort((a, b) => (a.submitted_at ?? "").localeCompare(b.submitted_at ?? ""));
+  }
   const comments = await octokit.paginate(octokit.rest.issues.listComments, {
     owner,
     repo,
@@ -111,7 +153,7 @@ async function fetchPRFull(
 
   return {
     ...base,
-    reviews: reviews as unknown as ContextData["reviews"],
+    reviews,
     reviewThreads,
     ...(reviewThreadsUnavailable ? { reviewThreadsUnavailable } : {}),
     inlineComments,

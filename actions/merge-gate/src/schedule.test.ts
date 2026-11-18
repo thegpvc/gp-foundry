@@ -21,6 +21,9 @@ const { runHybridGate, GATE_TICK_LIMIT } = await import("./index.js");
 const BOT = "gate-bot[bot]";
 const CHECK = "acme/approval";
 const APP = "gate-app";
+/** quiet_verdicts=: the approver's verdict check, and the harness App that owns it. */
+const QUIET_CHECK = "gp-foundry/verdict (approver)";
+const QUIET_APP = "agent-app";
 const sha = (n: number, v = 1) => `${String(n).padStart(4, "0")}${"0".repeat(32)}v${v}`.slice(0, 40);
 
 interface FakePr {
@@ -37,7 +40,7 @@ interface FakePr {
   /** pulls.get throws this many more times. */
   failReads?: number;
   /** More check runs on the current head (other workflows' jobs, the gate's own job). */
-  extra?: { name: string; status: string; conclusion: string | null; details_url?: string; app?: string }[];
+  extra?: { name: string; status: string; conclusion: string | null; details_url?: string; app?: string; completed_at?: string; head_sha?: string; output?: { title?: string; summary?: string } }[];
   draft?: boolean;
   /** When the re-review label was added, if it is on the PR. */
   rereviewAt?: string;
@@ -198,7 +201,7 @@ class World {
             const gate = w.checks
               .filter((c) => c.sha === ref)
               .map((c) => ({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, app: { slug: c.app }, output: c.output }));
-            const extra = (pr?.extra ?? []).map((c, i) => ({ id: 1000 + i, ...c, app: { slug: c.app ?? "github-actions" }, output: {} }));
+            const extra = (pr?.extra ?? []).map((c, i) => ({ id: 1000 + i, ...c, app: { slug: c.app ?? "github-actions" }, output: c.output ?? {} }));
             const all = [ci, ...extra, ...gate];
             return { check_runs: check_name ? all.filter((c) => c.name === check_name) : all };
           }),
@@ -234,7 +237,7 @@ const POLICY = {
 let run = 0;
 function tick(
   w: World,
-  opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rollout?: { skipLabel?: string; authors?: string[] }; rereview?: boolean; self?: { runId?: string; jobCheckName?: string } } = {},
+  opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rollout?: { skipLabel?: string; authors?: string[] }; rereview?: boolean; quiet?: boolean; self?: { runId?: string; jobCheckName?: string } } = {},
 ) {
   const o = w.octokit();
   const before = w.total();
@@ -243,7 +246,7 @@ function tick(
     checksOctokit: o,
     owner: "o",
     repo: "r",
-    policy: { ...POLICY, ...(opts.rereview ? { rereviewLabel: "re-review" } : {}) },
+    policy: { ...POLICY, ...(opts.rereview ? { rereviewLabel: "re-review" } : {}), ...(opts.quiet ? { verdictChecks: [QUIET_CHECK], verdictApp: QUIET_APP } : {}) },
     checkName: CHECK,
     checkApp: APP,
     baseBranch: "main",
@@ -726,5 +729,79 @@ describe("0.4.1: the re-review label at the gate", () => {
     await tick(w, { prNumber: 1 });
     expect(current(w, 1, "success")).toBe(true);
     expect(w.calls["issues.listEvents"]).toBeUndefined();
+  });
+});
+
+describe("quiet_verdicts: a verdict delivered as a check run", () => {
+  // After the fake head commit (11-15), before the fake clock.
+  const T = (h: number) => `2026-11-16T${String(h).padStart(2, "0")}:00:00Z`;
+  const quiet = (word: string, at: string, over: object = {}) => ({
+    name: QUIET_CHECK, status: "completed", conclusion: "success", app: QUIET_APP, completed_at: at, output: { title: `Verdict: ${word}`, summary: "Looks right." }, ...over,
+  });
+
+  it("a head with only a quiet APPROVE gets its result — and a rerun of the gate changes nothing", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "success")).toBe(true);
+    const before = w.checks.map((c) => ({ ...c }));
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(w.checks).toEqual(before);
+  });
+
+  it("is not CI: the quiet check itself is left out of the rollup", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1), status: "in_progress", conclusion: null } as any, { ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("a later REQUEST_CHANGES review overrides an earlier quiet APPROVE", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "REQUEST_CHANGES", verdictAt: T(11) });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "failure")).toBe(true);
+  });
+
+  it("…and a later quiet APPROVE overrides an earlier rejection review", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "REQUEST_CHANGES", verdictAt: T(9) });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("a check of the same name from another App is no verdict", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10), { app: "someone-else" }), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(w.result(1)).toBeUndefined();
+  });
+
+  it("off (no verdict-checks): a quiet check is no verdict, and no extra read is made", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    const before = w.calls["checks.listForRef"] ?? 0;
+    await tick(w, { prNumber: 1 });
+    expect(w.result(1)).toBeUndefined();
+    // One read of the head's checks (the CI rollup), as before.
+    expect((w.calls["checks.listForRef"] ?? 0) - before).toBe(1);
+  });
+
+  it("a re-review request makes an earlier quiet verdict stale; a fresh one ends it", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, labels: ["re-review"], rereviewAt: T(11) });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true, rereview: true });
+    expect(w.result(1)!.status).toBe("in_progress");
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(12)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true, rereview: true });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.prs.get(1)!.labels).toEqual([]);
   });
 });
