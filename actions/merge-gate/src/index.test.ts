@@ -67,7 +67,7 @@ interface World {
   verdictBody?: string;
   threads: unknown[];
   /** The head's CI check runs (default: one green `ci`). */
-  ci?: { id: number; name: string; status: string; conclusion: string | null; app: { slug: string } }[];
+  ci?: { id: number; name: string; status: string; conclusion: string | null; app: { slug: string }; details_url?: string }[];
   existing: { id: number; name: string; status: string; conclusion: string; app: { slug: string }; output: { summary: string; text: string } }[];
 }
 
@@ -79,6 +79,7 @@ function makeOctokit(world: World) {
   };
   const pr = {
     number: 7,
+    state: "open",
     title: "Add widget",
     draft: world.draft ?? false,
     head: { sha: HEAD, ref: world.headRef ?? "agent/widget" },
@@ -730,6 +731,50 @@ describe("the single gate (merge=)", () => {
     });
   });
 
+  // Trajectory's formal-approval workflow calls the original gate for one PR with
+  // dry-run, from its OWN workflow run: the gate's job never shares its run id,
+  // so only the name rule (job-check-name) can leave that job out of CI.
+  describe("the original gate for one PR, called from another workflow", () => {
+    const legacy = (ci: World["ci"], jobCheckName?: string) => {
+      setup({ ci, reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "ok\n\n**Verdict:** APPROVE" }] });
+      inputs.mode = "";
+      inputs["pr-number"] = "7";
+      inputs["dry-run"] = "true";
+      if (jobCheckName) inputs["job-check-name"] = jobCheckName;
+    };
+    const green = { id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } };
+    const gateJob = (id: number, status: string, conclusion: string | null) => ({
+      id, name: "gate", status, conclusion, app: { slug: "github-actions" }, details_url: `https://github.com/o/r/actions/runs/${id}/job/1`,
+    });
+
+    it.each([
+      ["in progress", gateJob(50, "in_progress", null)],
+      ["cancelled", gateJob(51, "completed", "cancelled")],
+      ["timed out", gateJob(52, "completed", "timed_out")],
+    ])("leaves a gate job %s out of CI by its name", async (_label, job) => {
+      process.env.GITHUB_RUN_ID = "999";
+      try {
+        legacy([green, job], "gate");
+        await run();
+        expect(failures).toEqual([]);
+        expect(outputs.code).toBe("ready-to-merge");
+        // Without the name, the same job is CI.
+        legacy([green, job]);
+        await run();
+        expect(outputs.code).not.toBe("ready-to-merge");
+      } finally {
+        delete process.env.GITHUB_RUN_ID;
+      }
+    });
+
+    it("still counts any other check that is not done", async () => {
+      legacy([green, { id: 3, name: "rerun", status: "in_progress", conclusion: null, app: { slug: "github-actions" } }], "gate");
+      await run();
+      expect(outputs.code).not.toBe("ready-to-merge");
+      expect(writes()).toEqual([]);
+    });
+  });
+
   it("without merge=, the original gate is untouched: it merges by branch prefix and publishes nothing", async () => {
     setup({ author: ALICE, headRef: "agent/by-a-person", reviews: [{ submitted_at: "2026-01-01T00:00:00Z", state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: "ok\n\n**Verdict:** APPROVE" }] });
     inputs.mode = "";
@@ -755,6 +800,32 @@ describe("sign-off on a policy handoff (handoff_clauses)", () => {
     expect(failures).toEqual([]);
     return stub.calls.find((c) => c.method === "checks.create")?.params;
   };
+
+  // An event run leaves a result alone while CI is pending only when pending CI
+  // is all that keeps the head from success. Here the sign-off that made it
+  // success is dismissed while another workflow's job is still running: the
+  // handoff is outstanding again, and the stale success must not stand.
+  it("an event run while CI is pending still replaces a success whose sign-off was dismissed", async () => {
+    setup(
+      {
+        reviews: [botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2), formal("bob", "DISMISSED", 3)],
+        ci: [
+          { id: 1, name: "ci", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: 2, name: "rerun", status: "in_progress", conclusion: null, app: { slug: "github-actions" } },
+        ],
+        existing: [{ id: 9, name: CHECK, status: "completed", conclusion: "success", app: { slug: "github-actions" }, output: { summary: "Ready", text: "" } }],
+      },
+      HANDOFF,
+    );
+    delete inputs.mode;
+    inputs.merge = "off";
+    inputs["pr-number"] = "7";
+    await run();
+    expect(failures).toEqual([]);
+    const update = stub.calls.find((c) => c.method === "checks.update")?.params;
+    expect(update?.check_run_id).toBe(9);
+    expect(update?.conclusion).not.toBe("success");
+  });
 
   it("an outstanding handoff is action_required and says what would sign it off", async () => {
     const c = await evaluate({ reviews: [botVerdict("APPROVE")] });

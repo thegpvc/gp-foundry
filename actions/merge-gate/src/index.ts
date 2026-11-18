@@ -1054,14 +1054,17 @@ export async function runHybridGate(opts: {
       const out = renderCheckOutput(decision, facts, checkPolicy, checkName);
       // An event run lands while the same event's other workflows are still
       // starting on this head (a review or label starts them too), so CI that is
-      // merely pending says nothing yet. When pending CI is the only thing that
-      // changes the result, an event run publishes nothing and leaves the head's
-      // existing result: the scheduled pass, or the next event, settles it.
-      // Failed CI, or any other failing clause, is published as before.
+      // merely pending says nothing yet. When pending CI is all that stands
+      // between this head and success, an event run publishes nothing and leaves
+      // the head's existing result: the scheduled pass, or the next event, settles
+      // it. Only then: with anything else outstanding (a failing clause, a policy
+      // handoff no longer signed off) the result is published as before, or a
+      // stale success would stand.
       const ciPendingOnly =
         opts.prNumber !== undefined &&
         facts.ciStatus === "pending" &&
-        checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion !== out.conclusion;
+        out.conclusion !== "success" &&
+        checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion === "success";
       // Say, on the PR, who will merge it — the one thing the result alone does not.
       if (opts.merge === "agent-only") {
         const line = onDependabotLane
