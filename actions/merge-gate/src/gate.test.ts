@@ -522,6 +522,28 @@ describe("firstProtectedPath", () => {
   it("returns undefined when nothing is protected", () => {
     expect(firstProtectedPath([{ path: "src/x.ts", additions: 1 }], ["terraform/"])).toBeUndefined();
   });
+
+  describe("protectedPathExcludeGlobs", () => {
+    const tests = ["**/*_test.go", "**/testdata/**"];
+    it("a diff only of excluded files under a protected path is not protected", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 40 }, { path: "pkg/auth/testdata/a.json", additions: 5 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"], tests)).toBeUndefined();
+    });
+    it("one non-excluded file under the protected path still is", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 40 }, { path: "pkg/auth/token.go", additions: 1 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"], tests)).toBe("pkg/auth/");
+    });
+    it("is read from merge.yaml as protected_path_exclude_globs", () => {
+      const policy = normalizePolicyKeys({ protected_paths: ["pkg/auth/"], protected_path_exclude_globs: tests }) as MergePolicy;
+      expect(policy.protectedPathExcludeGlobs).toEqual(tests);
+      expect(firstProtectedPath([{ path: "pkg/auth/x_test.go", additions: 1 }], policy.protectedPaths, policy.protectedPathExcludeGlobs)).toBeUndefined();
+    });
+    it("empty or absent: unchanged", () => {
+      const files = [{ path: "pkg/auth/token_test.go", additions: 1 }];
+      expect(firstProtectedPath(files, ["pkg/auth/"])).toBe("pkg/auth/");
+      expect(firstProtectedPath(files, ["pkg/auth/"], [])).toBe("pkg/auth/");
+    });
+  });
 });
 
 describe("parseTimestamp", () => {

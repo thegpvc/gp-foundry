@@ -53,7 +53,9 @@ has given a verdict.
 9. **Hand-written additions** — additions of non-`excludeGlobs` files must be
    `<= maxAdditions`, else apply `labels.needsHuman`.
 10. **Protected paths** — no changed file may match `protectedPaths`, else apply
-   `labels.needsHuman`.
+   `labels.needsHuman`. Files matching `protectedPathExcludeGlobs` (e.g. tests under a
+   protected package) are left out of this check only; they still count towards
+   `maxAdditions` unless `excludeGlobs` covers them too.
 11. **Clean rebase** — the branch must rebase cleanly onto the base branch
    (unless `requireCleanRebase: false`), else apply `labels.rebaseNeeded`.
 
@@ -298,6 +300,8 @@ protectedPaths:
   - "db/migrations/"
   - ".github/workflows/"
   - "terraform/"
+protectedPathExcludeGlobs:   # optional: not "protected" even under a protected path
+  - "**/*_test.go"
   - "CLAUDE.md"
   - "scope.yaml"
 blockingLabels:

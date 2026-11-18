@@ -48,6 +48,10 @@ exclude_globs:
 # Protected paths — touching any of these blocks auto-merge (labels needs-human).
 protected_paths:
   - ".github/"
+# Files left out of the protected-path check only (e.g. tests under a protected package).
+# They still count towards max_additions. Default: none.
+# protected_path_exclude_globs:
+#   - "**/*_test.go"
 
 # Rebase / conflicts.
 #  - require_clean_rebase: false — GitHub's mergeable_state is computed async and races

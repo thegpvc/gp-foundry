@@ -157,6 +157,12 @@ export interface MergePolicy {
    */
   protectedPaths?: string[];
   /**
+   * Globs whose matching files are left out of the protected-path check only
+   * (e.g. tests under a protected package: ["**\/*_test.go"]). They still count
+   * towards maxAdditions unless excludeGlobs also covers them. Default: none.
+   */
+  protectedPathExcludeGlobs?: string[];
+  /**
    * Labels that disqualify a PR outright (e.g. ["needs-human",
    * "rebase-needed"]). A PR carrying any of these is skipped.
    */
@@ -502,11 +508,15 @@ export function handWrittenAdditions(files: PrFile[], excludeGlobs?: string[]): 
   }, 0);
 }
 
-/** First protected path a changed file touches, or undefined. */
-export function firstProtectedPath(files: PrFile[], protectedPaths?: string[]): string | undefined {
+/**
+ * First protected path a changed file touches, or undefined. Files matching
+ * `excludeGlobs` (the policy's protectedPathExcludeGlobs) are not considered.
+ */
+export function firstProtectedPath(files: PrFile[], protectedPaths?: string[], excludeGlobs?: string[]): string | undefined {
   if (!protectedPaths || protectedPaths.length === 0) return undefined;
+  const considered = files.filter((f) => !anyGlobMatches(excludeGlobs, f.path));
   for (const pattern of protectedPaths) {
-    if (files.some((f) => globMatch(pattern, f.path))) return pattern;
+    if (considered.some((f) => globMatch(pattern, f.path))) return pattern;
   }
   return undefined;
 }
@@ -970,7 +980,7 @@ function evaluateDependabotLane(
       detail: { handAdditions },
     };
   }
-  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+  const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths, policy.protectedPathExcludeGlobs);
   if (protectedPath) {
     return {
       action: needsHumanLabel ? "label" : "skip",
@@ -1171,7 +1181,7 @@ const AGENT_LANE_CLAUSES: Clause[] = [
   // 7) Protected paths untouched
   (pr, policy) => {
     const needsHumanLabel = policy.labels?.needsHuman;
-    const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths);
+    const protectedPath = firstProtectedPath(pr.files, policy.protectedPaths, policy.protectedPathExcludeGlobs);
     if (!protectedPath) return undefined;
     return {
       action: needsHumanLabel ? "label" : "skip",
