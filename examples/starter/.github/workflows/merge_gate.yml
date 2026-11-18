@@ -39,7 +39,7 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: false
       - name: Evaluate merge gate (publish check, never merge)
-        uses: thegpvc/gp-foundry/actions/merge-gate@v0.3.2
+        uses: thegpvc/gp-foundry/actions/merge-gate@v0.4.0
         with:
           merge: "off"
           check-name: gp-foundry/approval (merge_gate)
