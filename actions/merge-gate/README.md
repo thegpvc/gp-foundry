@@ -243,7 +243,9 @@ instead of a review, so a clean PR's timeline stays quiet. The gate reads it as 
 verdict when `verdict-checks` names it (the compiler writes it) and its app is
 `verdict-app`; any other app's run of the same name is ignored, and it is never CI.
 "Latest verdict wins" still holds across both kinds: the check counts at its
-`completed_at`, a review at its `submitted_at`.
+`completed_at`, a review at its `submitted_at`. A check run starts no gate run the way a
+review's event does, so the lane's post step dispatches the gate with the PR as its `pr`
+input (`pr-number` falls back to it), and the scheduled pass covers a failed dispatch.
 
 **Reading a verdict yourself** (a formal-approval publisher, a dashboard). The latest
 verdict on a head is the newest of:

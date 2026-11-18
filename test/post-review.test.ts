@@ -120,19 +120,21 @@ describe('validate: post= and post_marker=', () => {
 const GH_STUB = `#!/usr/bin/env bash
 [ "$1" = "api" ] || { echo "stub gh: unsupported: $*" >&2; exit 2; }
 shift
-path=""; jqexpr=""; method="GET"; input=""
+path=""; jqexpr=""; method="GET"; input=""; fields="{}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) jqexpr="$2"; shift 2 ;;
     --method) method="$2"; shift 2 ;;
     --input) input="$2"; shift 2 ;;
+    -f) fields=$(jq -c --arg kv "$2" '. + {($kv | split("=") | .[0]): ($kv | split("=") | .[1:] | join("="))}' <<< "$fields"); shift 2 ;;
     --paginate) shift ;;
     *) path="$1"; shift ;;
   esac
 done
 LINE_422='{"message":"Unprocessable Entity","errors":["Line could not be resolved"],"documentation_url":"https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request","status":"422"}'
 if [ "$method" != "GET" ]; then
-  { echo "$method $path"; cat "$input"; echo; } >> "$FIXTURES/writes.log"
+  { echo "$method $path"; if [ -n "$input" ]; then cat "$input"; else echo "$fields"; fi; echo; } >> "$FIXTURES/writes.log"
+  if [ -n "\${STUB_DISPATCH_FAIL:-}" ] && [[ "$path" == */dispatches ]]; then echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1; fi
   # A rejection in gh's real shape: GitHub's error body on STDOUT, and only
   # gh's one-line summary on stderr.
   if [ -n "\${STUB_422_ALWAYS:-}" ] || { [ -n "\${STUB_422_IF_COMMENTS:-}" ] && [ "$(jq '.comments | length' "$input")" != "0" ]; }; then
@@ -680,5 +682,39 @@ describe("quiet_verdicts: a verdict that needs nothing from the author is a chec
     const off = stepNamed(job(SWEEP, "approver"), "Post the review");
     expect(off.run).not.toContain("quiet_verdicts");
     expect(off.env.VERDICT_CHECK).toBeUndefined();
+  });
+});
+
+describe("quiet_verdicts: the gate is nudged, since a check run starts no gate run", () => {
+  const APP_CFG = { identity: { bot_login: BOT, app_id_secret: "APP_ID", app_key_secret: "APP_KEY" }, rollout: {} } as Partial<FoundryConfig>;
+  const WITH_GATE = `digraph t {
+  approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/10 * * * *", post="review", quiet_verdicts="APPROVE"]
+  merge_gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="off"]
+}`;
+  const step = () => {
+    const { files } = compile(mkHarness(WITH_GATE, APP_CFG));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/approver.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.approver, "Post the review");
+  };
+  const approve = { body: "Looks right.\n\n**Verdict:** APPROVE" };
+
+  it("after delivering the check, dispatches the gate for this PR with the job's own token", () => {
+    const s = step();
+    expect(s.env).toMatchObject({ GATE_WORKFLOWS: "merge_gate.yml", DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: "main" });
+    const r = runPost(s, fence(approve), [], { DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs", "POST repos/o/r/actions/workflows/merge_gate.yml/dispatches"]);
+    expect(r.writes[1]!.body).toEqual({ ref: "main", "inputs[pr]": "7" });
+  });
+
+  it("a failed dispatch is a warning: the verdict is delivered, the scheduled pass catches up", () => {
+    const r = runPost(step(), fence(approve), [], { STUB_DISPATCH_FAIL: "1", DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("its scheduled pass will evaluate it");
+  });
+
+  it("a review-delivered verdict dispatches nothing: its own event starts the gate", () => {
+    const r = runPost(step(), fence({ body: "No.\n\n**Verdict:** REQUEST_CHANGES" }), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/pulls/7/reviews"]);
   });
 });

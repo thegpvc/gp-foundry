@@ -1,0 +1,15 @@
+# The verdict-lanes fixture with quiet_verdicts="APPROVE" on the approver: a snapshot
+# of the on-mode output, linted by CI (actionlint) like the examples.
+name: verdict-lanes-quiet
+identity:
+  app_id_secret: AGENT_APP_ID
+  app_key_secret: AGENT_APP_PRIVATE_KEY
+  bot_login: agent-app[bot]
+  git_name: agent-app[bot]
+repo:
+  base_branch: main
+labels:
+  re_review: re-review
+rollout: {}
+runtime:
+  ref: fixture-ref

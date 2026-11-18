@@ -18,6 +18,7 @@ import { parseRollout } from "../shared/scope.js";
 import type { MergeSetting } from "./attrs.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
+  nudgedGatesOf,
   quietVerdictsOf,
   verdictChecksOf,
   rereviewLabelOf,
@@ -179,6 +180,9 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // the App token must be allowed to write (the job's own token is untouched).
   const quiet = quietVerdictsOf(node, ctx.config);
   const app = appTokenStep(ctx, appScope(node, quiet ? { ...permissions, checks: "write" } : permissions));
+  // …and nudges the gate with the job's own token, which may start a workflow by
+  // dispatch (and needs no new App permission).
+  if (quiet && nudgedGatesOf(ctx.nodes ?? [], ctx.config).length) permissions.actions = "write";
   if (app) steps.push(app);
 
   // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
@@ -738,7 +742,9 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ...(rereview ? { "rereview-label": rereview } : {}),
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
-      "pr-number": "${{ github.event.pull_request.number }}",
+      "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).some((g) => g.id === node.id)
+        ? "${{ github.event.pull_request.number || inputs.pr }}"
+        : "${{ github.event.pull_request.number }}",
       // The schedule's period: the pass's window moves once per period.
       "rotation-period-seconds": String(cronPeriodSeconds(String(node.attrs.schedule ?? ""))),
       // Leave the job two minutes to finish the PR it is on and exit cleanly.

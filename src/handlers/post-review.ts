@@ -6,7 +6,7 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, nudgedGatesOf, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 import { LABEL_EVENTS_JQ } from "../shared/rereview.js";
 
@@ -261,6 +261,17 @@ if jq -e '__IS_QUIET_JQ__' <<< "$REVIEW" > /dev/null; then
     echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
     URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
     if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \\\`$VERDICT_CHECK\\\` on $HEAD_SHA."; fi
+    # A check run starts no gate run (a review would, by its event): nudge each
+    # gate to evaluate this PR now. Best effort — the gate's scheduled pass
+    # reaches it anyway.
+    for WF in \${GATE_WORKFLOWS:-}; do
+      if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" \\
+          -f ref="$BASE_BRANCH" -f "inputs[pr]=$PR" > /dev/null 2> "$ERR"; then
+        echo "asked $WF to evaluate #$PR now"
+      else
+        echo "::warning::could not start $WF for #$PR ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — its scheduled pass will evaluate it"
+      fi
+    done
     exit 0
   fi
   echo "::error::could not deliver the verdict as a check: $(why)"
@@ -275,6 +286,7 @@ export function postReviewStep(
   opts: { prNumber: string; headSha: string; verdictLane: boolean },
 ): StepSpec {
   const quiet = opts.verdictLane ? quietVerdictsOf(ctx.node, ctx.config) : undefined;
+  const gates = quiet ? nudgedGatesOf(ctx.nodes ?? [], ctx.config) : [];
   let marker = DEFAULT_POST_MARKER;
   try {
     marker = parsePostMarker(ctx.node);
@@ -297,6 +309,9 @@ export function postReviewStep(
       VERDICT_LINES: verdictLinesOf(ctx.config),
       ...(rereviewLabelOf(ctx.config) ? { REREVIEW_LABEL: rereviewLabelOf(ctx.config)! } : {}),
       ...(quiet ? { QUIET_LINES: quiet.lines, VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
+      ...(quiet && gates.length
+        ? { GATE_WORKFLOWS: gates.map((g) => `${g.id}.yml`).join(" "), DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: ctx.config.repo.base_branch }
+        : {}),
     },
     // Off, the quiet blocks vanish with their lines: the script is byte-identical.
     run: SCRIPT.replace("__QUIET_EXISTING__\n", () => (quiet ? QUIET_EXISTING : ""))

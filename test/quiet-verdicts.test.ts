@@ -53,6 +53,24 @@ describe("off: the compiled output is byte-identical to before quiet verdicts ex
   });
 });
 
+describe("on: the verdict-lanes-quiet snapshot is what this compiler generates (CI lints it)", () => {
+  it("every file", () => {
+    const qbase = join(root, "test/fixtures/verdict-lanes-quiet/.github");
+    const { harness, parseErrors } = loadHarness(join(qbase, "harness.dot"), join(qbase, "agents/foundry.config.yaml"));
+    expect(parseErrors).toEqual([]);
+    const qread = (rel: string) => {
+      try {
+        return readFileSync(join(qbase, rel), "utf8");
+      } catch {
+        return undefined;
+      }
+    };
+    const out = compile(harness, { readFile: qread }, { specDir: ".github" }).files;
+    const drift = out.filter((f) => readFileSync(join(root, "test/fixtures/verdict-lanes-quiet", f.path), "utf8") !== f.contents).map((f) => f.path);
+    expect(drift).toEqual([]);
+  });
+});
+
 describe("on: the wiring", () => {
   const h = () => fixture(QUIET);
 
@@ -75,6 +93,16 @@ describe("on: the wiring", () => {
     const gate = wf(h(), "gate").jobs.gate.steps.find((s: any) => String(s.uses ?? "").includes("merge-gate")).with;
     expect(gate["verdict-checks"]).toBe("gp-foundry/verdict (approver)");
     expect(gate["verdict-app"]).toBe("agent-app");
+  });
+
+  it("the gate takes the PR to evaluate as a dispatch input, in that PR's concurrency slot", () => {
+    const gate = wf(h(), "gate");
+    expect(gate.on.workflow_dispatch.inputs.pr).toMatchObject({ required: false, type: "string" });
+    expect(gate.concurrency.group).toBe("${{ (github.event.pull_request.number || inputs.pr) && format('gate-pr-{0}', (github.event.pull_request.number || inputs.pr)) || 'gate' }}");
+    expect(gate.concurrency["cancel-in-progress"]).toBe("${{ (github.event.pull_request.number || inputs.pr) && true || false }}");
+    expect(gate.jobs.gate.steps.find((s: any) => String(s.uses ?? "").includes("merge-gate")).with["pr-number"]).toBe("${{ github.event.pull_request.number || inputs.pr }}");
+    // The approver may dispatch it with its own token.
+    expect(wf(h(), "approver").jobs.approver.permissions.actions).toBe("write");
   });
 
   it("verdict_check= names the check", () => {

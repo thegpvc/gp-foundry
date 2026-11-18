@@ -67,14 +67,15 @@ jobs:
             https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash)
           echo "$PWD" >> "$GITHUB_PATH"
 
-      # Lints this repo's workflows AND any generated example harness workflows.
+      # Lints this repo's workflows AND any generated harness workflows (the examples
+      # and the compiled test fixtures).
       # -shellcheck= disables shellcheck (not installed here); config-loader-like
       # generated files are covered by the same pass.
       - name: Run actionlint
         run: |
           shopt -s nullglob globstar
           files=( .github/workflows/*.yml .github/workflows/*.yaml )
-          gen=( examples/**/.github/workflows/*.yml examples/**/.github/workflows/*.yaml )
+          gen=( examples/**/.github/workflows/*.yml examples/**/.github/workflows/*.yaml test/fixtures/**/.github/workflows/*.yml )
           if [ ${#gen[@]} -gt 0 ]; then
             files+=( "${gen[@]}" )
           fi

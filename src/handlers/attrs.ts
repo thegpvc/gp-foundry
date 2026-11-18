@@ -458,6 +458,17 @@ export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { che
   return qs.length ? { checks: [...new Set(qs.map((q) => q.check))], app: qs[0]!.app } : undefined;
 }
 
+/**
+ * The single gates (merge=) a quiet verdict nudges. A verdict review starts the
+ * gate through its pull_request_review event; a check run created by the App
+ * starts nothing, so the post step dispatches each of these for the PR instead.
+ * Empty when the graph has no quiet verdicts — and then nothing about the gates changes.
+ */
+export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
+  if (!verdictChecksOf(nodes, cfg)) return [];
+  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined);
+}
+
 /** Default heading the post step puts on line 1 of the review: placeholders `<n>` and `<sha>`. */
 export const DEFAULT_POST_MARKER = "PR #<n> head <sha>";
 
