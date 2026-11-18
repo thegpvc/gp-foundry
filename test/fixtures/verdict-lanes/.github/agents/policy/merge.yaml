@@ -1,0 +1,4 @@
+bot_login: "agent-app[bot]"
+require_ci: true
+protected_paths:
+  - ".github/"
