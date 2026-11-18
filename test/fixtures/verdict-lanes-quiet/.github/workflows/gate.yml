@@ -30,11 +30,11 @@ permissions:
   contents: read
 jobs:
   gate:
-    name: gp-foundry gate (gate)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'agent-app[bot]'))
     permissions:
       contents: read
+      actions: read
     timeout-minutes: 10
     steps:
       - name: Mint app token
@@ -54,7 +54,8 @@ jobs:
         with:
           merge: agent-only
           check-name: gp-foundry/approval (gate)
-          job-check-name: gp-foundry gate (gate)
+          job-check-name: gate
+          gate-workflow: .github/workflows/gate.yml
           token: ${{ steps.app-token.outputs.token }}
           checks-token: ${{ steps.app-token.outputs.token }}
           check-app: ${{ steps.app-token.outputs.app-slug }}

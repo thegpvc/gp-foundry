@@ -177,10 +177,12 @@ last, removes the label (its `unlabeled` event starts another gate run, which mu
 this one mid-merge). If the label's history cannot be read, the check is held the same way.
 The token needs `issues: write` (or `pull-requests: write`) to remove it.
 
-**Its own job** is named `gp-foundry gate (<node>)` (the `job-check-name` input), a name no CI
-job would carry: every `github-actions` check run of that name is left out of the CI rollup.
-On the PR that adds the harness the base branch has no policy yet; an event run there is a
-notice, not a failure.
+**Its own job** is named after its node, like every lane's (the `job-check-name` input), so
+its check groups with theirs. A CI job may share that name: a `github-actions` run of it is
+left out of the CI rollup only when its workflow run is of the gate's own file
+(`gate-workflow`), read once per run with `actions-token` (the job's `GITHUB_TOKEN`,
+`actions: read`). On the PR that adds the harness the base branch has no policy yet; an
+event run there is a notice, not a failure.
 
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.

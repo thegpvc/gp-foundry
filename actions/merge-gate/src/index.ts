@@ -142,6 +142,10 @@ export interface GateRun {
   runId?: string;
   /** The check-run name GitHub Actions gives the gate's job (the compiler passes it): any earlier run of it. */
   jobCheckName?: string;
+  /** The gate's workflow file (`gate-workflow`): a run named like its job must be of this workflow. */
+  workflowPath?: string;
+  /** Reads a workflow run's file (`actions-token`, default GITHUB_TOKEN with `actions: read`). */
+  actionsOctokit?: Octokit;
 }
 
 /** The workflow run a GitHub Actions check run belongs to, from its details or html URL (`…/actions/runs/<id>/job/<id>`). */
@@ -155,32 +159,77 @@ export function actionsRunId(c: { details_url?: string | null; html_url?: string
 
 /**
  * Is this check run the gate's own job — this run, or an earlier run of the gate
- * workflow (in progress, cancelled or timed out)? Only GitHub Actions check runs
- * qualify (an Actions job is always written by the `github-actions` app), then:
+ * workflow (in progress, cancelled, timed out or failed)? Only GitHub Actions
+ * check runs qualify (an Actions job is always written by the `github-actions`
+ * app), then:
  *
- *   - its details/html URL names this workflow run (GITHUB_RUN_ID), or
- *   - its name is the gate job's own check-run name.
+ *   - "own": its details/html URL names this workflow run (GITHUB_RUN_ID);
+ *   - "candidate": its name is the gate job's name. The job is named after its
+ *     node like every lane's (so its check groups with theirs), which a CI job
+ *     may share — so with the gate's workflow file known (`gate-workflow`), a
+ *     candidate is the gate's own only once its workflow run turns out to be that
+ *     file (gateRunsOnly). Without it (a hand-written setup), the name decides,
+ *     as before. 0.5.0 named the job `gp-foundry gate (<node>)`; runs under that
+ *     name still on a head are candidates too.
  *
- * The second rule also drops a job of that name in ANOTHER workflow from the
- * rollup, so the compiler gives the gate's job a name no CI job would carry:
- * `gp-foundry gate (<node>)`. The gate's published result (`check-name`) is left
- * out by name separately.
- *
- * Before 0.5.0 the job was named after its node alone. Runs of that name still
- * on an open PR's head after an upgrade — in progress, or cancelled by the first
- * run under the new name — are the gate's own too. Only those states: a
- * completed run of that name that passed or failed may be a CI job, and is CI.
+ * The gate's published result (`check-name`) is left out by name separately.
  */
-export function isOwnGateRun(
-  c: { name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null; details_url?: string | null; html_url?: string | null },
+export function classifyGateRun(
+  c: { name?: string | null; app?: { slug?: string | null } | null; details_url?: string | null; html_url?: string | null },
   self: GateRun | undefined,
-): boolean {
-  if (!self || c.app?.slug !== CHECK_APP) return false;
-  if (self.runId && actionsRunId(c) === self.runId) return true;
-  if (!self.jobCheckName) return false;
-  if (c.name === self.jobCheckName) return true;
-  const legacy = /^gp-foundry gate \((.+)\)$/.exec(self.jobCheckName)?.[1];
-  return !!legacy && c.name === legacy && (c.status !== "completed" || c.conclusion === "cancelled");
+): "own" | "candidate" | "not" {
+  if (!self || c.app?.slug !== CHECK_APP) return "not";
+  if (self.runId && actionsRunId(c) === self.runId) return "own";
+  if (!self.jobCheckName) return "not";
+  const names = self.workflowPath ? [self.jobCheckName, `gp-foundry gate (${self.jobCheckName})`] : [self.jobCheckName];
+  if (!names.includes(c.name ?? "")) return "not";
+  return self.workflowPath ? "candidate" : "own";
+}
+
+/** Sync form, for a caller that cannot look a run up: a candidate counts as own (the name rule). */
+export function isOwnGateRun(c: Parameters<typeof classifyGateRun>[0], self: GateRun | undefined): boolean {
+  return classifyGateRun(c, self) !== "not";
+}
+
+/** Workflow file per workflow run id, for the life of this action run. */
+const workflowOfRun = new Map<string, string | null>();
+
+/**
+ * Drop the gate's own runs from a head's check runs. A candidate (named like the
+ * gate's job) is looked up — one read per workflow run, cached — and dropped only
+ * if that run is of the gate's workflow file. If the lookup fails, the name rule
+ * stands in, with a warning: as it was before the job shared its name with lanes.
+ */
+export async function withoutGateRuns<T extends Parameters<typeof classifyGateRun>[0]>(
+  runs: T[],
+  self: GateRun | undefined,
+  actionsOctokit: Octokit,
+  owner: string,
+  repo: string,
+): Promise<T[]> {
+  const kept: T[] = [];
+  for (const c of runs) {
+    const k = classifyGateRun(c, self);
+    if (k === "own") continue;
+    if (k === "candidate") {
+      const runId = actionsRunId(c);
+      let path: string | null | undefined = runId ? workflowOfRun.get(runId) : null;
+      if (runId && path === undefined) {
+        try {
+          const { data } = await actionsOctokit.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) });
+          path = data.path ?? null;
+        } catch (e) {
+          core.warning(`could not tell whether \`${c.name}\` (run ${runId}) is the gate's own job — treating it as the gate's: ${(e as Error).message}`);
+          path = self!.workflowPath!;
+        }
+        workflowOfRun.set(runId, path);
+      }
+      // A workflow run's path can carry a ref (`…/gate.yml@refs/heads/main`).
+      if ((path ?? "").replace(/@.*$/, "") === self!.workflowPath) continue;
+    }
+    kept.push(c);
+  }
+  return kept;
 }
 
 // GraphQL is the only API with thread resolution; same shape as agent-context's
@@ -458,7 +507,7 @@ export async function gatherFacts(
   // The gate's own job is not CI: this run is in progress while it reads, and an
   // earlier run of the gate cancelled by a newer event would otherwise read as
   // failing CI. Dropped before anything else reads the list (see isOwnGateRun).
-  checkRunsRaw = checkRunsRaw.filter((c) => !isOwnGateRun(c, self));
+  checkRunsRaw = await withoutGateRuns(checkRunsRaw, self, self?.actionsOctokit ?? checksOctokit, owner, repo);
   // Superseded attempts are history: judge only the newest attempt of each check, in
   // both the rollup and the requiredChecks gate below.
   checkRunsRaw = latestAttemptPerCheck(checkRunsRaw);
@@ -1230,7 +1279,14 @@ export async function runHybridGate(opts: {
 function gateRunFromEnv(): GateRun {
   const runId = (process.env.GITHUB_RUN_ID ?? "").trim();
   const jobCheckName = core.getInput("job-check-name").trim();
-  return { ...(runId ? { runId } : {}), ...(jobCheckName ? { jobCheckName } : {}) };
+  const workflowPath = core.getInput("gate-workflow").trim();
+  const actionsToken = core.getInput("actions-token").trim();
+  return {
+    ...(runId ? { runId } : {}),
+    ...(jobCheckName ? { jobCheckName } : {}),
+    ...(workflowPath ? { workflowPath } : {}),
+    ...(workflowPath && actionsToken ? { actionsOctokit: github.getOctokit(actionsToken) } : {}),
+  };
 }
 
 export async function run(): Promise<void> {

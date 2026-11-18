@@ -674,11 +674,6 @@ function verdictCheckInputs(ctx: EmitContext): Record<string, string> {
   return v ? { "verdict-checks": v.checks.join("\n"), "verdict-app": v.app } : {};
 }
 
-/** The single gate's job name — and so its check run's name on a PR head. */
-export function gateJobName(nodeId: string): string {
-  return `gp-foundry gate (${nodeId})`;
-}
-
 function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: string[]): WorkflowJobFragment {
   const node = ctx.node;
   const merging = merge === "agent-only";
@@ -724,9 +719,11 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       merge,
       "check-name": checkName,
       // This job's own check run is on the PR's head during an event run; it is
-      // not CI. The gate leaves out every github-actions run of this name, so the
-      // name is one no CI job would have (a bare node id like `gate` could be).
-      "job-check-name": gateJobName(node.id),
+      // not CI. The job is named after its node, like every lane's, so its check
+      // groups with theirs — and a CI job may share that name, so the gate also
+      // checks that a run of this name is of its own workflow file.
+      "job-check-name": node.id,
+      "gate-workflow": `.github/workflows/${node.id}.yml`,
       // Merging (and its labels) goes out under the harness identity so it is
       // attributable and its events cascade; a gate that never merges only reads.
       token: merging || app ? tokenExpr(ctx) : "${{ github.token }}",
@@ -755,15 +752,16 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   return {
     jobId: node.id,
     name: node.id,
-    displayName: gateJobName(node.id),
     // Under App auth the App token does everything the gate does — reads the PRs,
     // writes the check, merges — so the job's GITHUB_TOKEN is left with the one
     // thing it is used for: checking out the policy file.
+    // `actions: read`: the job's own token reads which workflow a run named like
+    // the gate's job belongs to (gate-workflow) — no App permission needed.
     permissions: app
-      ? { contents: "read" }
+      ? { contents: "read", actions: "read" }
       : merging
-        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write" }
-        : { contents: "read", "pull-requests": "read", checks: "write", ...(rereview ? { issues: "write" as const } : {}) },
+        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write", actions: "read" }
+        : { contents: "read", "pull-requests": "read", checks: "write", actions: "read", ...(rereview ? { issues: "write" as const } : {}) },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
   };

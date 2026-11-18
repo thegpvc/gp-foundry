@@ -60,6 +60,8 @@ class World {
   calls: Record<string, number> = {};
   /** Every call, in order. */
   order: string[] = [];
+  /** Workflow file per workflow run id (actions.getWorkflowRun); unmapped: the read fails. */
+  workflowOf: Record<string, string> = {};
   failSearch = false;
   /** The search honours `-label:"…"` (real GitHub does); off, only the gate's own scope test filters. */
   honourLabelExclusion = true;
@@ -149,6 +151,13 @@ class World {
         return { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }, reviewDecision: null } } };
       },
       rest: {
+        actions: {
+          getWorkflowRun: call("actions.getWorkflowRun", ({ run_id }: any) => {
+            const path = w.workflowOf[String(run_id)];
+            if (path === undefined) throw new Error("HTTP 404");
+            return { path };
+          }),
+        },
         pulls: {
           list: call("pulls.list", () => [...w.prs.values()].filter((p) => (p.state ?? "open") === "open").sort((a, b) => a.number - b.number).map((p) => w.prJson(p))),
           get: async ({ pull_number }: any) => {
@@ -734,22 +743,57 @@ describe("0.4.1: the re-review label at the gate", () => {
   });
 });
 
-describe("upgrading past the gate job's rename (`<node>` → `gp-foundry gate (<node>)`)", () => {
-  const NEW = { runId: SELF.runId, jobCheckName: "gp-foundry gate (gate)" };
-  it.each([
-    ["in progress", "in_progress", null],
-    ["cancelled", "completed", "cancelled"],
-  ])("an old-named run of the gate left %s on the head is not failing CI", async (_label, status, conclusion) => {
+describe("the gate's job shares its node's name: its own runs are told apart by workflow file", () => {
+  const GATE_WF = ".github/workflows/gate.yml";
+  const VERIFY = { runId: SELF.runId, jobCheckName: "gate", workflowPath: GATE_WF };
+  const world = () => {
     const w = new World();
-    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status, conclusion, details_url: runUrl(6999) }] });
-    await tick(w, { prNumber: 1, self: NEW });
+    w.workflowOf = { "6999": GATE_WF, "8123": ".github/workflows/ci.yml", "6500": `${GATE_WF}@refs/heads/main` };
+    return w;
+  };
+
+  it.each(["failure", "cancelled", "timed_out"])("an earlier run of the gate's own workflow that ended %s is not CI", async (conclusion) => {
+    const w = world();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion, details_url: runUrl(6999) }] });
+    await tick(w, { prNumber: 1, self: VERIFY });
     expect(current(w, 1, "success")).toBe(true);
   });
-  it("a completed, failed job of that old name is still CI (it may be a real CI job)", async () => {
-    const w = new World();
-    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion: "failure", details_url: runUrl(6999) }] });
-    await tick(w, { self: NEW });
+
+  it("a CI job that merely shares the gate's name is CI", async () => {
+    const w = world();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion: "failure", details_url: runUrl(8123) }] });
+    await tick(w, { prNumber: 1, self: VERIFY });
     expect(current(w, 1, "failure")).toBe(true);
+  });
+
+  it("0.5.0's job name, `gp-foundry gate (<node>)`, left on a head after the upgrade, is the gate's too", async () => {
+    const w = world();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gp-foundry gate (gate)", status: "completed", conclusion: "cancelled", details_url: runUrl(6500) }] });
+    await tick(w, { prNumber: 1, self: VERIFY });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("one lookup per workflow run, and none for a run of this run or of another name", async () => {
+    const w = world();
+    w.add({
+      number: 1, reviewed: true, verdict: "APPROVE",
+      extra: [
+        { name: "gate", status: "in_progress", conclusion: null, details_url: runUrl(SELF.runId) },
+        { name: "test", status: "completed", conclusion: "success", details_url: runUrl(8123) },
+        { name: "gate", status: "completed", conclusion: "failure", details_url: runUrl(6999) },
+      ],
+    });
+    await tick(w, { prNumber: 1, self: VERIFY });
+    await tick(w, { prNumber: 1, self: VERIFY });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.calls["actions.getWorkflowRun"] ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it("an unreadable workflow run: the name rule stands in (as before the name was shared)", async () => {
+    const w = world();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion: "failure", details_url: runUrl(7777) }] });
+    await tick(w, { prNumber: 1, self: VERIFY });
+    expect(current(w, 1, "success")).toBe(true);
   });
 });
 
