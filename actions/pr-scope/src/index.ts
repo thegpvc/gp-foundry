@@ -14,6 +14,7 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { inScope, isAgentWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
+import { reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
@@ -97,9 +98,42 @@ export interface ScopedPr {
  */
 export async function listInScope(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string },
 ): Promise<ScopedPr[] | undefined> {
   const { owner, repo } = opts;
+  const now = opts.nowMs ?? Date.now();
+  const toScoped = (c: Candidate): ScopedPr => ({
+    number: c.number,
+    sha: c.sha,
+    base: c.base,
+    requested: c.requested,
+    quiet: Math.max(0, Math.floor((now - c.updatedAt) / 1000)),
+  });
+  const keep = (c: Candidate) => {
+    const scope = inScope({ authorLogin: c.author, authorType: c.authorType, draft: c.draft, labels: c.labels }, opts.rollout, opts.botLogin);
+    if (!scope.inScope) core.info(`#${c.number}: out of scope — ${scope.detail}`);
+    return scope.inScope;
+  };
+
+  // Only PRs the bot has reviewed: one search, retried once.
+  if (opts.reviewedBy) {
+    const search = () =>
+      searchCandidates((q, v) => octokit.graphql(q, v), { owner, repo, base: opts.baseBranch, qualifiers: [reviewedByQualifier(opts.reviewedBy!)] });
+    let found: Candidate[];
+    try {
+      found = await search();
+    } catch (first) {
+      core.info(`searching for reviewed pull requests failed (${(first as Error).message}); retrying once`);
+      await new Promise((r) => setTimeout(r, opts.retryDelayMs ?? 5000));
+      try {
+        found = await search();
+      } catch (second) {
+        core.warning(`could not search for reviewed pull requests: ${(second as Error).message}`);
+        return undefined;
+      }
+    }
+    return roundRobinByAuthor(found.filter(keep)).map(toScoped);
+  }
   const list = () =>
     octokit.paginate(octokit.rest.pulls.list, {
       owner,
@@ -123,27 +157,18 @@ export async function listInScope(
       return undefined;
     }
   }
-  const now = opts.nowMs ?? Date.now();
-  const out: ScopedPr[] = [];
-  for (const p of prs) {
-    const scope = inScope(
-      { authorLogin: p.user?.login, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => l.name ?? "").filter(Boolean) },
-      opts.rollout,
-      opts.botLogin,
-    );
-    if (!scope.inScope) {
-      core.info(`#${p.number}: out of scope — ${scope.detail}`);
-      continue;
-    }
-    out.push({
-      number: p.number,
-      sha: p.head.sha,
-      base: p.base.ref,
-      requested: (p.requested_reviewers?.length ?? 0) + (p.requested_teams?.length ?? 0),
-      quiet: Math.max(0, Math.floor((now - Date.parse(p.updated_at)) / 1000)),
-    });
-  }
-  return out;
+  const cands: Candidate[] = prs.map((p) => ({
+    number: p.number,
+    sha: p.head.sha,
+    base: p.base.ref,
+    author: p.user?.login ?? "",
+    authorType: p.user?.type ?? "",
+    draft: !!p.draft,
+    labels: p.labels.map((l) => l.name ?? "").filter(Boolean),
+    requested: (p.requested_reviewers?.length ?? 0) + (p.requested_teams?.length ?? 0),
+    updatedAt: Date.parse(p.updated_at) || 0,
+  }));
+  return roundRobinByAuthor(cands.filter(keep)).map(toScoped);
 }
 
 export async function run(): Promise<void> {
@@ -165,6 +190,7 @@ export async function run(): Promise<void> {
         baseBranch: core.getInput("base-branch").trim() || undefined,
         rollout,
         botLogin: core.getInput("bot-login").trim() || undefined,
+        reviewedBy: core.getInput("reviewed-by").trim() || undefined,
       });
       core.setOutput("listed", String(prs !== undefined));
       core.setOutput("prs", JSON.stringify(prs ?? []));

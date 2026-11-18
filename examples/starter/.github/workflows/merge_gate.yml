@@ -50,4 +50,5 @@ jobs:
           bot-login: agent-bot
           rollout: "{\"authors\":[]}"
           pr-number: ${{ github.event.pull_request.number }}
+          rotation: ${{ github.run_number }}
           time-budget-seconds: "480"

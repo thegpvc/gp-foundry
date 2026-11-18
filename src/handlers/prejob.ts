@@ -492,6 +492,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
             list: "true",
             token: "${{ github.token }}",
             "base-branch": ctx.config.repo.base_branch,
+            // A sweep that acts only on reviewed heads looks only at PRs the bot
+            // has reviewed: one search, instead of reading every open PR's head.
+            ...(sweepRequiresReview(node) && ctx.config.identity?.bot_login ? { "reviewed-by": ctx.config.identity.bot_login } : {}),
             ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
             ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
           },

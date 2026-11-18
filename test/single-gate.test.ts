@@ -251,6 +251,7 @@ describe("the single gate also evaluates one PR when something that decides it c
   it("evaluates the event's PR, and the pass when scheduled, within the job's time", () => {
     const w = gateStep(wf().jobs.gate).with;
     expect(w["pr-number"]).toBe("${{ github.event.pull_request.number }}");
+    expect(w.rotation).toBe("${{ github.run_number }}");
     expect(w["time-budget-seconds"]).toBe("480"); // a 10-minute job, two minutes to spare
     expect(gateStep(wf('merge="off", timeout=30').jobs.gate).with["time-budget-seconds"]).toBe("1680");
   });

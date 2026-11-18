@@ -303,3 +303,18 @@ jq -r "$jqe" <<< "$body"
     expect(job.steps[0].run).toContain("startswith(env.PREFIX)");
   });
 });
+
+describe("an approver sweep that acts only on reviewed heads", () => {
+  const sweep = (attrs: string) => `digraph t {
+    approver [type=pr-review, role="agents/roles/a.md", context="pr-review", select="sweep", schedule="*/10 * * * *"${attrs}]
+  }`;
+  const scope = (attrs: string) => workflow(sweep(attrs), "approver", hybrid()).jobs.approver_select.steps.find((s: any) => s.id === "scope").with;
+
+  it("lists only PRs the bot has reviewed, with requires_review", () => {
+    expect(scope(", requires_review=true")["reviewed-by"]).toBe(BOT);
+  });
+
+  it("lists every PR in scope without it (it may act on unreviewed heads)", () => {
+    expect(scope("")["reviewed-by"]).toBeUndefined();
+  });
+});

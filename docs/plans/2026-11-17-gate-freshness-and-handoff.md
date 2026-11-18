@@ -38,62 +38,45 @@ Runs triggered by a Dependabot or fork PR get no secrets and a read-only token. 
 run there could neither mint the App token nor write a check, so those PRs are left to the
 scheduled pass (which runs on the default branch with secrets).
 
-### Design
+### Design (revised 2026-11-17, after review of the first version)
 
-1. **A targeted run per PR on the events above** — reviews, labels, review requests, new
-   commits, ready for review — evaluating that one PR by number. One
-   concurrency slot per PR, newest wins (`cancel-in-progress: true`): a burst of events
-   collapses to one evaluation of the latest state. Skipped quietly for a Dependabot or
-   fork PR, the same pattern as the guard fix.
-2. **A bounded scheduled pass that makes progress across ticks**, with no stored state. It
-   orders the PRs in scope least recently evaluated first — a head with no gate result yet
-   (new, or its evaluation failed) before all others, then by the read time its result
-   records — and evaluates at most 20 per tick (built in, no setting), stopping early
-   within a time budget the compiler derives from the job's timeout. An interrupted pass
-   leaves the heads it missed first in line for the next. An interrupted pass leaves the unvisited heads oldest, so the next tick
-   starts there. This is the backstop for everything the events miss: CI finishing, thread resolution,
-   Dependabot and fork PRs, a missed delivery, a failed read.
-3. **No stale result ever replaces a fresher one.** Each published result records, in a
-   hidden marker, when the facts behind it were read, and is re-stamped even when the
-   result is unchanged, so it always records the latest read. A run whose read is older
-   than the one already published writes nothing and does not merge. A new commit cannot
-   inherit a result: results are per commit, and the merge pins the SHA it evaluated.
-4. **Per-head decisions and merge policy are unchanged.** Only when and in what order the
-   gate evaluates changes.
+1. **A targeted run per PR on the events above** — reviews (the approver's verdict
+   included), labels, review requests, new commits, ready for review — evaluating that
+   one PR. One concurrency slot per PR, newest wins. Fork and Dependabot-triggered events,
+   closed PRs and labels the harness applied itself do nothing. This is what gets a
+   verdicted head its result: within seconds of the verdict, not a tick later.
+2. **No result without a verdict.** A head the approver has not decided gets no check.
+   GitHub counts `success`, `neutral` and `skipped` as passing a required status check,
+   so the earlier "awaiting the approver" neutral would let an undecided PR through one;
+   a missing required check blocks. A dismissed verdict sends the head's result back to
+   in progress. (`no_verdict_conclusion: neutral` on the older evaluate mode is left as
+   it is, with a runtime warning.)
+3. **Candidates come from one search: open PRs the bot has reviewed.** A verdict is a
+   review by the bot, so nothing else can have a result. One GraphQL search returns the
+   head SHA, author and labels too. In a busy repo this cuts ~800 open PRs to the ~80 the
+   bot has reviewed. Dependabot's PRs are searched too when the policy runs that lane.
+   The approver's select job uses the same search when it has `requires_review=true`, and
+   takes candidates **round-robin by author** (each author's newest PR first, the
+   longest-waiting author first in each round), so one author's flood cannot take every
+   slot.
+4. **A rotating window of 20 per tick** for the gate's pass, moved by the run number: every
+   candidate within ⌈candidates ÷ 20⌉ ticks, no stored state, nothing extra read to
+   order it. Stops within a time budget derived from the job's timeout.
+5. **Search failure is a quiet tick.** A failed or truncated (over 1,000 results) search
+   evaluates nothing and says so; it does not fall back to walking every open PR.
+   Verdicts still arrive through the review event.
 
-### Decided (2026-11-17)
+The first version ordered the pass by "least recently evaluated", which needed a read
+per open PR and a timestamp written into every result, and published a neutral result on
+every in-scope PR. Both are gone.
 
-- **No trigger for CI finishing.** `workflow_run` would need the CI workflows listed by
-  name, one more list to keep in step with the repo. CI finishing is picked up by the
-  scheduled pass; since that pass now visits the least recently evaluated heads first, a
-  head whose CI just finished waits at most until its turn, not for a full pass over the
-  backlog. External (non-Actions) CI is not special-cased either: no `check_suite`
-  trigger, so no risk of the gate's own check retriggering the gate.
-- **The scheduled pass evaluates a fixed, built-in number of PRs per tick**, with no
-  setting, and stops early before the job's timeout. API use per tick stays bounded; a
-  larger backlog takes several ticks, least recently evaluated first.
+### Measured (stub API)
 
-### Verification
-
-A synthetic backlog larger than one tick's budget, against a stub API: interrupt the first
-pass; add a ready head near the tail; clear a hold on an older head without a push. Both
-must receive current results within a stated number of ticks; a failed read is retried; a
-duplicate event or a superseded SHA never produces a stale approval. Report API calls per
-tick and ticks to a published decision.
-
----
-
-### Measured (synthetic backlog, stub API)
-
-51 PRs in scope, 20 per tick. The first tick is cut short by its time budget after 9
-evaluations; then a ready head is added at the tail and a hold is cleared on an older
-head without a push. Both have current results by the third tick after the change
-(within ⌈51 ÷ 20⌉ + 1 = 4). A full tick makes 192 API calls (1 listing, 51 reads to order
-the pass, ~7 per evaluation); a targeted run makes 8. With an event (a review, a label
-change), the result is published by that one targeted run, not a later tick.
-
-Not covered by an event, so left to the pass: CI finishing, a thread resolved, and any
-PR whose events come from a fork or Dependabot.
+A repo with 800 open PRs, 83 reviewed by the bot: one search page, then 20 evaluations —
+111 API calls per tick (~1,330 an hour at a 5-minute cron), 7 per targeted run. A
+verdicted head gets its result from the review event; one whose CI finishes later is
+reached by the pass within ⌈84 ÷ 20⌉ ticks. Every reviewed head is reached within
+⌈83 ÷ 20⌉ ticks from any starting point, interrupted ticks included.
 
 ## B. Recognizing a person's sign-off on a policy handoff
 

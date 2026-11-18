@@ -93,7 +93,19 @@ function makeOctokit(world: World) {
       const { data } = await fn(params);
       return data;
     },
-    graphql: async (query: string) => {
+    graphql: async (query: string, vars: any = {}) => {
+      if (query.includes("search(")) {
+        // The single gate's scheduled pass: open PRs the bot has reviewed. The
+        // stub's one PR is always a result; whether it has a verdict is up to its reviews.
+        calls.push({ method: "graphql.search", params: vars });
+        return {
+          search: {
+            issueCount: 1,
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [{ number: pr.number, headRefOid: pr.head.sha, baseRefName: "main", isDraft: pr.draft, updatedAt: "2026-01-01T00:00:00Z", author: { __typename: pr.user.type, login: pr.user.login }, labels: { nodes: pr.labels }, reviewRequests: { totalCount: 0 } }],
+          },
+        };
+      }
       if (query.includes("reviewDecision")) {
         calls.push({ method: "graphql.reviewDecision", params: {} });
         if (world.reviewDecision instanceof Error) throw world.reviewDecision;
@@ -569,7 +581,8 @@ describe("the single gate (merge=)", () => {
     it("does not label or comment on a person's PR that is not ready", async () => {
       gate("agent-only", { author: ALICE, approved: false }, undefined, "labels: { awaiting_approval: awaiting-approval }\n");
       await run();
-      expect(writes().map((c) => c.method)).toEqual(["checks.create"]);
+      // No verdict on the head, so no result either: nothing is written at all.
+      expect(writes().map((c) => c.method)).toEqual([]);
     });
 
     it("still applies the policy's labels to the pipeline's own PR that is not ready", async () => {

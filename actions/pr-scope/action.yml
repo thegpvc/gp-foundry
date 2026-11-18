@@ -18,6 +18,14 @@ inputs:
       the repo.
     required: false
     default: "false"
+  reviewed-by:
+    description: >-
+      With `list`: only PRs this login has reviewed, found with one search (the
+      head SHA, author and labels come back in the same call). For a sweep that
+      acts only on reviewed heads. A failed or truncated search is a quiet
+      tick: `listed` is "false".
+    required: false
+    default: ""
   base-branch:
     description: "With `list`: only PRs targeting this branch."
     required: false
@@ -65,8 +73,9 @@ outputs:
     description: "One line saying why."
   prs:
     description: >-
-      With `list`: a JSON array, oldest PR first, of {number, sha, base,
-      requested, quiet} — head SHA, base ref, the number of pending review
+      With `list`: a JSON array, round-robin by author (each author's newest PR,
+      then each author's next, longest-waiting author first), of {number, sha,
+      base, requested, quiet} — head SHA, base ref, the number of pending review
       requests, and seconds since the PR last changed.
   listed:
     description: 'With `list`: "true" when the open PRs could be listed, "false" when the API was unavailable.' 

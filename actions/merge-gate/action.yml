@@ -110,6 +110,13 @@ inputs:
       can publish one this gate — or a ruleset pinned to the App — accepts.
     required: false
     default: ""
+  rotation:
+    description: >
+      With `merge` and no `pr-number`: a number that advances every scheduled
+      run (the compiler passes the run number). It moves the pass's window of 20
+      PRs, so successive ticks cover every candidate without stored state.
+    required: false
+    default: ""
   time-budget-seconds:
     description: >
       With `merge` and no `pr-number` (the scheduled pass): stop starting new

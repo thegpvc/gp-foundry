@@ -143,15 +143,22 @@ to that App alone. Anything that requires it downstream (another gate's
 `<check name>@<app slug>`.
 
 **When it runs.** The compiler wires the gate to evaluate one PR (`pr-number`) when
-something that decides it changes — a review submitted or dismissed, a label, a review
-request, a new commit, ready for review — and to run a scheduled pass over every PR in
-scope. The pass evaluates at most 20 PRs per tick, least recently evaluated first (a
-head with no result yet before all others), and stops early within
-`time-budget-seconds`; an interrupted pass leaves the heads it missed first in line.
-CI finishing and threads being resolved have no usable event and are picked up by the
-pass. Each published result records when its facts were read
-(`<!-- gp-foundry:read-at:… -->`): a run never replaces, or merges on, a result read
-earlier than the one already on the head.
+something that decides it changes — a review submitted or dismissed (the approver's
+verdict among them), a label, a review request, a new commit, ready for review — and to
+run a scheduled pass for what has no usable event: CI finishing, a thread resolved,
+fork and Dependabot PRs.
+
+The pass looks only at open PRs `bot-login` has reviewed — one search, which returns the
+head SHA, author and labels in the same call — plus dependabot's when the policy runs its
+lane. It evaluates a window of 20 of them per tick that moves with `rotation`, so every
+candidate is reached within ⌈candidates ÷ 20⌉ ticks, and stops within
+`time-budget-seconds`. If the search fails or would be truncated (over 1,000 results), the
+tick evaluates nothing rather than walk every open PR.
+
+**No result without a verdict.** A head the approver has given no verdict on gets no
+check: a missing required check blocks a merge, whereas a `neutral` one would pass it
+(GitHub counts `success`, `neutral` and `skipped` as passing). If a verdict is dismissed,
+the result on that head goes back to in progress. The dependabot lane needs no verdict.
 
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.

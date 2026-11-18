@@ -691,6 +691,8 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
       "pr-number": "${{ github.event.pull_request.number }}",
+      // Moves the scheduled pass's window each tick.
+      rotation: "${{ github.run_number }}",
       // Leave the job two minutes to finish the PR it is on and exit cleanly.
       "time-budget-seconds": String(Math.max(60, (timeoutOf(node, 10) - 2) * 60)),
     },

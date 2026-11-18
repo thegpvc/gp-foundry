@@ -52,6 +52,7 @@ import {
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
+import { reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
@@ -628,26 +629,6 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
  * (one current result per head), create one if there is none, and write nothing
  * when the existing run already says the same thing.
  */
-/**
- * `<!-- gp-foundry:read-at:<ISO time> -->` — appended to the check's text by the
- * single gate: when the facts behind this result were read. A run never
- * replaces a result read later than its own (see publishCheck), and the
- * scheduled pass visits the heads read longest ago first.
- */
-const READ_AT = /<!-- gp-foundry:read-at:([0-9T:.\-Z]+) -->/;
-
-/** The read-at time recorded in a check's text, in ms; undefined when there is none. */
-export function readAtOf(text: string | null | undefined): number | undefined {
-  const m = READ_AT.exec(text ?? "");
-  if (!m) return undefined;
-  const t = Date.parse(m[1]!);
-  return Number.isNaN(t) ? undefined : t;
-}
-
-function withoutReadAt(text: string | null | undefined): string {
-  return (text ?? "").replace(READ_AT, "").replace(/\n+$/, "");
-}
-
 export async function publishCheck(
   checksOctokit: Octokit,
   owner: string,
@@ -659,27 +640,18 @@ export async function publishCheck(
   // publishes with GITHUB_TOKEN, the harness's own App when it publishes with
   // that App's token (see the `check-app` input).
   app: string = CHECK_APP,
-  // The single gate passes when its facts were read. Then the check records it,
-  // a result read EARLIER than the one already published is never written (a
-  // slow run cannot replace a fresher one), and an unchanged result is still
-  // re-stamped, so the check always says when the head was last evaluated.
-  readAt?: string,
-): Promise<"created" | "updated" | "unchanged" | "superseded"> {
+): Promise<"created" | "updated" | "unchanged"> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs
     .filter((r) => r.name === name && r.app?.slug === app)
     .sort((a, b) => b.id - a.id)[0];
-  const sameResult =
-    !!mine &&
+  if (
+    mine &&
     mine.status === "completed" &&
     mine.conclusion === out.conclusion &&
     (mine.output?.summary ?? "") === out.summary &&
-    withoutReadAt(mine.output?.text) === withoutReadAt(out.text);
-  if (readAt !== undefined) {
-    const theirs = readAtOf(mine?.output?.text);
-    if (theirs !== undefined && theirs > Date.parse(readAt)) return "superseded";
-    out = { ...out, text: `${withoutReadAt(out.text)}\n\n<!-- gp-foundry:read-at:${readAt} -->`.replace(/^\n+/, "") };
-  } else if (sameResult) {
+    (mine.output?.text ?? "") === out.text
+  ) {
     return "unchanged";
   }
   const output = { title: out.title, summary: out.summary, text: out.text };
@@ -729,6 +701,11 @@ export async function runEvaluate(opts: {
   const policy: PolicyFile = { ...opts.policy, ciIgnoreCheckNames: [...(opts.policy.ciIgnoreCheckNames ?? []), checkName] };
   if (policy.noVerdictConclusion !== undefined && policy.noVerdictConclusion !== "failure" && policy.noVerdictConclusion !== "neutral") {
     throw new Error(`no_verdict_conclusion must be "failure" or "neutral", got ${JSON.stringify(policy.noVerdictConclusion)}`);
+  }
+  if (policy.noVerdictConclusion === "neutral") {
+    core.warning(
+      'no_verdict_conclusion: neutral — GitHub counts a neutral check as PASSING a required status check, so a head the approver has not decided would pass one. Prefer merge="off", which publishes no result until there is a verdict.',
+    );
   }
   // mergeable_state is computed lazily and only a merge attempt settles it; an
   // evaluate gate makes no attempt, so the rebase clause is off unless set.
@@ -792,41 +769,22 @@ export type MergeSetting = "off" | "agent-only";
 export const GATE_TICK_LIMIT = 20;
 
 /**
- * The scheduled pass's order: PRs in scope (and on the dependabot lane, when
- * the policy turns it on), least recently evaluated first — a head the gate
- * has never published a result for (a new head, or one whose evaluation
- * failed) before all others, then by the read time its check records; ties by
- * age. No state is stored: the check runs are the record, so a pass that is
- * interrupted leaves the heads it did not reach at the front of the next one.
- * One read per PR in scope.
+ * Withdraw the gate's result from a head that no longer has a verdict (the
+ * approver's review was dismissed). It goes back to in progress — which, unlike
+ * neutral, never counts as passing a required check.
  */
-export async function scheduleOrder<T extends { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[]; head: { sha: string } }>(
-  open: T[],
-  o: { octokit: Octokit; owner: string; repo: string; checkName: string; checkApp: string; rollout: Rollout | undefined; botLogin?: string; dependabotLane: boolean },
-): Promise<T[]> {
-  const ranked: { pr: T; at: number; i: number }[] = [];
-  for (const [i, p] of open.entries()) {
-    const scope = inScope(
-      { authorLogin: p.user?.login, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => l.name ?? "").filter(Boolean) },
-      o.rollout,
-      o.botLogin,
-    );
-    const dependabot = o.dependabotLane && p.user?.login === DEPENDABOT_LOGIN && !p.draft;
-    if (!scope.inScope && !dependabot) {
-      core.info(`PR #${p.number}: out of scope — ${scope.detail}`);
-      continue;
-    }
-    let at = -Infinity; // never evaluated: first
-    try {
-      const runs = await o.octokit.paginate(o.octokit.rest.checks.listForRef, { owner: o.owner, repo: o.repo, ref: p.head.sha, check_name: o.checkName, per_page: 100 });
-      const mine = runs.filter((r) => r.name === o.checkName && r.app?.slug === o.checkApp).sort((a, b) => b.id - a.id)[0];
-      if (mine) at = readAtOf(mine.output?.text) ?? (Date.parse(mine.completed_at ?? "") || -Infinity);
-    } catch {
-      // Unreadable: treat it as never evaluated, so it is tried first.
-    }
-    ranked.push({ pr: p, at, i });
-  }
-  return ranked.sort((a, b) => a.at - b.at || a.i - b.i).map((r) => r.pr);
+export async function withdrawCheck(checksOctokit: Octokit, owner: string, repo: string, headSha: string, name: string, app: string): Promise<boolean> {
+  const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
+  const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
+  if (!mine || mine.status !== "completed") return false;
+  await checksOctokit.rest.checks.update({
+    owner,
+    repo,
+    check_run_id: mine.id,
+    status: "in_progress",
+    output: { title: "Awaiting the approver", summary: "The approver's verdict on this head is gone (dismissed). The gate publishes a result once there is one." },
+  });
+  return true;
 }
 
 export async function runHybridGate(opts: {
@@ -844,6 +802,8 @@ export async function runHybridGate(opts: {
   dryRun: boolean;
   /** Scheduled pass: stop starting new evaluations after this many seconds. */
   timeBudgetSeconds?: number;
+  /** Scheduled pass: the run number, which moves the pass's window each tick. */
+  rotation?: number;
   /** Injected clock, for tests. */
   now?: () => number;
 }): Promise<{ evaluated: number; written: number; mergedPr: string }> {
@@ -867,28 +827,48 @@ export async function runHybridGate(opts: {
   const deadline = opts.timeBudgetSeconds ? started + opts.timeBudgetSeconds * 1000 : Infinity;
 
   // A targeted run (an event on one PR) evaluates that PR. The scheduled pass
-  // evaluates a bounded number, least recently evaluated first.
-  let prs: Awaited<ReturnType<typeof octokit.rest.pulls.list>>["data"];
+  // evaluates a rotating window of the PRs the gate could have something to say
+  // about: the gate publishes only once the approver has a verdict on the head,
+  // and a verdict is a review by the harness bot — so the candidates are one
+  // search for open PRs the bot has reviewed (plus dependabot's, when the policy
+  // runs that lane).
+  type Pr = { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[] };
+  let prs: Pr[];
   if (opts.prNumber !== undefined) {
     const one = (await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data;
     if (one.state !== "open") {
       core.info(`PR #${one.number} is ${one.state} — nothing to evaluate`);
       return { evaluated: 0, written: 0, mergedPr: "" };
     }
-    prs = [one as unknown as (typeof prs)[number]];
+    prs = [one];
+  } else if (botLogin) {
+    let found: Candidate[];
+    try {
+      found = await searchCandidates((q, v) => octokit.graphql(q, v), {
+        owner,
+        repo,
+        base: opts.baseBranch,
+        qualifiers: [reviewedByQualifier(botLogin), ...(dependabotLane ? ["author:app/dependabot"] : [])],
+      });
+    } catch (e) {
+      // No fallback to walking every open PR: that is what used to time out.
+      // Verdicts reach the gate through the review event regardless.
+      core.notice(`could not search for the PRs to evaluate (${(e as Error).message}) — nothing evaluated this tick; the next tick tries again`);
+      return { evaluated: 0, written: 0, mergedPr: "" };
+    }
+    const window = rotatingWindow(found, GATE_TICK_LIMIT, opts.rotation ?? 0);
+    core.info(`${found.length} open PR(s) reviewed by ${botLogin}; evaluating ${window.length} this tick`);
+    prs = window.map((c) => ({ number: c.number, draft: c.draft, user: { login: c.author, type: c.authorType }, labels: c.labels.map((name) => ({ name })) }));
   } else {
+    // No bot login to search by: the original listing, in a rotating window.
     const open = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
-    prs = await scheduleOrder(open, { octokit: checksOctokit, owner, repo, checkName, checkApp: opts.checkApp, rollout, botLogin, dependabotLane });
+    prs = rotatingWindow(open, GATE_TICK_LIMIT, opts.rotation ?? 0);
   }
 
   let evaluated = 0;
   let written = 0;
   let mergedPr = "";
   for (const p of prs) {
-    if (opts.prNumber === undefined && evaluated >= GATE_TICK_LIMIT) {
-      core.info(`evaluated ${GATE_TICK_LIMIT} PRs this tick — the rest, least recently evaluated first, wait for the next`);
-      break;
-    }
     if (now() > deadline) {
       core.info("near the job's time limit — the rest wait for the next tick");
       break;
@@ -909,8 +889,20 @@ export async function runHybridGate(opts: {
     }
     evaluated++;
     try {
-      const readAt = new Date(now()).toISOString();
       const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit);
+      // No verdict from the approver on this head: no result. A missing required
+      // check blocks a merge; a neutral one would PASS it. (The dependabot lane
+      // needs no verdict.) A result already on this head — its verdict since
+      // dismissed — is withdrawn to in progress.
+      const verdictless = !facts.headVerdict && !onDependabotLane;
+      if (verdictless) {
+        const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
+        if (mine && !opts.dryRun && facts.headSha && (await withdrawCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp))) {
+          core.info(`PR #${n}: verdict gone from ${facts.headSha.slice(0, 8)} — result withdrawn`);
+        } else {
+          core.info(`PR #${n}: no verdict from the approver on this head yet — no result published`);
+        }
+      }
 
       // Who merges this PR? Only asked when the gate may merge at all.
       let writer: { agentWritten: boolean; detail: string } | undefined;
@@ -938,14 +930,9 @@ export async function runHybridGate(opts: {
         out.text = out.text ? `${out.text}\n\n${line}` : line;
       }
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
-      if (!opts.dryRun && facts.headSha) {
-        const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp, readAt);
-        if (result === "superseded") {
-          // A newer evaluation of this head is already published: this one is stale.
-          core.info(`PR #${n}: a fresher result is already on ${facts.headSha.slice(0, 8)} — not replacing it, not acting on this one`);
-          continue;
-        }
-        written++;
+      if (!opts.dryRun && facts.headSha && !verdictless) {
+        const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
+        if (result !== "unchanged") written++;
         core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
       }
 
@@ -1041,6 +1028,7 @@ export async function run(): Promise<void> {
         merge: mergeSetting,
         checkApp: core.getInput("check-app").trim() || CHECK_APP,
         timeBudgetSeconds: parseInt(core.getInput("time-budget-seconds"), 10) || undefined,
+        rotation: parseInt(core.getInput("rotation"), 10) || 0,
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));

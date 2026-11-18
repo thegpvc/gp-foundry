@@ -139,7 +139,7 @@ describe("pr-scope: listing for a sweep", () => {
   }
   const opts = { owner: "o", repo: "r", baseBranch: "main", botLogin: BOT, nowMs: NOW, retryDelayMs: 0 };
 
-  it("returns the in-scope PRs, oldest first, with what the selector needs", async () => {
+  it("returns the in-scope PRs, round-robin by author, with what the selector needs", async () => {
     const o = lister([
       [
         open(1, "alice", { requested_reviewers: [{ login: "x" }], requested_teams: [{ slug: "t" }] }),
@@ -150,9 +150,10 @@ describe("pr-scope: listing for a sweep", () => {
       ],
     ]);
     const prs = await listInScope(o, { ...opts, rollout: { authors: ["alice"] } });
+    // Same age, so authors fall back to login order: agent-bot[bot] before alice.
     expect(prs).toEqual([
-      { number: 1, sha: "sha1", base: "main", requested: 2, quiet: 60 },
       { number: 3, sha: "sha3", base: "release", requested: 0, quiet: 60 },
+      { number: 1, sha: "sha1", base: "main", requested: 2, quiet: 60 },
     ]);
     expect(o.seen[0]).toMatchObject({ state: "open", base: "main", sort: "created", direction: "asc" });
   });
@@ -190,5 +191,47 @@ describe("pr-scope: the wrong-bot-login hint", () => {
     expect(await quiet({ head: { ref: "agent/12-fix" } })).not.toContain("bot_login");
     expect(await quiet({ ...onAgentBranch, draft: true })).not.toContain("bot_login");
     expect(await quiet({ ...onAgentBranch, labels: [{ name: "no" }] }, { authors: [], skipLabel: "no" })).not.toContain("bot_login");
+  });
+});
+
+describe("pr-scope: listing only PRs the bot has reviewed", () => {
+  const NOW = Date.parse("2026-01-01T01:00:00Z");
+  const node = (n: number, login: string, updated: string, over: Record<string, unknown> = {}) => ({
+    number: n, headRefOid: `sha${n}`, baseRefName: "main", isDraft: false, updatedAt: updated,
+    author: { __typename: login.endsWith("[bot]") ? "Bot" : "User", login }, labels: { nodes: [] }, reviewRequests: { totalCount: 0 }, ...over,
+  });
+  function searcher(results: (unknown[] | Error)[]) {
+    const queries: string[] = [];
+    let i = 0;
+    const o = {
+      queries,
+      graphql: async (_q: string, v: any) => {
+        queries.push(v.q);
+        const r = results[Math.min(i++, results.length - 1)]!;
+        if (r instanceof Error) throw r;
+        return { search: { issueCount: r.length, pageInfo: { hasNextPage: false, endCursor: null }, nodes: r } };
+      },
+      paginate: async () => {
+        throw new Error("must not list every open PR");
+      },
+      rest: { pulls: { list: async () => { throw new Error("must not list every open PR"); } } },
+    };
+    return o as unknown as Parameters<typeof listInScope>[0] & { queries: string[] };
+  }
+  const opts = { owner: "o", repo: "r", baseBranch: "main", botLogin: BOT, nowMs: NOW, retryDelayMs: 0, reviewedBy: BOT };
+
+  it("searches once for open PRs the bot reviewed, and round-robins them by author", async () => {
+    const flood = Array.from({ length: 5 }, (_, i) => node(100 + i, "prolific", `2026-01-01T00:0${i}:00Z`));
+    const o = searcher([[...flood, node(1, "alice", "2025-12-31T00:00:00Z"), node(2, "dependabot[bot]", "2026-01-01T00:00:00Z"), node(3, "bob", "2026-01-01T00:30:00Z", { isDraft: true })]]);
+    const prs = await listInScope(o, opts);
+    expect(o.queries).toEqual([`repo:o/r is:pr is:open base:main reviewed-by:${BOT}`]);
+    // alice waited longest; prolific's newest first; dependabot (another bot) and the draft are out.
+    expect(prs!.map((p) => p.number)).toEqual([1, 104, 103, 102, 101, 100]);
+    expect(prs![0]).toEqual({ number: 1, sha: "sha1", base: "main", requested: 0, quiet: 90000 });
+  });
+
+  it("retries a failed search once, then reports the tick as not listed", async () => {
+    expect(await listInScope(searcher([new Error("rate limit"), [node(1, "alice", "2026-01-01T00:00:00Z")]]), opts)).toHaveLength(1);
+    expect(await listInScope(searcher([new Error("rate limit"), new Error("rate limit")]), opts)).toBeUndefined();
   });
 });
