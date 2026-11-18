@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Is this a PR the pipeline wrote?
         id: scope
-        uses: thegpvc/gp-foundry/actions/pr-scope@v0.4.0
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.4.1
         with:
           number: ${{ github.event.pull_request.number }}
           token: ${{ github.token }}
@@ -129,7 +129,7 @@ jobs:
       - name: Fetch context
         id: ctx
         if: steps.attempts.outputs.exhausted != 'true'
-        uses: thegpvc/gp-foundry/actions/agent-context@v0.4.0
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.4.1
         with:
           type: pr-review
           number: ${{ github.event.pull_request.number }}
@@ -139,7 +139,7 @@ jobs:
       - name: Run agent
         if: steps.attempts.outputs.exhausted != 'true'
         timeout-minutes: 25
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.4.0
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.4.1
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/fixer.md
           model: claude-opus-4-8
