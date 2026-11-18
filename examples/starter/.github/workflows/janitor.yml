@@ -38,7 +38,7 @@ jobs:
       - name: Run agent
         id: agent
         timeout-minutes: 10
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.3.2
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.4.0
         with:
           role-file: .github/agents/roles/janitor.md
           model: claude-opus-4-8
@@ -47,7 +47,7 @@ jobs:
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github-token: ${{ secrets.AGENT_PAT }}
       - name: Strip protected paths, commit, push
-        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.3.2
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.4.0
         with:
           branch: main
           base-branch: main
@@ -70,7 +70,7 @@ jobs:
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
       - name: Preserve failed agent output for review
         if: ${{ !cancelled() && steps.agent.outcome == 'failure' && steps.recovery.outcome == 'success' }}
-        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.3.2
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.4.0
         with:
           branch: ${{ steps.recovery.outputs.branch }}
           base-branch: main
