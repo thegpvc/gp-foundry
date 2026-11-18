@@ -194,6 +194,15 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
     }
   }
 
+  if (ir.config.labels?.re_review && !hybrid) {
+    diags.push({
+      level: "warning",
+      code: "config.rereview-ignored",
+      message: `labels.re_review ('${ir.config.labels.re_review}') has no effect: the re-review label works only in a harness with a rollout block`,
+      hint: "add `rollout: {}` (or a rollout dial) to foundry.config.yaml, or remove labels.re_review",
+    });
+  }
+
   // repo.authors (config-wide allowlist) is checked once, not per node.
   try {
     parseConfigAuthors(ir.config);

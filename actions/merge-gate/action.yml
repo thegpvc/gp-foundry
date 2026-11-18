@@ -119,6 +119,12 @@ inputs:
       progress, cancelled or timed out — as well as every job of the current
       workflow run (GITHUB_RUN_ID). A CI job of the same name in another
       workflow is left out too: keep the gate's job name distinct.
+  rereview-label:
+    description: >
+      With `merge`: the label that asks for a fresh review and verdict on the
+      head. While it is on a PR, only verdicts posted after it was added count;
+      until one exists the gate's result is held at in progress and nothing is
+      merged. Once one exists the gate removes the label. Empty: off.
     required: false
     default: ""
   rotation-period-seconds:

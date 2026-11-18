@@ -481,6 +481,16 @@ export function rolloutOf(cfg: FoundryConfig): Rollout | undefined {
   }
 }
 
+/**
+ * The re-review label (`labels.re_review`), in a hybrid harness: a person asks
+ * for a fresh review and verdict on the head as it stands. Undefined: off.
+ * See src/shared/rereview.ts.
+ */
+export function rereviewLabelOf(cfg: FoundryConfig): string | undefined {
+  const l = cfg.labels?.re_review;
+  return isHybrid(cfg) && typeof l === "string" && l.trim() ? l.trim() : undefined;
+}
+
 /** A lane that reads a pull request and advises: it runs on any PR in scope. */
 export function isReadingPrLane(node: HarnessNode): boolean {
   return (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);

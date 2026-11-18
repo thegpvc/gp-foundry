@@ -6,7 +6,7 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 
 const SCRIPT = `set -euo pipefail
@@ -95,12 +95,24 @@ fi
 # test stands in: the heading on line 1 — and, on a verdict lane, only a review
 # that is itself a verdict, so a plain review under the same heading cannot
 # stop the verdict being posted.
+#
+# A re-review request (the re-review label) asks for a FRESH review of the same
+# head: a review posted before the label was last added no longer counts.
 MARKER="\${POST_MARKER//<n>/$PR}"
 MARKER="\${MARKER//<sha>/$HEAD_SHA}"
 POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
-export MARKER POSTED
+SINCE=""
+if [ -n "\${REREVIEW_LABEL:-}" ]; then
+  if ! SINCE=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '
+      .[] | select(.event == "labeled" and .label.name == env.REREVIEW_LABEL) | .created_at' | sort | tail -n 1); then
+    echo "::error::could not read the PR's label history — not posting, so a re-run cannot post the review twice"
+    exit 1
+  fi
+fi
+export MARKER POSTED SINCE
 if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100" --paginate --jq '
   [.[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)
+   | select(env.SINCE == "" or (.submitted_at // "") >= env.SINCE)
    | (.body // "") as $b
    | select(($b | contains(env.POSTED))
        or ((($b | contains(env.POSTED_PREFIX)) | not)
@@ -226,6 +238,7 @@ export function postReviewStep(
       POST_MARKER: marker,
       REQUIRE_VERDICT: String(opts.verdictLane),
       VERDICT_LINES: verdictLinesOf(ctx.config),
+      ...(rereviewLabelOf(ctx.config) ? { REREVIEW_LABEL: rereviewLabelOf(ctx.config)! } : {}),
     },
     run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ),
   });
