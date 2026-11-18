@@ -951,6 +951,28 @@ describe('select="sweep" on pr-review', () => {
       expect(r.stdout).toContain("#2: 1 check-run(s) still running");
     });
 
+    // The gate withdraws its result to in progress when a verdict is dismissed, and
+    // waits for the next verdict — from this sweep. Counted as running CI, it held
+    // the head out of the sweep for good.
+    it("does not wait on the merge gate's own check, which waits on this lane", () => {
+      const dot = SWEEP.replace(
+        "start    -> builder",
+        'gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/5 * * * *", mode="evaluate", check_name="fletch/approval"]\n    start    -> builder',
+      );
+      const st = workflow(dot, "approver").jobs.approver_select.steps[0];
+      expect(st.env.GATE_CHECKS).toBe("fletch/approval");
+      const fx = {
+        [LIST]: [open(1), open(2)],
+        ...head(1, { checks: [{ status: "completed", conclusion: "success", name: "ci" }, { status: "in_progress", name: "fletch/approval" }] }),
+        ...head(2, { checks: [{ status: "in_progress", name: "fletch/approval" }, { status: "in_progress", name: "ci" }] }),
+      };
+      const r = runStepScript(st, fx);
+      expect(JSON.parse(r.outputs.prs!)).toEqual([{ number: 1, sha: "sha1", base: "main" }]);
+      expect(r.stdout).toContain("#2: 1 check-run(s) still running");
+      // Without a gate in the graph nothing is exempt.
+      expect(select(fx).prs).toEqual([]);
+    });
+
     it("leaves out PRs with a skip= label or by a bot, but not the harness's own", () => {
       const dot = SWEEP.replace('select="sweep"', 'select="sweep", skip="bot-author,label:hold"');
       const st = workflow(dot, "approver", { labels: { hold: "do-not-approve" } } as any).jobs.approver_select.steps[0];

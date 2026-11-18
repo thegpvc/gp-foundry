@@ -267,8 +267,17 @@ describe("the single gate also evaluates one PR when something that decides it c
 
   describe("which runs do anything", () => {
     const guard = () => wf().jobs.gate.if as string;
-    const run = (event_name: string, event: object = {}, actor = "alice") => evalGuard(guard(), { github: { event_name, actor, repository: "o/r", event } } as any);
-    const pr = (over: object = {}) => ({ state: "open", base: { ref: "main" }, head: { repo: { full_name: "o/r" } }, ...over });
+    const run = (event_name: string, event: object = {}, actor = "alice", g: () => string = guard) =>
+      evalGuard(g(), { github: { event_name, actor, repository: "o/r", event } } as any);
+    const pr = (over: object = {}) => ({
+      state: "open",
+      draft: false,
+      labels: [] as { name: string }[],
+      user: { login: "alice", type: "User" },
+      base: { ref: "main" },
+      head: { repo: { full_name: "o/r" } },
+      ...over,
+    });
 
     it("the schedule and a manual run, always", () => {
       expect(run("schedule")).toBe(true);
@@ -294,6 +303,54 @@ describe("the single gate also evaluates one PR when something that decides it c
       expect(run("pull_request", { action: "labeled", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
       expect(run("pull_request_review", { action: "submitted", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
     });
+
+    // A person's label or review on a PR the gate will find out of scope used to
+    // start a run that minted the App token and then did nothing.
+    it("not a draft, nor another bot's PR, whoever triggered the event", () => {
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ draft: true }) })).toBe(false);
+      const dependabot = pr({ user: { login: "dependabot[bot]", type: "Bot" } });
+      expect(run("pull_request_review", { action: "submitted", pull_request: dependabot })).toBe(false);
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ user: { login: "renovate[bot]", type: "Bot" } }) })).toBe(false);
+    });
+
+    it("the harness bot's own PR runs, and another bot's only when rollout.authors names it", () => {
+      expect(run("pull_request_review", { action: "submitted", pull_request: pr({ user: { login: BOT, type: "Bot" } }) })).toBe(true);
+      const named = () => wf('merge="off"', { ...APP, rollout: { authors: ["renovate[bot]", "alice"] } } as Partial<FoundryConfig>).jobs.gate.if as string;
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ user: { login: "renovate[bot]", type: "Bot" } }) }, "alice", named)).toBe(true);
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ user: { login: "dependabot[bot]", type: "Bot" } }) }, "alice", named)).toBe(false);
+      // …and the authors list still decides for people.
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ user: { login: "bob", type: "User" } }) }, "alice", named)).toBe(false);
+    });
+
+    it("not a PR carrying the rollout's skip label; removing it does run (the payload no longer carries it)", () => {
+      const skip = () => wf('merge="off"', { ...APP, rollout: { skip_label: "fletch:skip" } } as Partial<FoundryConfig>).jobs.gate.if as string;
+      const skipped = pr({ labels: [{ name: "fletch:skip" }] });
+      expect(run("pull_request_review", { action: "submitted", pull_request: skipped }, "alice", skip)).toBe(false);
+      expect(run("pull_request", { action: "labeled", label: { name: "fletch:skip" }, pull_request: skipped }, "alice", skip)).toBe(false);
+      expect(run("pull_request", { action: "unlabeled", label: { name: "fletch:skip" }, pull_request: pr() }, "alice", skip)).toBe(true);
+      // The schedule is never filtered.
+      expect(run("schedule", {}, "alice", skip)).toBe(true);
+      expect(run("workflow_dispatch", {}, "alice", skip)).toBe(true);
+    });
+  });
+
+  // An event run on a pull request checks out the PR's merge ref by default: the
+  // policy would be read from the PR it judges, which could loosen it.
+  it("reads the policy from the base branch on every trigger, with no credential left behind", () => {
+    for (const cfg of [APP, PAT]) {
+      const checkout = wf('merge="off"', cfg).jobs.gate.steps.find((s: any) => s.name === "Checkout");
+      expect(checkout.with.ref).toBe("main");
+      expect(checkout.with["persist-credentials"]).toBe(false);
+    }
+    const other = wf('merge="agent-only"', { ...APP, repo: { ...loadConfig(undefined).repo, base_branch: "develop" } } as Partial<FoundryConfig>);
+    expect(other.jobs.gate.steps.find((s: any) => s.name === "Checkout").with.ref).toBe("develop");
+    expect(gateStep(other.jobs.gate).with["base-branch"]).toBe("develop");
+  });
+
+  it("names its own job's check run, so the gate leaves it out of the CI rollup", () => {
+    expect(gateStep(wf().jobs.gate).with["job-check-name"]).toBe("gate");
+    // The job has no display name: GitHub names its check run by the job id.
+    expect(wf().jobs.gate.name).toBeUndefined();
   });
 
   it("the older gates are untouched: schedule only, one slot", () => {

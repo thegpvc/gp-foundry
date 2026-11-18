@@ -515,6 +515,23 @@ export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, w
   return clauses.join(" && ");
 }
 
+/**
+ * The single gate's job-level test for a pull-request event: the reading-lane
+ * prefilter (not a draft, no skip label, an admitted author or label), and not
+ * another bot's PR. Without it a person's label or review on a Dependabot,
+ * draft or skipped PR starts a run that mints the App token only to find the PR
+ * out of scope. Another bot's PR runs only when `rollout.authors` names it, as
+ * the scope rule says; the policy's Dependabot lane (runtime content the
+ * compiler does not read) is served by the scheduled pass, which is where
+ * Dependabot's own events already go.
+ */
+export function singleGatePrefilter(rollout: Rollout, botLogin: string | undefined): string {
+  const by = (login: string) => `${PR}.user.login == ${exprString(login)}`;
+  const bots = [...(botLogin ? [botLogin] : []), ...(rollout.authors ?? [])].filter((a, i, all) => all.indexOf(a) === i);
+  const notOtherBot = `(${[`${PR}.user.type != 'Bot'`, ...bots.map(by)].join(" || ")})`;
+  return `${scopePrefilter(rollout, botLogin, false)} && ${notOtherBot}`;
+}
+
 /** The job that decides whether (or for which PRs) the node's own job runs. */
 export function preJobId(node: HarnessNode): string {
   return isSweep(node) ? `${node.id}_select` : `${node.id}_guard`;
