@@ -229,6 +229,30 @@ describe("pr-scope: listing only PRs the bot has reviewed", () => {
     expect(prs![0]).toEqual({ number: 1, sha: "sha1", base: "main", requested: 0, quiet: 90000 });
   });
 
+  it("leaves the skip label out of the search, and still drops skipped PRs it returns", async () => {
+    const skip = { labels: { nodes: [{ name: "fletch:skip" }] } };
+    const o = searcher([[node(1, "alice", "2026-01-01T00:00:00Z", skip), node(2, "alice", "2026-01-01T00:10:00Z"), node(3, "bob", "2026-01-01T00:20:00Z")]]);
+    const prs = await listInScope(o, { ...opts, rollout: { skipLabel: "fletch:skip" } });
+    expect(o.queries).toEqual([`repo:o/r is:pr is:open base:main reviewed-by:${BOT} -label:"fletch:skip"`]);
+    expect(prs!.map((p) => p.number)).toEqual([2, 3]);
+  });
+
+  // The selector takes the first LIMIT of this list: a skipped PR must not hold a
+  // place in an author's turn, or one author's skipped backlog starves the rest.
+  it("round-robins only PRs in scope: 90 skipped of 100 leave 10, each author still taking turns", async () => {
+    const skip = { labels: { nodes: [{ name: "fletch:skip" }] } };
+    const nodes = Array.from({ length: 100 }, (_, i) =>
+      node(i + 1, i < 90 ? "prolific" : i % 2 ? "alice" : "bob", `2026-01-01T00:${String(i % 60).padStart(2, "0")}:00Z`, i < 90 ? skip : {}),
+    );
+    const prs = await listInScope(searcher([nodes]), { ...opts, rollout: { skipLabel: "fletch:skip" } });
+    expect(prs).toHaveLength(10);
+    expect(prs!.every((p) => p.number > 90)).toBe(true);
+    // Strict alternation between the two in-scope authors.
+    const authorOf = (n: number) => ((n - 1) % 2 ? "alice" : "bob");
+    const order = prs!.map((p) => authorOf(p.number));
+    for (let i = 1; i < order.length; i++) expect(order[i]).not.toBe(order[i - 1]);
+  });
+
   it("retries a failed search once, then reports the tick as not listed", async () => {
     expect(await listInScope(searcher([new Error("rate limit"), [node(1, "alice", "2026-01-01T00:00:00Z")]]), opts)).toHaveLength(1);
     expect(await listInScope(searcher([new Error("rate limit"), new Error("rate limit")]), opts)).toBeUndefined();

@@ -685,8 +685,11 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
     merging ? undefined : { contents: "read", "pull-requests": "read", checks: "write" },
   );
   if (app) steps.push(app);
-  // Only the policy file is read from the tree; no credential is left behind.
-  const checkout = checkoutStep(ctx, { persistCredentials: false });
+  // Only the policy file is read from the tree; no credential is left behind. It
+  // is read from the BASE branch on every trigger: an event run on a pull request
+  // would otherwise check out the PR's merge ref, and a PR could loosen the policy
+  // that judges it.
+  const checkout = checkoutStep(ctx, { persistCredentials: false, ref: ctx.config.repo.base_branch });
   checkout.with = { ...checkout.with, token: "${{ github.token }}" };
   steps.push(checkout);
   steps.push({
@@ -695,6 +698,9 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
     with: {
       merge,
       "check-name": checkName,
+      // This job's own check run (named by its job id: the fragment sets no
+      // display name) is on the PR's head during an event run; it is not CI.
+      "job-check-name": node.id,
       // Merging (and its labels) goes out under the harness identity so it is
       // attributable and its events cascade; a gate that never merges only reads.
       token: merging || app ? tokenExpr(ctx) : "${{ github.token }}",

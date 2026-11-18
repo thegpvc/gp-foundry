@@ -14,6 +14,8 @@
 import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
   isHybrid,
+  parseEvaluateCheckName,
+  publishesCheck,
   isWritingPrLane,
   rolloutOf,
   ALSO_HEAD_ANY_NODE_PATTERN,
@@ -440,6 +442,16 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `}`,
   ];
   const hybrid = isHybrid(ctx.config);
+  // The checks a merge gate publishes. One left in progress on a head (a withdrawn
+  // result waits for a verdict) is waiting on THIS sweep: counted as running, it
+  // would hold the head back from the verdict it waits for.
+  const gateChecks = (ctx.nodes ?? []).filter((n) => n.type === "merge-gate" && publishesCheck(n)).flatMap((n) => {
+    try {
+      return [parseEvaluateCheckName(n)];
+    } catch {
+      return []; // malformed: validate() reports it
+    }
+  });
   const listing: string[] = hybrid
     ? [
         `# The candidates were listed and scoped by the step above: the rollout rule`,
@@ -513,7 +525,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
       ? [`#   not skipped ${[skipBots ? "not opened by a bot (the harness's own is exempt)" : "", Object.keys(skipLabels).length ? "no skip= label" : ""].filter(Boolean).join(", ")}`]
       : []),
     `#   reviews in  no review is still being waited on (no pending review request)`,
-    `#   checks in   every check-run on the head is completed, no commit status`,
+    `#   checks in   every check-run on the head is completed (the gate's own result`,
+    `#               aside: it waits on this lane's verdict), no commit status`,
     `#               pending — and at least one check-run exists, unless the PR has`,
     `#               been quiet for $SETTLE_SECONDS s (a repo with no CI still gets swept)`,
     `#   undecided   no verdict review on this exact head yet, and no earlier`,
@@ -535,7 +548,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  # an older one still in progress.`,
     `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
     `    .check_runs | [ length,`,
-    `      ([.[] | select(.status != "completed")] | length),`,
+    `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP)] | length),`,
     `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP)] | length),`,
     `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP)] | length) ] | @tsv' \\`,
@@ -607,6 +620,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           LIMIT: String(SWEEP_LIMIT),
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
+          ...(gateChecks.length ? { GATE_CHECKS: gateChecks.join("\n") } : {}),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),
           ...skipLabels,

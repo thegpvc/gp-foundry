@@ -52,7 +52,7 @@ import {
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
-import { reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
+import { excludeLabelQualifier, reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
@@ -120,6 +120,50 @@ function rollupCi(
   if (relevant.every((c) => c.status === "completed" && (c.conclusion === "success" || c.conclusion === "skipped" || c.conclusion === "neutral"))) return "passing";
   if (relevant.some((c) => c.status === "in_progress" || c.status === "queued" || c.status === "pending")) return "pending";
   return "unknown";
+}
+
+/**
+ * The gate's own workflow run, as the runtime describes it. An event run of the
+ * gate (a review, a label, a push) is itself a GitHub Actions job attached to the
+ * PR's head, in progress while it reads that head's check runs; left in the CI
+ * rollup, every event run would see "CI pending" and publish `failure`.
+ */
+export interface GateRun {
+  /** GITHUB_RUN_ID: every job of THIS run of the gate workflow. */
+  runId?: string;
+  /** The check-run name GitHub Actions gives the gate's job (the compiler passes it): any earlier run of it. */
+  jobCheckName?: string;
+}
+
+/** The workflow run a GitHub Actions check run belongs to, from its details or html URL (`…/actions/runs/<id>/job/<id>`). */
+export function actionsRunId(c: { details_url?: string | null; html_url?: string | null }): string | undefined {
+  for (const url of [c.details_url, c.html_url]) {
+    const m = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(url ?? "");
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+/**
+ * Is this check run the gate's own job — this run, or an earlier run of the gate
+ * workflow (in progress, cancelled or timed out)? Only GitHub Actions check runs
+ * qualify (an Actions job is always written by the `github-actions` app), then:
+ *
+ *   - its details/html URL names this workflow run (GITHUB_RUN_ID), or
+ *   - its name is the gate job's own check-run name.
+ *
+ * The second rule also drops a job of that name in ANOTHER workflow from the
+ * rollup; the compiler names the gate's job after its node, so give the node an
+ * id no CI job uses. The gate's published result (`check-name`) is left out by
+ * name separately.
+ */
+export function isOwnGateRun(
+  c: { name?: string | null; app?: { slug?: string | null } | null; details_url?: string | null; html_url?: string | null },
+  self: GateRun | undefined,
+): boolean {
+  if (!self || c.app?.slug !== CHECK_APP) return false;
+  if (self.runId && actionsRunId(c) === self.runId) return true;
+  return !!self.jobCheckName && c.name === self.jobCheckName;
 }
 
 // GraphQL is the only API with thread resolution; same shape as agent-context's
@@ -258,7 +302,15 @@ export async function fetchReviewThreads(octokit: Octokit, owner: string, repo: 
   return threads;
 }
 
-export async function gatherFacts(octokit: Octokit, owner: string, repo: string, prNumber: number, policy: PolicyFile, checksOctokit: Octokit = octokit): Promise<PullRequestFacts> {
+export async function gatherFacts(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  policy: PolicyFile,
+  checksOctokit: Octokit = octokit,
+  self?: GateRun,
+): Promise<PullRequestFacts> {
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
   const markers = verdictMarkers(policy);
@@ -330,7 +382,15 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
 
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
-  type CheckRunRaw = { id?: number | null; name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null };
+  type CheckRunRaw = {
+    id?: number | null;
+    name?: string | null;
+    status?: string | null;
+    conclusion?: string | null;
+    app?: { slug?: string | null } | null;
+    details_url?: string | null;
+    html_url?: string | null;
+  };
   let checkRunsRaw: CheckRunRaw[];
   try {
     // Deliberately a SEPARATE token from the one that merges. Reading check-runs
@@ -344,6 +404,10 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     // Fail closed, but say what to wire up — see describeCheckRunsFailure.
     throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }));
   }
+  // The gate's own job is not CI: this run is in progress while it reads, and an
+  // earlier run of the gate cancelled by a newer event would otherwise read as
+  // failing CI. Dropped before anything else reads the list (see isOwnGateRun).
+  checkRunsRaw = checkRunsRaw.filter((c) => !isOwnGateRun(c, self));
   // Superseded attempts are history: judge only the newest attempt of each check, in
   // both the rollup and the requiredChecks gate below.
   checkRunsRaw = latestAttemptPerCheck(checkRunsRaw);
@@ -718,6 +782,8 @@ export async function runEvaluate(opts: {
   selection: CandidateSelection;
   prNumber?: number;
   dryRun: boolean;
+  /** The gate's own workflow run, left out of the CI rollup (see isOwnGateRun). */
+  self?: GateRun;
 }): Promise<{ evaluated: number; written: number }> {
   const { octokit, checksOctokit, owner, repo, checkName } = opts;
   // The gate's own check sits on the head it judges: left in the CI rollup, a
@@ -759,7 +825,7 @@ export async function runEvaluate(opts: {
   let written = 0;
   for (const n of numbers) {
     try {
-      const facts = await gatherFacts(octokit, owner, repo, n, policy, checksOctokit);
+      const facts = await gatherFacts(octokit, owner, repo, n, policy, checksOctokit, opts.self);
       const decision = evaluateMergeGate(facts, policy);
       const out = renderCheckOutput(decision, facts, policy, checkName);
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
@@ -780,6 +846,16 @@ export type MergeSetting = "off" | "agent-only";
 export const GATE_TICK_LIMIT = 20;
 
 /**
+ * The conclusions the single gate publishes, each only from a verdict on the head.
+ * Anything else completed under the check's name is not a result to withdraw: in
+ * particular the `neutral` "Awaiting the approver" that 0.3.x put on undecided
+ * heads. Superseding that with an in-progress run would hold the head in
+ * progress until a verdict arrived, and the approver's sweep used to skip any
+ * head with a check still running — so the verdict never came.
+ */
+const VERDICT_RESULTS = new Set(["success", "failure", "action_required"]);
+
+/**
  * Withdraw the gate's result from a head that no longer has a verdict (the
  * approver's review was dismissed). A completed run is not reopened — its
  * conclusion would stand — but superseded: a NEW run of the same name, in
@@ -790,7 +866,7 @@ export const GATE_TICK_LIMIT = 20;
 export async function withdrawCheck(checksOctokit: Octokit, owner: string, repo: string, headSha: string, name: string, app: string): Promise<boolean> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
-  if (!mine || mine.status !== "completed") return false;
+  if (!mine || mine.status !== "completed" || !VERDICT_RESULTS.has(mine.conclusion ?? "")) return false;
   await checksOctokit.rest.checks.create({
     owner,
     repo,
@@ -835,6 +911,8 @@ export async function runHybridGate(opts: {
   rotation?: number;
   /** Injected clock, for tests. */
   now?: () => number;
+  /** The gate's own workflow run, left out of the CI rollup (see isOwnGateRun). */
+  self?: GateRun;
 }): Promise<{ evaluated: number; written: number; mergedPr: string }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
@@ -862,6 +940,26 @@ export async function runHybridGate(opts: {
   // search for open PRs the bot has reviewed (plus dependabot's, when the policy
   // runs that lane).
   type Pr = { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[] };
+  // Scope is decided from what the listing already carries, BEFORE a scheduled
+  // pass takes its window: a window taken first spends its places on PRs it then
+  // turns away (in a busy repo most reviewed PRs can carry the skip label).
+  const scopeOf = (p: Pr) => {
+    const author = p.user?.login;
+    const scope = inScope(
+      { authorLogin: author, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean) },
+      rollout,
+      botLogin,
+    );
+    // The policy's dependabot lane is its own explicit opt-in, and stays one:
+    // when it is on, dependabot's PRs are judged (and merged) on that lane.
+    const onDependabotLane = dependabotLane && author === DEPENDABOT_LOGIN && !p.draft;
+    return { ...scope, onDependabotLane, admitted: scope.inScope || onDependabotLane };
+  };
+  const windowOfInScope = (all: Pr[]): Pr[] => {
+    const admitted = all.filter((p) => scopeOf(p).admitted);
+    if (admitted.length < all.length) core.info(`${all.length - admitted.length} of ${all.length} candidate(s) out of scope`);
+    return rotatingWindow(admitted, GATE_TICK_LIMIT, opts.rotation ?? 0);
+  };
   let prs: Pr[];
   if (opts.prNumber !== undefined) {
     const one = (await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data;
@@ -882,7 +980,12 @@ export async function runHybridGate(opts: {
         owner,
         repo,
         base: opts.baseBranch,
-        qualifiers: [reviewedByQualifier(botLogin), ...(dependabotLane ? ["author:app/dependabot"] : [])],
+        // The skip label is left out by the search itself too (scope still
+        // decides below). Not for dependabot's lane, which the label does not stop.
+        qualifiers: [
+          [reviewedByQualifier(botLogin), ...excludeLabelQualifier(rollout?.skipLabel)].join(" "),
+          ...(dependabotLane ? ["author:app/dependabot"] : []),
+        ],
       });
     } catch (e) {
       // No fallback to walking every open PR: that is what used to time out.
@@ -890,13 +993,12 @@ export async function runHybridGate(opts: {
       core.notice(`could not search for the PRs to evaluate (${(e as Error).message}) — nothing evaluated this tick; the next tick tries again`);
       return { evaluated: 0, written: 0, mergedPr: "" };
     }
-    const window = rotatingWindow(found, GATE_TICK_LIMIT, opts.rotation ?? 0);
-    core.info(`${found.length} open PR(s) reviewed by ${botLogin}; evaluating ${window.length} this tick`);
-    prs = window.map((c) => ({ number: c.number, draft: c.draft, user: { login: c.author, type: c.authorType }, labels: c.labels.map((name) => ({ name })) }));
+    prs = windowOfInScope(found.map((c) => ({ number: c.number, draft: c.draft, user: { login: c.author, type: c.authorType }, labels: c.labels.map((name) => ({ name })) })));
+    core.info(`${found.length} open PR(s) reviewed by ${botLogin}; evaluating ${prs.length} this tick`);
   } else {
     // No bot login to search by: the original listing, in a rotating window.
     const open = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
-    prs = rotatingWindow(open, GATE_TICK_LIMIT, opts.rotation ?? 0);
+    prs = windowOfInScope(open);
   }
 
   let evaluated = 0;
@@ -909,21 +1011,15 @@ export async function runHybridGate(opts: {
     }
     const n = p.number;
     const author = p.user?.login;
-    const scope = inScope(
-      { authorLogin: author, authorType: p.user?.type, draft: p.draft, labels: p.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean) },
-      rollout,
-      botLogin,
-    );
-    // The policy's dependabot lane is its own explicit opt-in, and stays one:
-    // when it is on, dependabot's PRs are judged (and merged) on that lane.
-    const onDependabotLane = dependabotLane && author === DEPENDABOT_LOGIN && !p.draft;
-    if (!scope.inScope && !onDependabotLane) {
+    const scope = scopeOf(p);
+    const onDependabotLane = scope.onDependabotLane;
+    if (!scope.admitted) {
       core.info(`PR #${n}: out of scope — ${scope.detail}`);
       continue;
     }
     evaluated++;
     try {
-      const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit);
+      const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit, opts.self);
       // No verdict from the approver on this head: no result. A missing required
       // check blocks a merge; a neutral one would PASS it. (The dependabot lane
       // needs no verdict.) A result already on this head — its verdict since
@@ -933,6 +1029,8 @@ export async function runHybridGate(opts: {
         const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
         if (mine && !opts.dryRun && facts.headSha && (await withdrawCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp))) {
           core.info(`PR #${n}: verdict gone from ${facts.headSha.slice(0, 8)} — result withdrawn`);
+        } else if (mine && mine.status === "completed" && !VERDICT_RESULTS.has(mine.conclusion ?? "")) {
+          core.info(`PR #${n}: no verdict on this head yet — its earlier \`${mine.conclusion}\` result (not one this gate publishes) is left as it is`);
         } else {
           core.info(`PR #${n}: no verdict from the approver on this head yet — no result published`);
         }
@@ -954,6 +1052,19 @@ export async function runHybridGate(opts: {
 
       const decision = evaluateMergeGate(facts, checkPolicy);
       const out = renderCheckOutput(decision, facts, checkPolicy, checkName);
+      // An event run lands while the same event's other workflows are still
+      // starting on this head (a review or label starts them too), so CI that is
+      // merely pending says nothing yet. When pending CI is all that stands
+      // between this head and success, an event run publishes nothing and leaves
+      // the head's existing result: the scheduled pass, or the next event, settles
+      // it. Only then: with anything else outstanding (a failing clause, a policy
+      // handoff no longer signed off) the result is published as before, or a
+      // stale success would stand.
+      const ciPendingOnly =
+        opts.prNumber !== undefined &&
+        facts.ciStatus === "pending" &&
+        out.conclusion !== "success" &&
+        checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion === "success";
       // Say, on the PR, who will merge it — the one thing the result alone does not.
       if (opts.merge === "agent-only") {
         const line = onDependabotLane
@@ -964,7 +1075,9 @@ export async function runHybridGate(opts: {
         out.text = out.text ? `${out.text}\n\n${line}` : line;
       }
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
-      if (!opts.dryRun && facts.headSha && !verdictless) {
+      if (ciPendingOnly && !verdictless) {
+        core.info(`PR #${n}: CI is still running on ${(facts.headSha ?? "").slice(0, 8)} — no result from an event run; the scheduled pass settles it`);
+      } else if (!opts.dryRun && facts.headSha && !verdictless) {
         const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
         if (result !== "unchanged") written++;
         core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
@@ -983,6 +1096,13 @@ export async function runHybridGate(opts: {
   }
   core.info(`${evaluated} PR(s) in scope${mergedPr ? `; merged #${mergedPr}` : ""}`);
   return { evaluated, written, mergedPr };
+}
+
+/** The gate's own run: GITHUB_RUN_ID from the runner, the job's check-run name from the compiler. */
+function gateRunFromEnv(): GateRun {
+  const runId = (process.env.GITHUB_RUN_ID ?? "").trim();
+  const jobCheckName = core.getInput("job-check-name").trim();
+  return { ...(runId ? { runId } : {}), ...(jobCheckName ? { jobCheckName } : {}) };
 }
 
 export async function run(): Promise<void> {
@@ -1065,6 +1185,7 @@ export async function run(): Promise<void> {
         // The window advances once per schedule period: computed from the clock,
         // not a run counter, which event runs of the same workflow also advance.
         rotation: Math.floor(Date.now() / (1000 * (parseInt(core.getInput("rotation-period-seconds"), 10) || 300))),
+        self: gateRunFromEnv(),
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));
@@ -1086,6 +1207,7 @@ export async function run(): Promise<void> {
       const { evaluated, written } = await runEvaluate({
         octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun,
         selection: selectionFromInputs((n) => core.getInput(n), policy.botLogin),
+        self: gateRunFromEnv(),
       });
       core.setOutput("evaluated", String(evaluated));
       core.setOutput("checks-written", String(written));
@@ -1098,7 +1220,7 @@ export async function run(): Promise<void> {
     if (prNumberInput) {
       const prNumber = parseInt(prNumberInput, 10);
       if (Number.isNaN(prNumber)) throw new Error("pr-number must be an integer");
-      const facts = await gatherFacts(octokit, owner, repo, prNumber, policy, checksOctokit);
+      const facts = await gatherFacts(octokit, owner, repo, prNumber, policy, checksOctokit, gateRunFromEnv());
       const decision = evaluateMergeGate(facts, policy);
       const merged = await actOnDecision(octokit, owner, repo, prNumber, facts, decision, policy, dryRun);
       core.setOutput("action", decision.action);
@@ -1114,7 +1236,7 @@ export async function run(): Promise<void> {
     core.info(`${candidates.length} candidate PR(s): ${candidates.join(", ") || "(none)"}`);
     let mergedPr = "";
     for (const n of candidates) {
-      const facts = await gatherFacts(octokit, owner, repo, n, policy, checksOctokit);
+      const facts = await gatherFacts(octokit, owner, repo, n, policy, checksOctokit, gateRunFromEnv());
       const decision = evaluateMergeGate(facts, policy);
       const merged = await actOnDecision(octokit, owner, repo, n, facts, decision, policy, dryRun);
       if (merged) { mergedPr = String(n); break; } // one merge per run

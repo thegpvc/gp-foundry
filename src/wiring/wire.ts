@@ -14,6 +14,7 @@ import {
   isWritingPrLane,
   rolloutOf,
   scopePrefilter,
+  singleGatePrefilter,
   authorClause,
   authorsOf,
   exprString,
@@ -24,6 +25,7 @@ import {
   NO_AUTHOR,
 } from "../handlers/attrs.js";
 import { detectDiamonds } from "./diamond.js";
+import type { Rollout } from "../shared/scope.js";
 
 const AGENT = new Set(AGENT_TYPES);
 const PR_CONTEXT_TYPES = new Set(["pr-review", "pr-fix"]);
@@ -295,7 +297,7 @@ const GATE_PR_EVENTS = ["synchronize", "reopened", "ready_for_review", "labeled"
  * the scheduled pass covers those PRs. Only PRs into the configured base
  * branch. Scope (the rollout) is decided inside the gate, against the live PR.
  */
-function singleGateGuard(baseBranch: string): string {
+function singleGateGuard(baseBranch: string, rollout: Rollout, botLogin: string | undefined): string {
   const pr = "github.event.pull_request";
   // Labels are NOT filtered by who applied them: the harness identity is shared
   // by every lane, and a reviewer's escalation or hold label must reach the gate.
@@ -305,6 +307,10 @@ function singleGateGuard(baseBranch: string): string {
     `${pr}.base.ref == ${exprString(baseBranch)}`,
     `${pr}.head.repo.full_name == github.repository`,
     `github.actor != 'dependabot[bot]'`,
+    // A cheap scope test on the payload, so an event on a draft, a skipped PR or
+    // another bot's PR does not start a run. The gate still decides on the live PR.
+    // (On `unlabeled` the removed skip label is already gone from the payload.)
+    singleGatePrefilter(rollout, botLogin),
   ].join(" && ");
   return `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (${event})`;
 }
@@ -460,7 +466,7 @@ export function wire(ir: Harness): WiringPlan {
     if (guard) nw.guard = guard;
     if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? optIn : undefined);
     if (singleGate) {
-      nw.guard = singleGateGuard(ir.config.repo.base_branch);
+      nw.guard = singleGateGuard(ir.config.repo.base_branch, rollout ?? {}, botLogin);
       // One slot per PR for event runs, newest wins: a burst of events on a PR
       // collapses to one evaluation of its latest state. The scheduled pass has
       // its own slot and is never cancelled by an event.

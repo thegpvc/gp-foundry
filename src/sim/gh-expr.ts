@@ -12,7 +12,17 @@
 export type Ctx = Record<string, unknown>;
 
 export function resolvePath(ctx: Ctx, path: string): unknown {
-  return path.split(".").reduce<unknown>((o, k) => (o == null ? undefined : (o as any)[k]), ctx);
+  // `a.*.b` is an object filter, as in GitHub: `b` of every element of `a`, as a list.
+  const step = (o: unknown, k: string): unknown => {
+    if (o == null) return undefined;
+    if (Array.isArray(o) && (o as { __filtered?: boolean }).__filtered) {
+      return filtered(o.map((x) => step(x, k)).filter((x) => x !== undefined));
+    }
+    if (k === "*") return filtered(Array.isArray(o) ? [...o] : typeof o === "object" ? Object.values(o as object) : []);
+    return (o as any)[k];
+  };
+  const filtered = (a: unknown[]) => Object.defineProperty(a, "__filtered", { value: true, enumerable: false });
+  return path.split(".").reduce<unknown>(step, ctx);
 }
 
 // ── tokenizer ───────────────────────────────────────────────────────────────

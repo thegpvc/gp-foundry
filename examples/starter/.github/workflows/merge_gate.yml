@@ -26,7 +26,7 @@ permissions:
 jobs:
   merge_gate:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && github.event.pull_request.user.login == 'agent-bot')
     permissions:
       contents: read
       pull-requests: read
@@ -37,12 +37,14 @@ jobs:
         uses: actions/checkout@v5
         with:
           token: ${{ github.token }}
+          ref: main
           persist-credentials: false
       - name: Evaluate merge gate (publish check, never merge)
-        uses: thegpvc/gp-foundry/actions/merge-gate@v0.4.0
+        uses: thegpvc/gp-foundry/actions/merge-gate@v0.4.1
         with:
           merge: "off"
           check-name: gp-foundry/approval (merge_gate)
+          job-check-name: merge_gate
           token: ${{ github.token }}
           checks-token: ${{ github.token }}
           policy-path: .github/agents/policy/merge.yaml

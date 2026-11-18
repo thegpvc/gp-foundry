@@ -42,8 +42,11 @@ scheduled pass (which runs on the default branch with secrets).
 
 1. **A targeted run per PR on the events above** — reviews (the approver's verdict
    included), labels, review requests, new commits, ready for review — evaluating that
-   one PR. One concurrency slot per PR, newest wins. Fork and Dependabot-triggered events,
-   closed PRs and labels the harness applied itself do nothing. This is what gets a
+   one PR. One concurrency slot per PR, newest wins. Fork and Dependabot-triggered events
+   and closed PRs do nothing; so (from 0.4.1) do events on drafts, skip-labelled PRs and
+   other bots' PRs. A label the harness identity applies DOES run the gate: the
+   reviewer's hold or escalation label must reach it, and the compiler cannot tell
+   those from the gate's own labels, which cost one extra, converging run. This is what gets a
    verdicted head its result: within seconds of the verdict, not a tick later.
 2. **No result without a verdict.** A head the approver has not decided gets no check.
    GitHub counts `success`, `neutral` and `skipped` as passing a required status check,
@@ -70,6 +73,31 @@ scheduled pass (which runs on the default branch with secrets).
 The first version ordered the pass by "least recently evaluated", which needed a read
 per open PR and a timestamp written into every result, and published a neutral result on
 every in-scope PR. Both are gone.
+
+### Fixed in 0.4.1 (pre-integration review)
+
+- **An event run counted its own job as pending CI.** On a PR event the gate's job
+  is a check run on the head, in progress while it reads. Every event run published
+  `failure`, which with a formal-approval workflow looped (success → APPROVE → event
+  → failure → approval dismissed → …). The rollup now leaves out GitHub Actions check
+  runs of this workflow run (`GITHUB_RUN_ID` in the run's URL) and any run of the
+  gate's job by name (`job-check-name`, which the compiler writes), so an earlier,
+  cancelled run never counts either.
+- **Other workflows start on the same event.** An event run whose result would
+  differ only because CI is still pending publishes nothing and leaves the current
+  result; the pass or the next event settles it. Failed CI, and any other failing
+  clause, are still published.
+- **The policy came from the PR on PR events.** The gate's checkout now names the
+  base branch on every trigger. (A PR that edits the workflow file itself still runs
+  its own copy on `pull_request`; `.github/` belongs among the protected paths.)
+- **Skipped PRs filled the window.** The pass applies the scope rule before taking
+  its window (and the search leaves out the skip label), so a tick evaluates up to
+  20 PRs in scope.
+- **A leftover 0.3 `neutral` became a permanent in-progress run.** Only a result
+  0.4 publishes from a verdict (success, failure, action_required) is withdrawn; the
+  approver's sweep no longer waits on the gate's own check.
+- **Runs that could only find a PR out of scope.** The job's `if:` turns away
+  events on drafts, skip-labelled PRs and other bots' PRs.
 
 ### Measured (stub API)
 

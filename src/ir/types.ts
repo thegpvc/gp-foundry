@@ -272,6 +272,8 @@ export interface EmitContext {
   actionRef: (name: string) => string;
   /** Look up another node — a handler that must reason about its neighbours. */
   nodeById: (id: string) => HarnessNode | undefined;
+  /** Every node of the harness — a handler that must reason about the whole graph. */
+  nodes?: HarnessNode[];
   /** Directory of harness.dot relative to the repo root (e.g. ".github"); prefixes file paths. */
   specDir: string;
   /**

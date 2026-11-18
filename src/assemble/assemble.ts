@@ -190,6 +190,7 @@ export function assemble(
     inEdges: inByNode.get(node.id) ?? [],
     actionRef,
     nodeById: (id: string) => byId.get(id),
+    nodes: ir.nodes,
     specDir,
     specFile: (ir.sourcePath ?? "harness.dot").split(/[\\/]/).pop() || "harness.dot",
     roleTools: extra.roleTools,
