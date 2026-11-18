@@ -191,6 +191,9 @@ rollout:
   # skip_label: no-agent-review
 ```
 
+- **Asking it to look again.** With `labels: { re_review: re-review }`, adding that label
+  gets a fresh review and a fresh verdict on the same head; the gate holds its check and
+  merges nothing until then, then removes the label.
 - **What the pipeline looks at.** Its own PRs always; then whoever the rollout admits.
   Drafts and other bots' PRs never. `rollout: {}` is every PR.
 - **What it may change.** Lanes that read (the reviewer, the gate's check) run on any PR in

@@ -168,6 +168,11 @@ the commit it evaluated; turn on "require branches to be up to date" in branch
 protection if merges must be serialized against the latest base. A merge another run
 already made is not reported as a rejection.
 
+**Re-review (`rereview-label`).** While that label is on a PR, only verdicts posted after
+it was last added count. Until one exists the check is put back to in progress ("Re-review
+requested") and nothing is merged; once one exists the gate removes the label and judges the
+head as usual. The token needs `issues: write` to remove it.
+
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
 
@@ -270,6 +275,7 @@ one identity. A rejection counts from anyone, including the author.
 | `mode`        | no       | `merge` (default when `merge` is unset) or `evaluate` (publish a check run per head, never merge). Not together with `merge`. |
 | `check-name`  | evaluate | The check run evaluate mode publishes. |
 | `authors`, `opt-in-label`, `skip-labels`, `skip-bot-authors` | no | Evaluate-mode PR selection (comma-separated logins / labels; `"true"`). |
+| `rereview-label` | no   | With `merge`: the re-review label (see above). Empty: off. |
 | `dry-run`     | no       | `"true"` to evaluate + emit outputs without mutating. |
 
 ## Outputs

@@ -18,6 +18,7 @@ import { parseRollout } from "../shared/scope.js";
 import type { MergeSetting } from "./attrs.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
+  rereviewLabelOf,
   authorsOf,
   diffMarkerPrefix,
   gatesOf,
@@ -680,9 +681,12 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   // "off" needs to read PRs and write checks, nothing more. A merging gate is left
   // on the App's own permissions, like the original merge gate: what a merge
   // needs is open-ended (a PR that touches workflows needs `workflows`).
+  // With a re-review label the gate also removes that label when a fresh verdict
+  // arrives, which needs write on issues.
+  const rereview = rereviewLabelOf(ctx.config);
   const app = appTokenStep(
     ctx,
-    merging ? undefined : { contents: "read", "pull-requests": "read", checks: "write" },
+    merging ? undefined : { contents: "read", "pull-requests": "read", checks: "write", ...(rereview ? { issues: "write" as const } : {}) },
   );
   if (app) steps.push(app);
   // Only the policy file is read from the tree; no credential is left behind. It
@@ -712,6 +716,7 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ...(verdictsInput(ctx) ? { verdicts: verdictsInput(ctx)! } : {}),
       ...(requiredChecks.length ? { "required-checks": requiredChecks.join(",") } : {}),
       ...(rollout ? { rollout } : {}),
+      ...(rereview ? { "rereview-label": rereview } : {}),
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
       "pr-number": "${{ github.event.pull_request.number }}",
@@ -731,7 +736,7 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ? { contents: "read" }
       : merging
         ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write" }
-        : { contents: "read", "pull-requests": "read", checks: "write" },
+        : { contents: "read", "pull-requests": "read", checks: "write", ...(rereview ? { issues: "write" as const } : {}) },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
   };

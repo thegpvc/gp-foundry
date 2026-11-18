@@ -26,6 +26,13 @@ inputs:
       tick: `listed` is "false".
     required: false
     default: ""
+  rereview-label:
+    description: >-
+      With `list`: the re-review label. A listed PR carrying it gets `since`:
+      when the label was last added, so the sweep counts only verdicts, reviews
+      and its own records from after it.
+    required: false
+    default: ""
   base-branch:
     description: "With `list`: only PRs targeting this branch."
     required: false

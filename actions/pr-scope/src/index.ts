@@ -15,6 +15,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { inScope, isAgentWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
 import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
+import { lastLabeledAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
@@ -88,6 +89,8 @@ export interface ScopedPr {
   requested: number;
   /** Seconds since the PR last changed. */
   quiet: number;
+  /** When a re-review was requested (the re-review label last added), if the PR carries it. */
+  since?: string;
 }
 
 /**
@@ -98,16 +101,43 @@ export interface ScopedPr {
  */
 export async function listInScope(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string },
 ): Promise<ScopedPr[] | undefined> {
+  const out = await listCandidates(octokit, opts);
+  if (!out || !opts.rereviewLabel) return out?.map(({ labels: _l, ...p }) => p);
+  // A PR carrying the re-review label: when it was added (one read per such PR).
+  // Unreadable counts as "just now", so nothing from before it is mistaken as fresh.
+  const result: ScopedPr[] = [];
+  for (const { labels, ...p } of out) {
+    if (!labels.includes(opts.rereviewLabel)) {
+      result.push(p);
+      continue;
+    }
+    let since: string | undefined;
+    try {
+      const events = await octokit.paginate(octokit.rest.issues.listEvents, { owner: opts.owner, repo: opts.repo, issue_number: p.number, per_page: 100 });
+      since = lastLabeledAt(events as LabelEvent[], opts.rereviewLabel);
+    } catch {
+      // fall through
+    }
+    result.push({ ...p, since: since ?? new Date(opts.nowMs ?? Date.now()).toISOString() });
+  }
+  return result;
+}
+
+async function listCandidates(
+  octokit: Octokit,
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string },
+): Promise<(ScopedPr & { labels: string[] })[] | undefined> {
   const { owner, repo } = opts;
   const now = opts.nowMs ?? Date.now();
-  const toScoped = (c: Candidate): ScopedPr => ({
+  const toScoped = (c: Candidate): ScopedPr & { labels: string[] } => ({
     number: c.number,
     sha: c.sha,
     base: c.base,
     requested: c.requested,
     quiet: Math.max(0, Math.floor((now - c.updatedAt) / 1000)),
+    labels: c.labels,
   });
   const keep = (c: Candidate) => {
     const scope = inScope({ authorLogin: c.author, authorType: c.authorType, draft: c.draft, labels: c.labels }, opts.rollout, opts.botLogin);
@@ -199,6 +229,7 @@ export async function run(): Promise<void> {
         rollout,
         botLogin: core.getInput("bot-login").trim() || undefined,
         reviewedBy: core.getInput("reviewed-by").trim() || undefined,
+        rereviewLabel: core.getInput("rereview-label").trim() || undefined,
       });
       core.setOutput("listed", String(prs !== undefined));
       core.setOutput("prs", JSON.stringify(prs ?? []));
