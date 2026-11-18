@@ -127,34 +127,76 @@ post() {
   jq -c --arg m "$POSTED" '.body += "\\n\\n" + $m' "$1" > "$1.out"
   gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1.out" > "$RESP" 2> "$ERR"
 }
+# Why a post failed, on one line. gh prints only "gh: <status> (HTTP <code>)" on
+# stderr; GitHub's error body, with the reason, goes to stdout ($RESP).
+why() {
+  local detail
+  detail=$(jq -r 'if type == "object" then [(.message // empty), ((.errors // [])[] | if type == "string" then . else (.message // tojson) end)] | join(" — ") else tojson end' "$RESP" 2> /dev/null) \\
+    || detail=$(head -c 300 "$RESP")
+  printf '%s %s' "$(head -c 200 "$ERR")" "$detail" | tr '\\n\\r' '  ' | head -c 500 || true
+}
 # The review's own URL, from the API's response, for the job summary.
 posted_note() {
   URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
   if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
 }
-if post "$PAYLOAD"; then
+# Move inline findings into the body, as a list before the verdict line (on a
+# verdict lane) or at the end. $2 is a JSON array of the paths whose comments
+# stay inline, or null to move every one. Nothing to move leaves the review as it is.
+flatten() {
+  jq -c --argjson rv "$([ "$REQUIRE_VERDICT" = "true" ] && echo true || echo false)" --argjson keep "$2" '
+    def kept: $keep != null and (.path as $p | $keep | any(. == $p));
+    [.comments[] | select(kept | not)] as $moved
+    | if ($moved | length) == 0 then . else
+        ("### Findings on unchanged lines\\n\\n" + ([$moved[] | "- \`\\(.path):\\(.line)\` — \\(.body | gsub("\\n"; " "))"] | join("\\n"))) as $f
+        | (.body | sub("\\\\s+$"; "") | split("\\n")) as $l
+        | .body = ((if $rv then ($l[:-1] + [$f, ""] + $l[-1:]) else ($l + ["", $f]) end) | join("\\n"))
+        | .comments = [.comments[] | select(kept)]
+      end' "$1"
+}
+
+# GitHub rejects the whole review when one inline comment is on a file outside
+# the PR's diff. Move those into the body before posting, from one read of the
+# changed files. If that read fails, post as is: the 422 retry below still holds.
+if [ "$(jq '.comments | length' "$PAYLOAD")" != "0" ]; then
+  if FILES=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100" --paginate --jq '.[].filename' 2> "$ERR" \\
+      | jq -R -s -c 'split("\\n") | map(select(length > 0))'); then
+    flatten "$PAYLOAD" "$FILES" > "$PAYLOAD.post"
+    MOVED=$(( $(jq '.comments | length' "$PAYLOAD") - $(jq '.comments | length' "$PAYLOAD.post") ))
+    if [ "$MOVED" != "0" ]; then
+      echo "::notice::$MOVED inline comment(s) on files outside the PR's diff — posting them in the body instead"
+    fi
+  else
+    echo "::warning::could not read the PR's changed files ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — posting the inline comments as they are"
+    cp "$PAYLOAD" "$PAYLOAD.post"
+  fi
+else
+  cp "$PAYLOAD" "$PAYLOAD.post"
+fi
+if post "$PAYLOAD.post"; then
   echo "posted the review on $HEAD_SHA"
   posted_note
   exit 0
 fi
 
-# GitHub rejects the whole review when one inline comment is on a line outside
-# the diff, and does not say which. Retry once with every inline finding moved
-# into the body (before the verdict line, on a verdict lane).
-if grep -q "422" "$ERR" && grep -qiE "line|diff|position|resolve" "$ERR" && [ "$(jq '.comments | length' "$PAYLOAD")" != "0" ]; then
-  echo "::warning::GitHub rejected an inline comment ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — posting the findings in the body instead"
-  jq -c --argjson rv "$([ "$REQUIRE_VERDICT" = "true" ] && echo true || echo false)" '
-    ("### Findings on unchanged lines\\n\\n" + ([.comments[] | "- \`\\(.path):\\(.line)\` — \\(.body | gsub("\\n"; " "))"] | join("\\n"))) as $f
-    | (.body | sub("\\\\s+$"; "") | split("\\n")) as $l
-    | .body = ((if $rv then ($l[:-1] + [$f, ""] + $l[-1:]) else ($l + ["", $f]) end) | join("\\n"))
-    | .comments = []' "$PAYLOAD" > "$PAYLOAD.flat"
+# A comment on a changed file but a line outside its hunks still gets the whole
+# review rejected with a 422, and GitHub does not say which comment. Retry once
+# with every inline finding moved into the body (built from the original, so the
+# body holds one list). Any 422 with inline comments retries, whatever its
+# wording ("Line could not be resolved", "Path could not be resolved", "must be
+# part of the diff", ...): the retry posts the same findings unanchored, so the
+# worst case is one more rejected POST. A 422 with no inline comments has
+# nothing to move and fails below.
+if grep -qs "HTTP 422" "$ERR" "$RESP" && [ "$(jq '.comments | length' "$PAYLOAD.post")" != "0" ]; then
+  echo "::warning::GitHub rejected an inline comment ($(why)) — posting the findings in the body instead"
+  flatten "$PAYLOAD" null > "$PAYLOAD.flat"
   if post "$PAYLOAD.flat"; then
     echo "posted the review on $HEAD_SHA, with its inline findings in the body"
     posted_note
     exit 0
   fi
 fi
-echo "::error::could not post the review: $(head -c 500 "$ERR" | tr '\\n\\r' '  ')"
+echo "::error::could not post the review: $(why)"
 note "_No review was posted: GitHub rejected it. See the job log._"
 exit 1
 `;
