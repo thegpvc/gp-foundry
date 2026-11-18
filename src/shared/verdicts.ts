@@ -75,3 +75,55 @@ export function bodyVerdict(body: string | null | undefined, words: VerdictWords
   if (last === verdictLine(words.escalate)) return "escalate";
   return undefined;
 }
+
+// ── quiet verdicts: a verdict delivered as a check run ───────────────────────
+
+/** A quiet verdict check's title: `Verdict: <WORD>`. */
+export const QUIET_TITLE_PREFIX = "Verdict: ";
+
+/** The fields of a check run a quiet-verdict reader looks at. */
+export interface QuietCheckRunLike {
+  name?: string | null;
+  status?: string | null;
+  completed_at?: string | null;
+  head_sha?: string | null;
+  app?: { slug?: string | null } | null;
+  output?: { title?: string | null; summary?: string | null } | null;
+}
+
+/**
+ * THE definition of a quiet verdict (quiet_verdicts=), for every TypeScript
+ * reader — the gate and the agent context. A check run is one when it is a
+ * named verdict check, completed, owned by the harness App (compared without
+ * case: an App's slug is lower-case, a configured login may not be), on the
+ * head when one is given, and titled `Verdict: <WORD>`. The jq readers use
+ * QUIET_CHECK_JQ, which says the same.
+ */
+export function quietVerdictOf(
+  run: QuietCheckRunLike,
+  o: { checks: string[]; app: string; headSha?: string },
+): { word: string; at: string; summary: string; name: string } | undefined {
+  const name = run.name ?? "";
+  const title = (run.output?.title ?? "").trim();
+  if (!o.checks.includes(name)) return undefined;
+  if ((run.app?.slug ?? "").toLowerCase() !== o.app.toLowerCase()) return undefined;
+  if (run.status !== "completed" || !run.completed_at) return undefined;
+  if (o.headSha && run.head_sha && run.head_sha !== o.headSha) return undefined;
+  if (!title.startsWith(QUIET_TITLE_PREFIX)) return undefined;
+  const word = title.slice(QUIET_TITLE_PREFIX.length);
+  if (!WORD.test(word)) return undefined;
+  return { word, at: run.completed_at, summary: run.output?.summary ?? "", name };
+}
+
+/**
+ * The same definition as a jq boolean over one check-run object, for the bash
+ * readers (the post step, the sweep's select and mark jobs). Reads
+ * env.VERDICT_CHECK, env.BOT_APP and env.SINCE (a re-review request: only a
+ * check completed after it counts; empty: any).
+ */
+export const QUIET_CHECK_JQ =
+  `(.name == env.VERDICT_CHECK` +
+  ` and ((.app.slug // "") | ascii_downcase) == (env.BOT_APP | ascii_downcase)` +
+  ` and .status == "completed"` +
+  ` and ((.output.title // "") | test("^${QUIET_TITLE_PREFIX}[A-Za-z][A-Za-z0-9_-]*$"))` +
+  ` and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))`;

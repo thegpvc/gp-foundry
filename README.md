@@ -191,6 +191,9 @@ rollout:
   # skip_label: no-agent-review
 ```
 
+- **Quiet approvals.** `quiet_verdicts="APPROVE"` on the approver delivers an approval as a
+  check run on the head instead of a review: no timeline entry, no notification. Anything
+  that needs the author (changes requested, escalation) is still a review.
 - **Asking it to look again.** With `labels: { re_review: re-review }`, adding that label
   gets a fresh review and a fresh verdict on the same head; the gate holds its check and
   merges nothing until then, then removes the label.

@@ -120,6 +120,10 @@ export interface CheckRunData {
   status: string;
   conclusion: string | null;
   started_at?: string | null;
+  completed_at?: string | null;
+  head_sha?: string | null;
+  app?: { slug?: string | null } | null;
+  output?: { title?: string | null; summary?: string | null } | null;
 }
 
 /** The union of all shapes {@link formatContext} may receive. */

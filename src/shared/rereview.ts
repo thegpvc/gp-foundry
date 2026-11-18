@@ -18,8 +18,9 @@
  *   - "fresh" is strictly after it. GitHub's timestamps are whole seconds in UTC
  *     ("…:SSZ"), so they compare as strings; a record from the label's own second
  *     is not fresh (a real review takes far longer than that);
- *   - a request that cannot be dated (no matching event) has no cutoff: it cannot
- *     hold anything forever.
+ *   - a request that cannot be dated (the label is on, but its latest event is not
+ *     a labeled one) is answered by no verdict: the gate holds and says to re-add
+ *     the label — usually a moment's lag in the events API, cleared on the next run.
  *
  * What a component does when the label history cannot be READ is its own,
  * fail-safe choice (the gate holds, the sweep waits a tick, the post step posts).

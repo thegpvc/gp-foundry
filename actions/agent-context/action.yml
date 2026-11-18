@@ -63,6 +63,18 @@ inputs:
       and downstream steps.
     default: ""
 
+  verdict-checks:
+    description: >
+      Newline-separated names of check runs that carry a lane's verdict instead
+      of a review (quiet_verdicts=). Completed runs of these, owned by
+      `verdict-app` and titled `Verdict: <WORD>`, are listed with the reviews.
+      Needs `checks-token`. The compiler writes it.
+    required: false
+    default: ""
+  verdict-app:
+    description: "With `verdict-checks`: the harness App's slug, the only app whose verdict checks count."
+    required: false
+    default: ""
 outputs:
   context-file:
     description: Path to the formatted context file

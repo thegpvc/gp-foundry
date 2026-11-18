@@ -6,9 +6,11 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, nudgedGatesOf, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 import { LABEL_EVENTS_JQ } from "../shared/rereview.js";
+import { QUIET_CHECK_JQ, QUIET_TITLE_PREFIX, VERDICT_PREFIX } from "../shared/verdicts.js";
+import { resolveAuth } from "../auth/auth.js";
 
 const SCRIPT = `set -euo pipefail
 # post="review": the agent printed its review; this step posts it with the lane's
@@ -104,15 +106,24 @@ MARKER="\${MARKER//<sha>/$HEAD_SHA}"
 POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
 SINCE=""
 if [ -n "\${REREVIEW_LABEL:-}" ]; then
-  # The request time: the label's last "labeled" event, if that is its latest
-  # event (removed by hand, there is no request). See src/shared/rereview.ts.
-  if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '__LABEL_EVENTS_JQ__' | sort | tail -n 1); then
-    case "$LAST_EVENT" in *" labeled") SINCE="\${LAST_EVENT%% *}" ;; esac
-  else
-    # Unknown: post. On a first run nothing is lost either way; on a re-run of a
-    # re-review the worst case is the review posted twice, not a request dropped.
-    echo "::warning::could not read the PR's label history — posting without the re-review check"
-    SINCE="9999"
+  # Only a PR that carries the label has a request to answer.
+  if ! LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels?per_page=100" --paginate --jq '.[].name'); then
+    echo "::warning::could not read the PR's labels — any re-review request is left for the next run"
+  elif grep -qxF -- "$REREVIEW_LABEL" <<< "$LABELS"; then
+    # The request time: the label's latest event in the API's (chronological)
+    # order, if that is a "labeled" one. See src/shared/rereview.ts.
+    if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '__LABEL_EVENTS_JQ__' | tail -n 1); then
+      case "$LAST_EVENT" in
+        *" labeled") SINCE="\${LAST_EVENT%% *}" ;;
+        # On, but undateable: the request stands; nothing earlier answers it.
+        *) SINCE="9999" ;;
+      esac
+    else
+      # The label is on but its history is unreadable: post. The worst case is
+      # the review posted twice on a re-run, not a request dropped.
+      echo "::warning::could not read the PR's label history — posting without the re-review check"
+      SINCE="9999"
+    fi
   fi
 fi
 export MARKER POSTED SINCE
@@ -128,6 +139,7 @@ if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100"
   echo "::error::could not read the PR's reviews — not posting, so a re-run cannot post the review twice"
   exit 1
 fi
+__QUIET_EXISTING__
 if [ "$EXISTING" != "0" ]; then
   echo "$NODE has already posted its review on $HEAD_SHA — not posting it again"
   note "_The review for this head was already posted; nothing new was posted._"
@@ -173,6 +185,7 @@ flatten() {
       end' "$1"
 }
 
+__QUIET_POST__
 # GitHub rejects the whole review when one inline comment is on a file outside
 # the PR's diff. Move those into the body before posting, from one read of the
 # changed files. If that read fails, post as is: the 422 retry below still holds.
@@ -219,11 +232,84 @@ note "_No review was posted: GitHub rejected it. See the job log._"
 exit 1
 `;
 
+/**
+ * quiet_verdicts=: the lane's earlier quiet verdict on this head (a check run from
+ * the harness App, after any re-review request) counts as posted, like a review.
+ */
+const QUIET_EXISTING = `# quiet_verdicts: a verdict delivered as a check run counts as posted too — this
+# lane's check on this head, from the harness App, after any re-review request.
+if ! QUIET_EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '
+  [.check_runs[] | select(__QUIET_CHECK_JQ__)] | length' \\
+  | awk '{s+=$1} END {print s+0}'); then
+  echo "::error::could not read the head's check runs — not posting, so a re-run cannot deliver the verdict twice"
+  exit 1
+fi
+EXISTING=$((EXISTING + QUIET_EXISTING))
+`;
+
+/**
+ * quiet_verdicts=: a quiet verdict is delivered as a completed check run on the
+ * head instead of a review. The title is built from the verdict line itself (the
+ * body's last visible line, which IS_QUIET_JQ matched); the summary is the
+ * visible body above it, with any inline findings listed after it. Signed by the
+ * lane's token — the harness App's. If that token's App is not the one every
+ * reader trusts (identity.bot_login), nobody would see the check: post a review.
+ */
+const QUIET_POST = `# quiet_verdicts: a verdict that needs nothing from the author is delivered as a
+# check run on the head, owned by the harness App — no timeline entry, no
+# notification. The gate and the sweep read it like a verdict review.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+QUIET_OK=""
+if jq -e '__IS_QUIET_JQ__' <<< "$REVIEW" > /dev/null; then
+  if [ -n "\${MINTED_APP:-}" ] && [ "$(lower "$MINTED_APP")" != "$(lower "$BOT_APP")" ]; then
+    echo "::warning::the lane's token belongs to the App '$MINTED_APP', but identity.bot_login names '$BOT_APP' — no reader would trust its check, so the verdict is posted as a review"
+  else
+    QUIET_OK=1
+  fi
+fi
+if [ -n "$QUIET_OK" ]; then
+  QUIET=$(mktemp)
+  jq -c --arg name "$VERDICT_CHECK" --arg sha "$HEAD_SHA" --arg ext "gp-foundry:verdict:$NODE:$HEAD_SHA" '
+    (.body | gsub("<!--[\\\\s\\\\S]*?-->"; "") | split("\\n") | map(sub("\\\\s+$"; ""))) as $l
+    | ([$l | to_entries[] | select(.value | test("\\\\S")) | .key] | last) as $i
+    | ($l[$i] | gsub("^\\\\s+|\\\\s+$"; "")) as $v
+    | ($l[:$i] | join("\\n") | sub("\\\\s+$"; "")) as $above
+    | [(.comments // [])[] | "- \`\\(.path):\\(.line)\` — \\(.body | gsub("\\n"; " "))"] as $f
+    | (if ($f | length) == 0 then $above
+       else ($above + (if ($above | length) > 0 then "\\n\\n" else "" end) + "### Findings\\n\\n" + ($f | join("\\n"))) end) as $b
+    | {name: $name, head_sha: $sha, status: "completed", conclusion: "success", external_id: $ext,
+       output: {title: ("__QUIET_TITLE_PREFIX__" + ($v | ltrimstr("__VERDICT_PREFIX__") | gsub("^\\\\s+"; ""))),
+                summary: (if ($b | length) == 0 then "(no findings)" else $b[0:65000] end)}}' <<< "$REVIEW" > "$QUIET"
+  if gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input "$QUIET" > "$RESP" 2> "$ERR"; then
+    echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
+    URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
+    if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \\\`$VERDICT_CHECK\\\` on $HEAD_SHA."; fi
+    # A check run starts no gate run (a review would, by its event): nudge each
+    # gate to evaluate this PR now. Best effort — the gate's scheduled pass
+    # reaches it anyway.
+    for WF in \${GATE_WORKFLOWS:-}; do
+      if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" \\
+          -f ref="$BASE_BRANCH" -f "inputs[pr]=$PR" > /dev/null 2> "$ERR"; then
+        echo "asked $WF to evaluate #$PR now"
+      else
+        echo "::warning::could not start $WF for #$PR ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — its scheduled pass will evaluate it"
+      fi
+    done
+    exit 0
+  fi
+  echo "::error::could not deliver the verdict as a check: $(why)"
+  note "_No verdict was delivered: GitHub rejected the check run. See the job log._"
+  exit 1
+fi
+`;
+
 /** The post step: after run-agent (`id: agent`), only when the agent succeeded. */
 export function postReviewStep(
   ctx: EmitContext,
   opts: { prNumber: string; headSha: string; verdictLane: boolean },
 ): StepSpec {
+  const quiet = opts.verdictLane ? quietVerdictsOf(ctx.node, ctx.config) : undefined;
+  const gates = quiet ? nudgedGatesOf(ctx.nodes ?? [], ctx.config) : [];
   let marker = DEFAULT_POST_MARKER;
   try {
     marker = parsePostMarker(ctx.node);
@@ -245,8 +331,28 @@ export function postReviewStep(
       REQUIRE_VERDICT: String(opts.verdictLane),
       VERDICT_LINES: verdictLinesOf(ctx.config),
       ...(rereviewLabelOf(ctx.config) ? { REREVIEW_LABEL: rereviewLabelOf(ctx.config)! } : {}),
+      ...(quiet
+        ? {
+            QUIET_LINES: quiet.lines,
+            VERDICT_CHECK: quiet.check,
+            BOT_APP: quiet.app,
+            // The App the lane's token actually belongs to: a check it creates is owned by it.
+            ...(resolveAuth(ctx.config).mode === "app" ? { MINTED_APP: "${{ steps.app-token.outputs.app-slug }}" } : {}),
+          }
+        : {}),
+      ...(quiet && gates.length
+        ? { GATE_WORKFLOWS: gates.map((g) => `${g.id}.yml`).join(" "), DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: ctx.config.repo.base_branch }
+        : {}),
     },
-    run: SCRIPT.replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ).replaceAll("__LABEL_EVENTS_JQ__", () => LABEL_EVENTS_JQ),
+    // Off, the quiet blocks vanish with their lines: the script is byte-identical.
+    run: SCRIPT.replace("__QUIET_EXISTING__\n", () => (quiet ? QUIET_EXISTING : ""))
+      .replace("__QUIET_POST__\n", () => (quiet ? QUIET_POST : ""))
+      .replaceAll("__IS_QUIET_JQ__", () => IS_VERDICT_JQ.replace("env.VERDICT_LINES", "env.QUIET_LINES"))
+      .replaceAll("__QUIET_CHECK_JQ__", () => QUIET_CHECK_JQ)
+      .replaceAll("__QUIET_TITLE_PREFIX__", () => QUIET_TITLE_PREFIX)
+      .replaceAll("__VERDICT_PREFIX__", () => VERDICT_PREFIX)
+      .replaceAll("__IS_VERDICT_JQ__", () => IS_VERDICT_JQ)
+      .replaceAll("__LABEL_EVENTS_JQ__", () => LABEL_EVENTS_JQ),
   });
 }
 

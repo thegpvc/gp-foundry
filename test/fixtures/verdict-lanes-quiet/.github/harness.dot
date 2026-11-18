@@ -1,0 +1,7 @@
+digraph verdict_lanes_quiet {
+  start    [type=start]
+  reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", post="review", skip="unchanged-diff"]
+  approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/10 * * * *", requires_review=true, post="review", quiet_verdicts="APPROVE"]
+  gate     [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="agent-only"]
+  start    -> reviewer [on="pull_request.opened, pull_request.synchronize"]
+}

@@ -120,19 +120,21 @@ describe('validate: post= and post_marker=', () => {
 const GH_STUB = `#!/usr/bin/env bash
 [ "$1" = "api" ] || { echo "stub gh: unsupported: $*" >&2; exit 2; }
 shift
-path=""; jqexpr=""; method="GET"; input=""
+path=""; jqexpr=""; method="GET"; input=""; fields="{}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) jqexpr="$2"; shift 2 ;;
     --method) method="$2"; shift 2 ;;
     --input) input="$2"; shift 2 ;;
+    -f) fields=$(jq -c --arg kv "$2" '. + {($kv | split("=") | .[0]): ($kv | split("=") | .[1:] | join("="))}' <<< "$fields"); shift 2 ;;
     --paginate) shift ;;
     *) path="$1"; shift ;;
   esac
 done
 LINE_422='{"message":"Unprocessable Entity","errors":["Line could not be resolved"],"documentation_url":"https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request","status":"422"}'
 if [ "$method" != "GET" ]; then
-  { echo "$method $path"; cat "$input"; echo; } >> "$FIXTURES/writes.log"
+  { echo "$method $path"; if [ -n "$input" ]; then cat "$input"; else echo "$fields"; fi; echo; } >> "$FIXTURES/writes.log"
+  if [ -n "\${STUB_DISPATCH_FAIL:-}" ] && [[ "$path" == */dispatches ]]; then echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1; fi
   # A rejection in gh's real shape: GitHub's error body on STDOUT, and only
   # gh's one-line summary on stderr.
   if [ -n "\${STUB_422_ALWAYS:-}" ] || { [ -n "\${STUB_422_IF_COMMENTS:-}" ] && [ "$(jq '.comments | length' "$input")" != "0" ]; }; then
@@ -143,6 +145,7 @@ if [ "$method" != "GET" ]; then
   [ -n "\${STUB_NO_URL:-}" ] || echo '{"id":99,"html_url":"https://github.com/o/r/pull/7#pullrequestreview-99"}'
   exit 0
 fi
+if [ -n "\${STUB_EVENTS_FAIL:-}" ] && [[ "$path" == */events* ]]; then echo 'gh: Server Error (HTTP 502)' >&2; exit 1; fi
 file="$FIXTURES/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
 [ -f "$file" ] || { echo "stub gh: no fixture for $path" >&2; exit 1; }
 if [ -n "$jqexpr" ]; then jq -r "$jqexpr" "$file"; else cat "$file"; fi
@@ -152,6 +155,8 @@ interface Ran {
   status: number;
   stdout: string;
   posts: any[];
+  /** Every write, in order: `<METHOD> <path>` and its JSON body. */
+  writes: { call: string; body: any }[];
   /** What the step appended to the job summary. */
   summary: string;
 }
@@ -165,6 +170,8 @@ function runPost(
   files: string[] | null = ["src/a.ts"],
   /** The PR's issue events (label history); omitted: the read fails. */
   events?: unknown[],
+  /** The head's runs of the quiet verdict check (quiet_verdicts=); omitted: the read fails. */
+  verdictChecks?: unknown[],
 ): Ran {
   const dir = mkdtempSync(join(tmpdir(), "gpf-post-"));
   const bin = join(dir, "bin");
@@ -174,7 +181,17 @@ function runPost(
   writeFileSync(join(bin, "gh"), GH_STUB);
   chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
-  if (events) writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
+  if (events) {
+    writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
+    // The labels on the PR: those whose latest event (in API order) is "labeled".
+    const on = new Map<string, boolean>();
+    for (const e of events as { event: string; label?: { name: string } }[]) if (e.label) on.set(e.label.name, e.event === "labeled");
+    writeFileSync(join(fx, "repos/o/r/issues/7/labels?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify([...on].filter(([, v]) => v).map(([name]) => ({ name }))));
+  }
+  if (verdictChecks && step.env.VERDICT_CHECK) {
+    const q = `repos/o/r/commits/head1/check-runs?check_name=${encodeURIComponent(step.env.VERDICT_CHECK).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())}&filter=all&per_page=100`;
+    writeFileSync(join(fx, q.replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify({ check_runs: verdictChecks }));
+  }
   if (files) {
     writeFileSync(
       join(fx, "repos/o/r/pulls/7/files?per_page=100".replace(/[^A-Za-z0-9]/g, "_")),
@@ -200,13 +217,16 @@ function runPost(
     stdout = (e.stdout ?? "") + (e.stderr ?? "");
   }
   const log = join(fx, "writes.log");
-  const posts = existsSync(log)
-    ? readFileSync(log, "utf8")
-        .split(/^POST repos\/o\/r\/pulls\/7\/reviews\n/m)
-        .filter((s) => s.trim())
-        .map((s) => JSON.parse(s))
-    : [];
-  return { status, stdout, posts, summary: readFileSync(summaryFile, "utf8").replace("### Agent output\n\n(the agent's text)\n", "") };
+  const writes: Ran["writes"] = [];
+  if (existsSync(log)) {
+    // Each write is "<METHOD> <path>" then its JSON body (one line; blank lines between).
+    const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.trim());
+    for (let i = 0; i < lines.length; i++) {
+      if (/^(POST|PUT|PATCH|DELETE) /.test(lines[i]!)) writes.push({ call: lines[i]!, body: JSON.parse(lines[++i]!) });
+    }
+  }
+  const posts = writes.filter((w) => w.call === "POST repos/o/r/pulls/7/reviews").map((w) => w.body);
+  return { status, stdout, posts, writes, summary: readFileSync(summaryFile, "utf8").replace("### Agent output\n\n(the agent's text)\n", "") };
 }
 
 const fence = (obj: unknown) => "```json\n" + JSON.stringify(obj) + "\n```\n";
@@ -596,9 +616,24 @@ describe("a re-review request: the post step posts a fresh review on the same he
     expect(r.posts).toEqual([]);
   });
 
-  it("an unreadable label history: posts anyway, with a warning (a duplicate at worst, never a dropped request)", () => {
-    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"]);
+  it("the label on but its history unreadable: posts anyway, with a warning (a duplicate at worst, never a dropped request)", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], { STUB_EVENTS_FAIL: "1" }, ["src/a.ts"], labelled);
     expect(r.status).toBe(0);
+    expect(r.posts).toHaveLength(1);
+  });
+
+  it("the label NOT on: no history read is needed, and a re-run stays idempotent", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], { STUB_EVENTS_FAIL: "1" }, ["src/a.ts"], []);
+    expect(r.posts).toEqual([]);
+  });
+
+  it("removed and re-added in the same second: API order decides, as in the gate (the request stands)", () => {
+    const toggled = [
+      { event: "labeled", label: { name: "re-review" }, created_at: "2026-11-17T10:00:00Z" },
+      { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-11-17T12:00:00Z" },
+      { event: "labeled", label: { name: "re-review" }, created_at: "2026-11-17T12:00:00Z" },
+    ];
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], toggled);
     expect(r.posts).toHaveLength(1);
   });
 
@@ -606,5 +641,129 @@ describe("a re-review request: the post step posts a fresh review on the same he
     const removed = [...labelled, { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-11-17T12:10:00Z" }];
     const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], removed);
     expect(r.posts).toEqual([]);
+  });
+});
+
+describe("quiet_verdicts: a verdict that needs nothing from the author is a check run, not a review", () => {
+  const APP_CFG = { identity: { bot_login: BOT, app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>;
+  const QUIET_SWEEP = SWEEP.replace('post="review"', 'post="review", quiet_verdicts="APPROVE"');
+  const quietStep = () => {
+    const { files } = compile(mkHarness(QUIET_SWEEP, APP_CFG));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/approver.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.approver, "Post the review");
+  };
+  const CHECK = "gp-foundry/verdict (approver)";
+  const approve = { body: "Looks right.\n\n**Verdict:** APPROVE", comments: [{ path: "src/a.ts", line: 4, body: "Nit: name." }] };
+  const reject = { body: "One blocker.\n\n**Verdict:** REQUEST_CHANGES", comments: [] };
+  const ours = (over: object = {}) => ({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-bot" }, output: { title: "Verdict: APPROVE" }, ...over });
+
+  it("an APPROVE is delivered as the App's completed check on the head — no review", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.posts).toEqual([]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+    const c = r.writes[0]!.body;
+    expect(c).toMatchObject({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", external_id: "gp-foundry:verdict:approver:head1" });
+    expect(c.output.title).toBe("Verdict: APPROVE");
+    // The visible body without the verdict line; inline findings moved into it.
+    expect(c.output.summary).toContain("Looks right.");
+    expect(c.output.summary).toContain("`src/a.ts:4` — Nit: name.");
+    expect(c.output.summary).not.toContain("**Verdict:**");
+    expect(r.summary).toContain("Verdict delivered as a check");
+  });
+
+  it("any other verdict still posts a review, exactly as before", () => {
+    const r = runPost(quietStep(), fence(reject), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.posts).toHaveLength(1);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/pulls/7/reviews"]);
+  });
+
+  it("a retried post step creates no second check: the App's check on this head counts as posted", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours()]);
+    expect(r.status).toBe(0);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("a check of the same name from another App does not", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ app: { slug: "someone-else" } })]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("the title comes from the verdict line, even with findings and a trailing HTML comment", () => {
+    const body = { body: "Looks good.\n\n**Verdict:** APPROVE\n<!-- note -->", comments: [{ path: "src/a.ts", line: 2, body: "nit: rename foo" }] };
+    const r = runPost(quietStep(), fence(body), [], {}, ["src/a.ts"], undefined, []);
+    const c = r.writes[0]!.body;
+    expect(c.output.title).toBe("Verdict: APPROVE");
+    expect(c.output.summary).toBe("Looks good.\n\n### Findings\n\n- `src/a.ts:2` — nit: rename foo");
+  });
+
+  it("a check of the right name and App but no verdict title is not a verdict: delivered again", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ output: { title: "Verdict: foo bar" } })]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("the App's slug is compared without case", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ app: { slug: "Agent-Bot" } })]);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("a token from another App than identity.bot_login names: posted as a review, with a warning", () => {
+    const s = quietStep();
+    expect(s.env.MINTED_APP).toBe("${{ steps.app-token.outputs.app-slug }}");
+    const r = runPost(s, fence(approve), [], { MINTED_APP: "other-app" }, ["src/a.ts"], undefined, []);
+    expect(r.posts).toHaveLength(1);
+    expect(r.stdout).toContain("posted as a review");
+    expect(runPost(s, fence(approve), [], { MINTED_APP: "agent-bot" }, ["src/a.ts"], undefined, []).writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("an unreadable check history: nothing posted, red (a retry must not deliver twice)", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"]);
+    expect(r.status).not.toBe(0);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("output without a verdict line is still refused", () => {
+    const r = runPost(quietStep(), fence({ body: "No verdict here." }), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("off: the step is the one it always was", () => {
+    const off = stepNamed(job(SWEEP, "approver"), "Post the review");
+    expect(off.run).not.toContain("quiet_verdicts");
+    expect(off.env.VERDICT_CHECK).toBeUndefined();
+  });
+});
+
+describe("quiet_verdicts: the gate is nudged, since a check run starts no gate run", () => {
+  const APP_CFG = { identity: { bot_login: BOT, app_id_secret: "APP_ID", app_key_secret: "APP_KEY" }, rollout: {} } as Partial<FoundryConfig>;
+  const WITH_GATE = `digraph t {
+  approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/10 * * * *", post="review", quiet_verdicts="APPROVE"]
+  merge_gate [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="off"]
+}`;
+  const step = () => {
+    const { files } = compile(mkHarness(WITH_GATE, APP_CFG));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/approver.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.approver, "Post the review");
+  };
+  const approve = { body: "Looks right.\n\n**Verdict:** APPROVE" };
+
+  it("after delivering the check, dispatches the gate for this PR with the job's own token", () => {
+    const s = step();
+    expect(s.env).toMatchObject({ GATE_WORKFLOWS: "merge_gate.yml", DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: "main" });
+    const r = runPost(s, fence(approve), [], { DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs", "POST repos/o/r/actions/workflows/merge_gate.yml/dispatches"]);
+    expect(r.writes[1]!.body).toEqual({ ref: "main", "inputs[pr]": "7" });
+  });
+
+  it("a failed dispatch is a warning: the verdict is delivered, the scheduled pass catches up", () => {
+    const r = runPost(step(), fence(approve), [], { STUB_DISPATCH_FAIL: "1", DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("its scheduled pass will evaluate it");
+  });
+
+  it("a review-delivered verdict dispatches nothing: its own event starts the gate", () => {
+    const r = runPost(step(), fence({ body: "No.\n\n**Verdict:** REQUEST_CHANGES" }), [], {}, ["src/a.ts"], undefined, []);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/pulls/7/reviews"]);
   });
 });

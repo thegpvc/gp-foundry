@@ -1,0 +1,69 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: gate
+"on":
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass"
+        required: false
+        type: string
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+      - review_requested
+      - review_request_removed
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
+concurrency:
+  group: ${{ (github.event.pull_request.number || inputs.pr) && format('gate-pr-{0}', (github.event.pull_request.number || inputs.pr)) || 'gate' }}
+  cancel-in-progress: ${{ (github.event.pull_request.number || inputs.pr) && true || false }}
+permissions:
+  contents: read
+jobs:
+  gate:
+    name: gp-foundry gate (gate)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'agent-app[bot]'))
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ github.token }}
+          ref: main
+          persist-credentials: false
+      - name: Evaluate merge gate (publish check, merge agent-written PRs)
+        uses: thegpvc/gp-foundry/actions/merge-gate@fixture-ref
+        with:
+          merge: agent-only
+          check-name: gp-foundry/approval (gate)
+          job-check-name: gp-foundry gate (gate)
+          token: ${{ steps.app-token.outputs.token }}
+          checks-token: ${{ steps.app-token.outputs.token }}
+          check-app: ${{ steps.app-token.outputs.app-slug }}
+          policy-path: .github/agents/policy/merge.yaml
+          base-branch: main
+          verdict-checks: gp-foundry/verdict (approver)
+          verdict-app: agent-app
+          bot-login: agent-app[bot]
+          rereview-label: re-review
+          pr-number: ${{ github.event.pull_request.number || inputs.pr }}
+          rotation-period-seconds: "600"
+          time-budget-seconds: "480"

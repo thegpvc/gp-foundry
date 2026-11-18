@@ -119,6 +119,20 @@ inputs:
       progress, cancelled or timed out — as well as every job of the current
       workflow run (GITHUB_RUN_ID). A CI job of the same name in another
       workflow is left out too: keep the gate's job name distinct.
+  verdict-checks:
+    description: >
+      Newline-separated names of the check runs that lanes with quiet_verdicts
+      deliver a verdict as. Such a run counts as the bot's verdict on the head,
+      at the time it completed, only when its app is `verdict-app` and its title
+      is `Verdict: <WORD>`. The compiler writes it. Empty: off.
+    required: false
+    default: ""
+  verdict-app:
+    description: >
+      With `verdict-checks`: the slug of the harness App, the only app whose
+      verdict checks count.
+    required: false
+    default: ""
   rereview-label:
     description: >
       With `merge`: the label that asks for a fresh review and verdict on the

@@ -236,6 +236,33 @@ to `false` — mergeability is only settled by a merge attempt, which this mode
 never makes. The token needs only `checks: write`, `pull-requests: read` and
 `contents: read`.
 
+## Quiet verdicts (`verdict-checks`)
+
+A lane with `quiet_verdicts="APPROVE"` delivers an approval as a check run on the head
+instead of a review, so a clean PR's timeline stays quiet. The gate reads it as the bot's
+verdict when `verdict-checks` names it (the compiler writes it) and its app is
+`verdict-app`; any other app's run of the same name is ignored, and it is never CI.
+"Latest verdict wins" still holds across both kinds: the check counts at its
+`completed_at`, a review at its `submitted_at`. A check run starts no gate run the way a
+review's event does, so the lane's post step dispatches the gate with the PR as its `pr`
+input (`pr-number` falls back to it). The scheduled pass covers a failed dispatch when the PR
+carries a bot review for its `reviewed-by:` search (a quiet lane with `requires_review=true`).
+
+**Reading a verdict yourself** (a formal-approval publisher, a dashboard). The latest
+verdict on a head is the newest of:
+
+- the bot's reviews on that commit (`GET /repos/{o}/{r}/pulls/{n}/reviews`,
+  `commit_id` = head, `user.login` = the bot) whose last visible line is a verdict line
+  (`**Verdict:** <WORD>`), at `submitted_at`; and
+- its verdict check runs (`GET /repos/{o}/{r}/commits/{head}/check-runs?check_name=<name>&filter=all`)
+  with `app.slug` = the harness App, `status` = `completed` and `output.title` =
+  `Verdict: <WORD>`, at `completed_at`. `external_id` is `gp-foundry:verdict:<node>:<sha>`;
+  `output.summary` is the review body without the verdict line.
+
+Filter by the app slug: anyone with a token that can write checks can create a run with
+the same name. With a re-review label on the PR, only records after the label was added
+count (see Re-review above).
+
 ## Verdict markers
 
 Review bodies are matched as a reader sees them: HTML comments removed (the

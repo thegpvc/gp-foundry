@@ -1,0 +1,16 @@
+# A hybrid harness with a reviewer, an approver sweep that posts verdicts, and a
+# single gate — compiled before quiet verdicts existed. The compiled output with
+# quiet verdicts off must stay byte-identical to expected/.
+name: verdict-lanes
+identity:
+  app_id_secret: AGENT_APP_ID
+  app_key_secret: AGENT_APP_PRIVATE_KEY
+  bot_login: agent-app[bot]
+  git_name: agent-app[bot]
+repo:
+  base_branch: main
+labels:
+  re_review: re-review
+rollout: {}
+runtime:
+  ref: fixture-ref

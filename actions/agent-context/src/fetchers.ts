@@ -1,4 +1,5 @@
 import type { getOctokit } from "@actions/github";
+import { quietVerdictOf, verdictLine } from "../../../src/shared/verdicts.js";
 import type {
   ChangedFileData,
   CheckRunData,
@@ -6,6 +7,7 @@ import type {
   ContextType,
   InlineCommentData,
   PullRequestData,
+  ReviewData,
   ReviewThreadData,
 } from "./formatters.js";
 
@@ -26,6 +28,11 @@ export interface FetchOptions {
    * Omit to skip check conclusions entirely.
    */
   checksOctokit?: Octokit;
+  /**
+   * quiet_verdicts=: check runs that carry a lane's verdict instead of a review,
+   * and the App whose runs alone count. Listed with the reviews (needs checksOctokit).
+   */
+  verdictChecks?: { checks: string[]; app: string };
 }
 
 /**
@@ -35,14 +42,14 @@ export async function fetchContext(
   octokit: Octokit,
   opts: FetchOptions
 ): Promise<ContextData> {
-  const { owner, repo, number, type, includeDiff, checksOctokit } = opts;
+  const { owner, repo, number, type, includeDiff, checksOctokit, verdictChecks } = opts;
 
   switch (type) {
     case "issue":
       return fetchIssue(octokit, owner, repo, number);
     case "pr-review":
     case "pr-full":
-      return fetchPRFull(octokit, owner, repo, number, includeDiff, checksOctokit);
+      return fetchPRFull(octokit, owner, repo, number, includeDiff, checksOctokit, verdictChecks);
     case "pr-diff":
       return fetchPRDiff(octokit, owner, repo, number, includeDiff, checksOctokit);
     default:
@@ -69,20 +76,53 @@ async function fetchIssue(
   return { issue: issue as unknown as ContextData["issue"], comments: comments as unknown as ContextData["comments"] };
 }
 
+/**
+ * The quiet verdicts among a head's check runs, as review records: each run that
+ * quietVerdictOf (src/shared/verdicts.ts — the one definition every reader uses)
+ * accepts. The body is the check's summary followed by the verdict line, as a
+ * verdict review would read.
+ */
+export function quietVerdictReviews(
+  checkRuns: CheckRunData[] | undefined,
+  verdictChecks: FetchOptions["verdictChecks"],
+  headSha: string | undefined,
+): ReviewData[] {
+  if (!checkRuns || !verdictChecks?.checks.length) return [];
+  return checkRuns.flatMap((r) => {
+    const q = quietVerdictOf(r, { ...verdictChecks, ...(headSha ? { headSha } : {}) });
+    if (!q) return [];
+    return [{
+      user: { login: `${verdictChecks.app}[bot]` } as ReviewData["user"],
+      state: `VERDICT (check run \`${q.name}\`)`,
+      submitted_at: q.at,
+      body: `${q.summary}\n\n${verdictLine(q.word)}`,
+      commit_id: r.head_sha ?? headSha ?? null,
+    }];
+  });
+}
+
 async function fetchPRFull(
   octokit: Octokit,
   owner: string,
   repo: string,
   number: number,
   includeDiff: boolean,
-  checksOctokit: Octokit | undefined
+  checksOctokit: Octokit | undefined,
+  verdictChecks?: FetchOptions["verdictChecks"],
 ): Promise<ContextData> {
   const base = await fetchPRDiff(octokit, owner, repo, number, includeDiff, checksOctokit);
-  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
+  const reviews = (await octokit.paginate(octokit.rest.pulls.listReviews, {
     owner,
     repo,
     pull_number: number,
-  });
+  })) as unknown as ReviewData[];
+  // A verdict delivered as a check run (quiet_verdicts=) sits with the reviews,
+  // in time order, so a later lane reads the decision where it reads the others.
+  const quiet = quietVerdictReviews(base.checkRuns, verdictChecks, base.pr?.head?.sha);
+  if (quiet.length) {
+    reviews.push(...quiet);
+    reviews.sort((a, b) => (a.submitted_at ?? "").localeCompare(b.submitted_at ?? ""));
+  }
   const comments = await octokit.paginate(octokit.rest.issues.listComments, {
     owner,
     repo,
@@ -111,7 +151,7 @@ async function fetchPRFull(
 
   return {
     ...base,
-    reviews: reviews as unknown as ContextData["reviews"],
+    reviews,
     reviewThreads,
     ...(reviewThreadsUnavailable ? { reviewThreadsUnavailable } : {}),
     inlineComments,

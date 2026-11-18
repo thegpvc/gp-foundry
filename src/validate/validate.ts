@@ -20,6 +20,10 @@ import {
   parseMergeSetting,
   publishesCheck,
   isSweep,
+  quietVerdictsRaw,
+  verdictCheckName,
+  sweepRequiresReview,
+  botAppSlug,
   parsePostMarker,
   postsReview,
   parseOptInLabel,
@@ -635,6 +639,70 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         } catch (e) {
           diags.push({ level: "error", code: "node.bad-post-marker", message: (e as Error).message, where: { node: n.id, line: n.line } });
         }
+      }
+    }
+    if (n.attrs.quiet_verdicts !== undefined || n.attrs.verdict_check !== undefined) {
+      const at = { node: n.id, line: n.line };
+      const words = quietVerdictsRaw(n);
+      let approve = "APPROVE";
+      try {
+        approve = parseVerdictWords(ir.config.verdicts).approve;
+      } catch {
+        // malformed verdicts: reported elsewhere
+      }
+      if (n.attrs.quiet_verdicts === undefined) {
+        diags.push({ level: "error", code: "node.verdict-check-without-quiet", message: `verdict_check= on '${n.id}' names the check quiet_verdicts= delivers to; set quiet_verdicts too`, where: at });
+      } else if (!words.length) {
+        diags.push({ level: "error", code: "node.bad-quiet-verdicts", message: `quiet_verdicts= on '${n.id}' is empty`, hint: `quiet_verdicts="${approve}"`, where: at });
+      } else if (!(postsReview(n) && isSweep(n))) {
+        diags.push({
+          level: "error",
+          code: "node.quiet-verdicts-not-verdict-lane",
+          message: `quiet_verdicts= on '${n.id}' needs a verdict lane: a pr-review sweep (select="sweep") with post="review"`,
+          where: at,
+        });
+      } else if (words.some((w) => w !== approve)) {
+        diags.push({
+          level: "error",
+          code: "node.bad-quiet-verdicts",
+          message: `quiet_verdicts= on '${n.id}' may list only the approve word ('${approve}'): ${words.filter((w) => w !== approve).join(", ")} asks something of the author, so it stays a review`,
+          hint: `quiet_verdicts="${approve}"`,
+          where: at,
+        });
+      } else if (resolveAuth(ir.config).mode !== "app" || !botAppSlug(ir.config)) {
+        diags.push({
+          level: "error",
+          code: "node.quiet-verdicts-needs-app",
+          message: `quiet_verdicts= on '${n.id}' needs App auth with identity.bot_login set to the App's bot (\`<app>[bot]\`): the verdict is a check run the App owns, and only the App's runs count`,
+          where: at,
+        });
+      } else if (!sweepRequiresReview(n)) {
+        diags.push({
+          level: "warning",
+          code: "node.quiet-verdicts-unfindable",
+          message: `quiet_verdicts= on '${n.id}' without requires_review=true: a PR whose only bot verdict is quiet leaves no bot review, so the gate's scheduled pass (which finds PRs by \`reviewed-by:\`) cannot find it — it relies on the dispatch after the verdict alone`,
+          hint: "set requires_review=true so a reviewer lane's review precedes the verdict",
+          where: at,
+        });
+      }
+      // Verdict checks are told apart by name: two lanes on one name would read
+      // each other's verdict as their own, and a CI or gate check of that name
+      // would be read as a verdict's.
+      const name = verdictCheckName(n);
+      const clash = ir.nodes.find(
+        (m) =>
+          m.id !== n.id &&
+          ((m.attrs.quiet_verdicts !== undefined && verdictCheckName(m) === name) ||
+            (m.type === "merge-gate" && String(m.attrs.check_name ?? `gp-foundry/approval (${m.id})`) === name)),
+      );
+      if (clash) {
+        diags.push({
+          level: "error",
+          code: "node.duplicate-verdict-check",
+          message: `verdict check '${name}' on '${n.id}' is also used by '${clash.id}': each quiet verdict lane needs a check name of its own`,
+          hint: "set verdict_check= to a distinct name",
+          where: at,
+        });
       }
     }
     if (n.attrs.requires_review !== undefined) {

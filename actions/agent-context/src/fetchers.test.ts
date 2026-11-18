@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { fetchContext, type Octokit } from "./fetchers.js";
+import { fetchContext, quietVerdictReviews, type Octokit } from "./fetchers.js";
 
 // --- Mock Octokit factory ---
 
@@ -476,5 +476,36 @@ describe("fetchContext - oversized diff", () => {
     await expect(
       fetchContext(octokit, { ...prOpts, type: "pr-diff", includeDiff: true }),
     ).rejects.toThrow(error.message);
+  });
+});
+
+describe("quiet_verdicts: verdict check runs listed with the reviews", () => {
+  const CHECK = "gp-foundry/verdict (approver)";
+  const VC = { checks: [CHECK], app: "agent-app" };
+  const run = (over: object = {}) => ({
+    id: 1, name: CHECK, status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", head_sha: HEAD_SHA,
+    app: { slug: "agent-app" }, output: { title: "Verdict: APPROVE", summary: "Looks right." }, ...over,
+  });
+
+  it("the App's completed verdict check becomes a review record ending in the verdict line", () => {
+    const [r, ...rest] = quietVerdictReviews([run()], VC, HEAD_SHA);
+    expect(rest).toEqual([]);
+    expect(r).toMatchObject({ user: { login: "agent-app[bot]" }, submitted_at: "2026-11-18T10:00:00Z", commit_id: HEAD_SHA });
+    expect(r!.state).toContain(CHECK);
+    expect(r!.body).toBe("Looks right.\n\n**Verdict:** APPROVE");
+  });
+
+  it("ignores another App's run of the same name, an unfinished run, other checks, and an untitled one", () => {
+    expect(
+      quietVerdictReviews(
+        [run({ app: { slug: "someone-else" } }), run({ status: "in_progress" }), run({ name: "ci" }), run({ output: { title: "Done" } })],
+        VC,
+        HEAD_SHA,
+      ),
+    ).toEqual([]);
+  });
+
+  it("off: nothing", () => {
+    expect(quietVerdictReviews([run()], undefined, HEAD_SHA)).toEqual([]);
   });
 });
