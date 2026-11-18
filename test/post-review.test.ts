@@ -130,11 +130,14 @@ while [ $# -gt 0 ]; do
     *) path="$1"; shift ;;
   esac
 done
+LINE_422='{"message":"Unprocessable Entity","errors":["Line could not be resolved"],"documentation_url":"https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request","status":"422"}'
 if [ "$method" != "GET" ]; then
   { echo "$method $path"; cat "$input"; echo; } >> "$FIXTURES/writes.log"
-  if [ -n "\${STUB_422_IF_COMMENTS:-}" ] && [ "$(jq '.comments | length' "$input")" != "0" ]; then
+  # A rejection in gh's real shape: GitHub's error body on STDOUT, and only
+  # gh's one-line summary on stderr.
+  if [ -n "\${STUB_422_ALWAYS:-}" ] || { [ -n "\${STUB_422_IF_COMMENTS:-}" ] && [ "$(jq '.comments | length' "$input")" != "0" ]; }; then
+    echo "\${STUB_422_BODY:-$LINE_422}"
     echo 'gh: Unprocessable Entity (HTTP 422)' >&2
-    echo '{"message":"Unprocessable Entity","errors":["Line could not be resolved"]}' >&2
     exit 1
   fi
   [ -n "\${STUB_NO_URL:-}" ] || echo '{"id":99,"html_url":"https://github.com/o/r/pull/7#pullrequestreview-99"}'
@@ -153,7 +156,14 @@ interface Ran {
   summary: string;
 }
 
-function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: Record<string, string> = {}): Ran {
+/** `files`: the PR's changed files (null: the read fails). */
+function runPost(
+  step: any,
+  agentStdout: string,
+  reviews: unknown[] = [],
+  env: Record<string, string> = {},
+  files: string[] | null = ["src/a.ts"],
+): Ran {
   const dir = mkdtempSync(join(tmpdir(), "gpf-post-"));
   const bin = join(dir, "bin");
   const fx = join(dir, "fx");
@@ -162,6 +172,12 @@ function runPost(step: any, agentStdout: string, reviews: unknown[] = [], env: R
   writeFileSync(join(bin, "gh"), GH_STUB);
   chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
+  if (files) {
+    writeFileSync(
+      join(fx, "repos/o/r/pulls/7/files?per_page=100".replace(/[^A-Za-z0-9]/g, "_")),
+      JSON.stringify(files.map((filename) => ({ filename }))),
+    );
+  }
   const out = join(dir, "stdout.txt");
   writeFileSync(out, agentStdout);
   const summaryFile = join(dir, "summary.md");
@@ -385,6 +401,67 @@ describe("the post script, run against a stub gh", () => {
     expect(r.posts[1].comments).toEqual([]);
     expect(r.posts[1].body).toBe(`PR #7 head head1\n\n${REVIEW.body}\n\n### Findings on unchanged lines\n\n- \`src/a.ts:4\` — Leaks the handle.${posted("reviewer")}`);
     expect(r.stdout).toContain("posting the findings in the body instead");
+    // The reason comes from the response body, not gh's stderr line.
+    expect(r.stdout).toContain("Line could not be resolved");
+  });
+
+  it("retries any 422 that has inline comments to move, but only once", () => {
+    const body = '{"message":"Validation Failed","errors":["pull_request_review_thread.end_commit_oid is not part of the pull request"]}';
+    const r = runPost(plain(), fence(REVIEW), [], { STUB_422_ALWAYS: "1", STUB_422_BODY: body });
+    expect(r.status).not.toBe(0);
+    expect(r.posts).toHaveLength(2);
+    expect(r.posts[1].comments).toEqual([]);
+    expect(r.stdout).toContain("could not post the review: gh: Unprocessable Entity (HTTP 422) Validation Failed — pull_request_review_thread");
+  });
+
+  it("fails on a 422 with no inline comments, quoting the response body", () => {
+    const body = '{"message":"Validation Failed","errors":[{"resource":"PullRequestReview","code":"custom","message":"Body is too long"}]}';
+    const r = runPost(plain(), fence({ body: "No findings." }), [], { STUB_422_ALWAYS: "1", STUB_422_BODY: body });
+    expect(r.status).toBe(1);
+    expect(r.posts).toHaveLength(1);
+    expect(r.stdout).not.toContain("posting the findings in the body instead");
+    expect(r.stdout).toContain("::error::could not post the review: gh: Unprocessable Entity (HTTP 422) Validation Failed — Body is too long");
+  });
+
+  describe("comments on files outside the diff", () => {
+    const OFF = { path: "tests/fake.py", line: 179, side: "RIGHT", body: "Not in this PR." };
+    const review = { ...REVIEW, comments: [...REVIEW.comments, OFF] };
+
+    it("moves them into the body before posting, so GitHub never rejects the review", () => {
+      const r = runPost(plain(), fence(review), [], {}, ["src/a.ts", "src/b.ts"]);
+      expect(r.status).toBe(0);
+      expect(r.posts).toHaveLength(1);
+      expect(r.posts[0].comments).toEqual(REVIEW.comments);
+      expect(r.posts[0].body).toBe(
+        `PR #7 head head1\n\n${REVIEW.body}\n\n### Findings on unchanged lines\n\n- \`tests/fake.py:179\` — Not in this PR.${posted("reviewer")}`,
+      );
+      expect(r.stdout).toContain("1 inline comment(s) on files outside the PR's diff");
+    });
+
+    it("keeps a verdict lane's verdict line last", () => {
+      const r = runPost(verdictLane(), fence({ ...review, body: "Fine.\n\n**Verdict:** APPROVE" }));
+      expect(r.posts).toHaveLength(1);
+      expect(r.posts[0].comments).toEqual(REVIEW.comments);
+      expect(r.posts[0].body).toContain("### Findings on unchanged lines\n\n- `tests/fake.py:179`");
+      expect(r.posts[0].body.endsWith(`\n\n**Verdict:** APPROVE${posted("approver")}`)).toBe(true);
+    });
+
+    it("lists every finding once when the rest are then rejected too", () => {
+      const r = runPost(plain(), fence(review), [], { STUB_422_IF_COMMENTS: "1" });
+      expect(r.status).toBe(0);
+      expect(r.posts).toHaveLength(2);
+      expect(r.posts[1].comments).toEqual([]);
+      expect(r.posts[1].body.split("### Findings on unchanged lines")).toHaveLength(2);
+      expect(r.posts[1].body).toContain("- `src/a.ts:4` — Leaks the handle.\n- `tests/fake.py:179` — Not in this PR.");
+    });
+
+    it("posts the comments as they are when the changed files cannot be read", () => {
+      const r = runPost(plain(), fence(review), [], {}, null);
+      expect(r.status).toBe(0);
+      expect(r.posts).toHaveLength(1);
+      expect(r.posts[0].comments).toEqual(review.comments);
+      expect(r.stdout).toContain("could not read the PR's changed files");
+    });
   });
 
   it("keeps a verdict lane's verdict line last when it moves the findings", () => {
