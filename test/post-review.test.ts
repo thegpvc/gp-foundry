@@ -163,6 +163,8 @@ function runPost(
   reviews: unknown[] = [],
   env: Record<string, string> = {},
   files: string[] | null = ["src/a.ts"],
+  /** The PR's issue events (label history); omitted: the read fails. */
+  events?: unknown[],
 ): Ran {
   const dir = mkdtempSync(join(tmpdir(), "gpf-post-"));
   const bin = join(dir, "bin");
@@ -172,6 +174,7 @@ function runPost(
   writeFileSync(join(bin, "gh"), GH_STUB);
   chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
+  if (events) writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
   if (files) {
     writeFileSync(
       join(fx, "repos/o/r/pulls/7/files?per_page=100".replace(/[^A-Za-z0-9]/g, "_")),
@@ -558,5 +561,44 @@ describe("the job summary says what became of the review", () => {
     const r = runPost(plain(), fence(REVIEW), [], { GITHUB_STEP_SUMMARY: "" });
     expect(r.status).toBe(0);
     expect(r.posts).toHaveLength(1);
+  });
+});
+
+describe("a re-review request: the post step posts a fresh review on the same head", () => {
+  const RR = { rollout: {}, labels: { re_review: "re-review" } } as Partial<FoundryConfig>;
+  const step = () => {
+    const { files } = compile(mkHarness(lane('post="review"'), RR));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/reviewer.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.reviewer, "Post the review");
+  };
+  const mine = (at: string) => ({ user: { login: BOT }, commit_id: "head1", submitted_at: at, body: `PR #7 head head1\n\nEarlier.\n\n<!-- gp-foundry:posted:reviewer:head1 -->` });
+  const labelled = [{ event: "labeled", label: { name: "re-review" }, created_at: "2026-11-17T12:00:00Z" }, { event: "labeled", label: { name: "other" }, created_at: "2026-11-17T13:00:00Z" }];
+
+  it("carries the label to the step", () => {
+    expect(step().env.REREVIEW_LABEL).toBe("re-review");
+    // Without one configured, no extra read.
+    expect(stepNamed(job(lane('post="review"'), "reviewer"), "Post the review").env.REREVIEW_LABEL).toBeUndefined();
+  });
+
+  it("a review posted before the label was added no longer stops it", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], labelled);
+    expect(r.status).toBe(0);
+    expect(r.posts).toHaveLength(1);
+  });
+
+  it("…but the fresh one does: a re-run on the same head posts nothing", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z"), mine("2026-11-17T12:30:00Z")], {}, ["src/a.ts"], labelled);
+    expect(r.posts).toEqual([]);
+  });
+
+  it("never re-requested: idempotent as before", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], []);
+    expect(r.posts).toEqual([]);
+  });
+
+  it("an unreadable label history: posts nothing, fails red", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"]);
+    expect(r.status).not.toBe(0);
+    expect(r.posts).toEqual([]);
   });
 });

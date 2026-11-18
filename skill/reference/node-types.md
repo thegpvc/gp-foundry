@@ -103,6 +103,27 @@ rollout:                       # `rollout: {}` = every PR
   for `ready_for_review`, and for `labeled` when there is an opt-in label.
 - Needs `identity.bot_login` wherever a writing lane or `merge="agent-only"` is used.
 
+**Asking for a fresh review.** Name a label under `labels.re_review` and adding it to a PR
+asks the pipeline to look again at the head as it stands, without a new push:
+
+```yaml
+labels:
+  re_review: re-review
+```
+
+- The reviewer runs again on that head, and its post step posts a new review even though
+  it already posted on that commit.
+- The approver's sweep treats the head as undecided: verdicts, reviews and its own records
+  from before the label was added no longer count, so it waits for the fresh review and
+  then gives a fresh verdict.
+- The gate holds while the label is on: its check goes back to in progress ("Re-review
+  requested"), which never passes a required check, and nothing is merged. Once there is a
+  verdict newer than the label, the gate removes the label and judges the head as usual.
+- "When the label was added" is the last `labeled` event for it. Removing the label by hand
+  cancels the request. `up` creates the label. It works only in a hybrid harness
+  (`validate` warns otherwise); under App auth the gate's token gains **Issues: write** to
+  remove it.
+
 Without a `rollout` key nothing here applies: lanes are scoped by `repo.branch_prefix` and
 the per-node attributes below, exactly as before.
 

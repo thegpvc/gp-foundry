@@ -9,6 +9,7 @@
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import {
+  rereviewLabelOf,
   mergeSettingOf,
   isReadingPrLane,
   isWritingPrLane,
@@ -261,7 +262,7 @@ function cancelInProgress(node: HarnessNode, dflt: boolean): boolean {
  */
 function concurrencyKey(
   node: HarnessNode,
-  optInLabel?: string,
+  admitLabels?: string[],
 ): { group: string; "cancel-in-progress": boolean } {
   if (node.attrs.schedule !== undefined) {
     return { group: node.id, "cancel-in-progress": cancelInProgress(node, false) };
@@ -274,9 +275,9 @@ function concurrencyKey(
     ? "${{ github.event.pull_request.number }}"
     : "${{ github.event.issue.number }}";
   const cancel = cancelInProgress(node, node.type === "issue-agent");
-  if (optInLabel !== undefined && prScoped) {
+  if (admitLabels?.length && prScoped) {
     const group =
-      `\${{ github.event.action == 'labeled' && github.event.label.name != ${exprString(optInLabel)}` +
+      `\${{ github.event.action == 'labeled' && ${admitLabels.map((l) => `github.event.label.name != ${exprString(l)}`).join(" && ")}` +
       ` && format(${exprString(`${node.id}-noop-{0}`)}, github.run_id)` +
       ` || format(${exprString(`${node.id}-{0}`)}, github.event.pull_request.number) }}`;
     return { group, "cancel-in-progress": cancel };
@@ -375,6 +376,11 @@ export function wire(ir: Harness): WiringPlan {
     // The label that admits a PR by itself: the rollout's, for a hybrid reading
     // lane (a writing lane is never opted in by label); else the node's own.
     const optIn = rollout ? (isReadingPrLane(node) ? rollout.optInLabel : undefined) : optInLabelOf(node, ir.config);
+    // The labels whose `labeled` event starts this lane: the opt-in label, and —
+    // for a hybrid reading lane — the re-review label, which asks for a fresh
+    // review of the head as it stands. Any other label event is turned away.
+    const rereview = hybridLane && isReadingPrLane(node) ? rereviewLabelOf(ir.config) : undefined;
+    const admitLabels = [...new Set([optIn, rereview].filter((l): l is string => !!l))];
     let gateLabelEvents = false;
 
     // scheduled nodes (e.g. merge-gate) are driven by cron + manual dispatch only
@@ -414,7 +420,7 @@ export function wire(ir: Harness): WiringPlan {
       // opt_in_label= lets a PR outside the allowlist in by its label, so the
       // lane must hear the label being added — but only THAT label: any other
       // label event is turned away by the action clause ANDed on below.
-      if (optIn && triggers.pull_request && hasSkipGuard(node, ir.config)) {
+      if (admitLabels.length && triggers.pull_request && hasSkipGuard(node, ir.config)) {
         if (!allEvents.has("pull_request.labeled")) {
           mergeEvent(triggers, "pull_request.labeled", node);
           allEvents.add("pull_request.labeled");
@@ -424,7 +430,7 @@ export function wire(ir: Harness): WiringPlan {
           // An edge already listens for labels behind its own guard (`label=x`);
           // an action clause would block that label, so admit the opt-in one
           // beside it instead. (An unguarded labeled edge already admits it.)
-          guards.add(`(${eventClause("pull_request.labeled")} && github.event.label.name == ${exprString(optIn)})`);
+          for (const l of admitLabels) guards.add(`(${eventClause("pull_request.labeled")} && github.event.label.name == ${exprString(l)})`);
         }
       }
       // Mixed guarded + unguarded edges: the unguarded events must still pass the
@@ -445,11 +451,11 @@ export function wire(ir: Harness): WiringPlan {
     let guard = hybridLane
       ? andForPrEvents(edgeGuard, allEvents, scopePrefilter(rollout!, botLogin, isWritingPrLane(node)))
       : applyAuthors(applyBranchPrefix(edgeGuard, allEvents, ir.config), allEvents, authorsOf(node, ir.config), optIn);
-    if (gateLabelEvents && optIn) {
+    if (gateLabelEvents && admitLabels.length) {
       guard = andForPrEvents(
         guard,
         allEvents,
-        `(github.event.action != 'labeled' || github.event.label.name == ${exprString(optIn)})`,
+        `(github.event.action != 'labeled' || ${admitLabels.map((l) => `github.event.label.name == ${exprString(l)}`).join(" || ")})`,
       );
     }
     const nw: NodeWiring = {
@@ -458,7 +464,7 @@ export function wire(ir: Harness): WiringPlan {
       dispatches,
     };
     if (guard) nw.guard = guard;
-    if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? optIn : undefined);
+    if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? admitLabels : undefined);
     if (singleGate) {
       nw.guard = singleGateGuard(ir.config.repo.base_branch);
       // One slot per PR for event runs, newest wins: a burst of events on a PR

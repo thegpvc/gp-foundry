@@ -131,3 +131,17 @@ the same reviewer and from someone else; a new head; an approval from the harnes
 identity; another bot's approval; GitHub's review decision not met or unreadable; an agent
 `ESCALATE`; an escalation label; a handoff with an independent blocker (CI red). Each
 checks both the conclusion and the explanation. Merge decisions are unchanged.
+
+## C. 0.4.1 follow-ups
+
+- **The gate ignores its own run.** Since the gate runs on PR events, its job is a check run
+  on the head, in progress while it evaluates. It is excluded from the CI rollup by job name.
+- **The gate checks out the base branch**, not the PR's merge commit, so a PR cannot be
+  judged by a policy it edits.
+- **Scope before the window.** The scheduled pass filters by scope, then takes its 20.
+- **A re-review label** (`labels.re_review`, hybrid only). Everything keys off when the label
+  was last added (`src/shared/rereview.ts`): the reviewer starts on its `labeled` event and
+  its post step ignores its own earlier review; the approver's sweep counts no verdict,
+  review or sweep record from before it (pr-scope lists the time as `since`); the gate holds
+  its check at in progress and merges nothing until a fresh verdict exists, then removes the
+  label.

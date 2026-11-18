@@ -115,6 +115,11 @@ export interface PullRequestFacts {
   signoff?: { reviewer: string; sha: string };
   /** Why a sign-off that looked present could not be accepted (shown on the check). */
   signoffUnavailable?: string;
+  /**
+   * The re-review label is on the PR, added at this time: only reviews from after
+   * it count towards the head's verdict (see src/shared/rereview.ts).
+   */
+  rereviewSince?: string;
 }
 
 export type HeadVerdict = "approve" | "reject" | "escalate";

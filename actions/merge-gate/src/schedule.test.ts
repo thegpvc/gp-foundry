@@ -36,6 +36,13 @@ interface FakePr {
   ci?: "success" | "in_progress";
   /** pulls.get throws this many more times. */
   failReads?: number;
+  draft?: boolean;
+  /** When the re-review label was added, if it is on the PR. */
+  rereviewAt?: string;
+  /** When the verdict was posted (default before any re-review request). */
+  verdictAt?: string;
+  /** The gate's own event-run job, in progress on this head. */
+  gateJobRunning?: boolean;
 }
 
 /** A fake GitHub: PRs, CI and the gate's own check runs, kept between ticks. */
@@ -71,7 +78,7 @@ class World {
     return {
       number: p.number,
       state: p.state ?? "open",
-      draft: false,
+      draft: !!p.draft,
       title: `PR ${p.number}`,
       user: { login: p.user ?? BOT, type: (p.user ?? BOT).endsWith("[bot]") ? "Bot" : "User" },
       labels: p.labels.map((name) => ({ name })),
@@ -112,7 +119,7 @@ class World {
                 number: p.number,
                 headRefOid: sha(p.number, p.head),
                 baseRefName: "main",
-                isDraft: false,
+                isDraft: !!p.draft,
                 updatedAt: "2026-11-16T00:00:00Z",
                 author: { __typename: (p.user ?? BOT).endsWith("[bot]") ? "Bot" : "User", login: p.user ?? BOT },
                 labels: { nodes: p.labels.map((name) => ({ name })) },
@@ -142,7 +149,7 @@ class World {
             const h = sha(p.number, p.head);
             return [
               ...(p.reviewed ? [{ submitted_at: "2026-11-15T00:00:00Z", state: "COMMENTED", commit_id: sha(p.number, 1), user: { login: BOT }, author_association: "NONE", body: "Two findings." }] : []),
-              ...(p.verdict ? [{ submitted_at: "2026-11-16T00:00:00Z", state: "COMMENTED", commit_id: h, user: { login: BOT }, author_association: "NONE", body: `ok\n\n**Verdict:** ${p.verdict}` }] : []),
+              ...(p.verdict ? [{ submitted_at: p.verdictAt ?? "2026-11-16T00:00:00Z", state: "COMMENTED", commit_id: h, user: { login: BOT }, author_association: "NONE", body: `ok\n\n**Verdict:** ${p.verdict}` }] : []),
             ];
           }),
           listFiles: call("pulls.listFiles", () => [{ filename: "src/a.ts", additions: 10, deletions: 0 }]),
@@ -153,9 +160,18 @@ class World {
           }),
         },
         issues: {
+          listEvents: call("issues.listEvents", ({ issue_number }: any) => {
+            const p = w.prs.get(issue_number)!;
+            return p.rereviewAt ? [{ event: "labeled", label: { name: "re-review" }, created_at: p.rereviewAt }] : [];
+          }),
           listComments: call("issues.listComments", () => []),
           addLabels: call("issues.addLabels", () => ({})),
-          removeLabel: call("issues.removeLabel", () => ({})),
+          removeLabel: call("issues.removeLabel", ({ issue_number, name }: any) => {
+            const p = w.prs.get(issue_number)!;
+            p.labels = p.labels.filter((l) => l !== name);
+            p.rereviewAt = undefined;
+            return {};
+          }),
           createComment: call("issues.createComment", () => ({})),
         },
         repos: { getCommit: call("repos.getCommit", () => ({ commit: { committer: { date: "2026-11-15T00:00:00Z" } } })) },
@@ -167,7 +183,8 @@ class World {
             const gate = w.checks
               .filter((c) => c.sha === ref)
               .map((c) => ({ id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, app: { slug: c.app }, output: c.output }));
-            const all = [ci, ...gate];
+            const job = pr?.gateJobRunning ? [{ id: -1, name: "merge_gate", status: "in_progress", conclusion: null, app: { slug: "github-actions" }, output: {} }] : [];
+            const all = [ci, ...job, ...gate];
             return { check_runs: check_name ? all.filter((c) => c.name === check_name) : all };
           }),
           create: call("checks.create", ({ head_sha, name, status, conclusion, output }: any) => {
@@ -196,7 +213,7 @@ const POLICY = {
 };
 
 let run = 0;
-function tick(w: World, opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number } = {}) {
+function tick(w: World, opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rereview?: boolean; ownJob?: string } = {}) {
   const o = w.octokit();
   const before = w.total();
   return runHybridGate({
@@ -204,11 +221,13 @@ function tick(w: World, opts: { prNumber?: number; budgetSeconds?: number; merge
     checksOctokit: o,
     owner: "o",
     repo: "r",
-    policy: { ...POLICY },
+    policy: { ...POLICY, ...(opts.rereview ? { rereviewLabel: "re-review" } : {}) },
     checkName: CHECK,
     checkApp: APP,
     baseBranch: "main",
     merge: opts.merge ?? "off",
+    ownJob: opts.ownJob ?? "merge_gate",
+    ...(opts.rereview ? { rereviewLabel: "re-review" } : {}),
     rollout: undefined,
     prNumber: opts.prNumber,
     dryRun: false,
@@ -397,3 +416,70 @@ describe("API calls", () => {
   });
 });
 
+
+describe("0.4.1: the gate's own run, and scope before the window", () => {
+  it("ignores its own event-run job, in progress on the head, when judging CI", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", gateJobRunning: true });
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+    // Counted as CI, the same job would hold the result it is computing.
+    const w2 = new World();
+    w2.add({ number: 1, reviewed: true, verdict: "APPROVE", gateJobRunning: true });
+    await tick(w2, { prNumber: 1, ownJob: "something-else" });
+    expect(current(w2, 1, "failure")).toBe(true);
+  });
+
+  it("spends no window slot on a PR it would only skip", async () => {
+    run = 0;
+    const w = new World();
+    for (let n = 1; n <= 40; n++) w.add({ number: n, reviewed: true, verdict: "APPROVE", draft: n <= 20 });
+    const t = await tick(w, { rotation: 0 });
+    expect(t.evaluated).toBe(20);
+    for (let n = 21; n <= 40; n++) expect(current(w, n, "success"), `#${n}`).toBe(true);
+  });
+});
+
+describe("0.4.1: the re-review label at the gate", () => {
+  const LABELLED = "2026-11-17T12:00:00Z";
+  const before = "2026-11-17T11:00:00Z";
+  const after = "2026-11-17T13:00:00Z";
+
+  it("holds the result at in progress while there is no verdict newer than the label, and merges nothing", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before, labels: ["re-review"], rereviewAt: LABELLED });
+    await tick(w, { prNumber: 1, merge: "agent-only", rereview: true });
+    expect(w.result(1)!.status).toBe("in_progress");
+    expect(w.result(1)!.output.title).toBe("Re-review requested");
+    expect(w.merged).toEqual([]);
+    expect(w.prs.get(1)!.labels).toEqual(["re-review"]);
+  });
+
+  it("an earlier passing result is superseded, not left passing", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before });
+    await tick(w, { prNumber: 1, rereview: true });
+    expect(current(w, 1, "success")).toBe(true);
+    w.prs.get(1)!.labels = ["re-review"];
+    w.prs.get(1)!.rereviewAt = LABELLED;
+    await tick(w, { prNumber: 1, rereview: true });
+    expect(w.result(1)!.status).toBe("in_progress");
+  });
+
+  it("a fresh verdict ends it: the label comes off and the head is judged (and merged) as usual", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: after, labels: ["re-review"], rereviewAt: LABELLED });
+    await tick(w, { prNumber: 1, merge: "agent-only", rereview: true });
+    expect(w.prs.get(1)!.labels).toEqual([]);
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.merged).toEqual([{ pr: 1, sha: w.headSha(1) }]);
+  });
+
+  it("is off without the label configured: an old verdict still counts", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before, labels: ["re-review"], rereviewAt: LABELLED });
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.calls["issues.listEvents"]).toBeUndefined();
+  });
+});

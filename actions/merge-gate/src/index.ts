@@ -52,6 +52,7 @@ import {
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
+import { isFresh, lastLabeledAt, type LabelEvent } from "../../../src/shared/rereview.js";
 import { reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
@@ -65,6 +66,8 @@ interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   rebaseLabel?: string;
   /** Evaluate mode: a trusted verdict on the head matching this is an escalation (check `action_required`). */
   escalationBodyRegex?: string;
+  /** From the `rereview-label` input: the label that asks for a fresh review and verdict. */
+  rereviewLabel?: string;
   /** From the `verdicts` input (not the policy file): the words the default markers are built from. */
   verdictWords?: VerdictWords;
 }
@@ -381,8 +384,17 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, state: r.state })),
     policy.botLogin,
   );
+  // A re-review request: only verdicts posted after the label was added count.
+  let rereviewSince: string | undefined;
+  if (policy.rereviewLabel && labels.includes(policy.rereviewLabel)) {
+    const events = await octokit.paginate(octokit.rest.issues.listEvents, { owner, repo, issue_number: prNumber, per_page: 100 });
+    // Unknown (no labeled event found) counts as "just now": nothing is fresh yet.
+    rereviewSince = lastLabeledAt(events as LabelEvent[], policy.rereviewLabel) ?? new Date().toISOString();
+  }
   const headVerdict = latestHeadVerdict(
-    reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
+    reviews
+      .filter((r) => r.submitted_at && isFresh(r.submitted_at, rereviewSince))
+      .map((r) => ({ at: r.submitted_at!, sha: r.commit_id, author: r.user?.login, authorAssociation: r.author_association, body: r.body })),
     pr.head.sha,
     policy,
     markers,
@@ -414,7 +426,7 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     }
   }
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}) };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}), ...(rereviewSince ? { rereviewSince } : {}) };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -788,17 +800,37 @@ export const GATE_TICK_LIMIT = 20;
  * on this head completes that new run (publishCheck adopts the newest).
  */
 export async function withdrawCheck(checksOctokit: Octokit, owner: string, repo: string, headSha: string, name: string, app: string): Promise<boolean> {
+  return pendCheck(checksOctokit, owner, repo, headSha, name, app, {
+    title: "Awaiting the approver",
+    summary: "The approver's verdict on this head is gone (dismissed). The gate publishes a result once there is one.",
+  }, { onlyIfPublished: true });
+}
+
+/**
+ * Put the gate's result on a head at "in progress" — which never passes a
+ * required check. A completed run is superseded by a new one (its conclusion
+ * would otherwise stand); an in-progress run is updated in place. With
+ * onlyIfPublished, a head that has no result yet is left without one.
+ */
+export async function pendCheck(
+  checksOctokit: Octokit,
+  owner: string,
+  repo: string,
+  headSha: string,
+  name: string,
+  app: string,
+  output: { title: string; summary: string },
+  o: { onlyIfPublished?: boolean } = {},
+): Promise<boolean> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
-  if (!mine || mine.status !== "completed") return false;
-  await checksOctokit.rest.checks.create({
-    owner,
-    repo,
-    name,
-    head_sha: headSha,
-    status: "in_progress",
-    output: { title: "Awaiting the approver", summary: "The approver's verdict on this head is gone (dismissed). The gate publishes a result once there is one." },
-  });
+  if (!mine && o.onlyIfPublished) return false;
+  if (mine && mine.status !== "completed") {
+    if ((mine.output?.title ?? "") === output.title && (mine.output?.summary ?? "") === output.summary) return false;
+    await checksOctokit.rest.checks.update({ owner, repo, check_run_id: mine.id, status: "in_progress", output });
+    return true;
+  }
+  await checksOctokit.rest.checks.create({ owner, repo, name, head_sha: headSha, status: "in_progress", output });
   return true;
 }
 
@@ -835,6 +867,10 @@ export async function runHybridGate(opts: {
   rotation?: number;
   /** Injected clock, for tests. */
   now?: () => number;
+  /** The gate's own job name (its check run on a PR head); default GITHUB_JOB. */
+  ownJob?: string;
+  /** The re-review label, when the harness has one (the policy carries it too). */
+  rereviewLabel?: string;
 }): Promise<{ evaluated: number; written: number; mergedPr: string }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
@@ -844,7 +880,16 @@ export async function runHybridGate(opts: {
   // a person's PR on any branch is judged on its merits, not failed for its name.
   // The gate's own check is left out of the CI rollup, or a failing result would
   // read as failing CI and hold itself failing.
-  const base: PolicyFile = { ...opts.policy, branchPrefix: undefined, ciIgnoreCheckNames: [...(opts.policy.ciIgnoreCheckNames ?? []), checkName] };
+  // Also the gate's OWN job: an event run of the gate is itself a check run on the
+  // PR's head (named after the job), in progress while it evaluates — counted as
+  // CI, it would hold the result it is computing, and a red gate run would hold
+  // every later one.
+  const ownJob = opts.ownJob ?? process.env.GITHUB_JOB;
+  const base: PolicyFile = {
+    ...opts.policy,
+    branchPrefix: undefined,
+    ciIgnoreCheckNames: [...(opts.policy.ciIgnoreCheckNames ?? []), checkName, ...(ownJob ? [ownJob] : [])],
+  };
   // The CHECK does not judge mergeability unless the policy asks: GitHub computes
   // it lazily and only a merge attempt settles it. The MERGE keeps the default.
   const checkPolicy: PolicyFile = { ...base, requireCleanRebase: opts.policy.requireCleanRebase ?? false };
@@ -890,8 +935,16 @@ export async function runHybridGate(opts: {
       core.notice(`could not search for the PRs to evaluate (${(e as Error).message}) — nothing evaluated this tick; the next tick tries again`);
       return { evaluated: 0, written: 0, mergedPr: "" };
     }
-    const window = rotatingWindow(found, GATE_TICK_LIMIT, opts.rotation ?? 0);
-    core.info(`${found.length} open PR(s) reviewed by ${botLogin}; evaluating ${window.length} this tick`);
+    // Scope first, then the window: a slot is never spent on a PR the gate would
+    // only skip (a draft, a skip label, another bot's).
+    const inScopeFound = found.filter((c) => {
+      const s = inScope({ authorLogin: c.author, authorType: c.authorType, draft: c.draft, labels: c.labels }, rollout, botLogin);
+      const dependabot = dependabotLane && c.author === DEPENDABOT_LOGIN && !c.draft;
+      if (!s.inScope && !dependabot) core.info(`PR #${c.number}: out of scope — ${s.detail}`);
+      return s.inScope || dependabot;
+    });
+    const window = rotatingWindow(inScopeFound, GATE_TICK_LIMIT, opts.rotation ?? 0);
+    core.info(`${found.length} open PR(s) reviewed by ${botLogin}, ${inScopeFound.length} in scope; evaluating ${window.length} this tick`);
     prs = window.map((c) => ({ number: c.number, draft: c.draft, user: { login: c.author, type: c.authorType }, labels: c.labels.map((name) => ({ name })) }));
   } else {
     // No bot login to search by: the original listing, in a rotating window.
@@ -928,6 +981,29 @@ export async function runHybridGate(opts: {
       // check blocks a merge; a neutral one would PASS it. (The dependabot lane
       // needs no verdict.) A result already on this head — its verdict since
       // dismissed — is withdrawn to in progress.
+      // A re-review request: until there is a verdict newer than the label, the
+      // result is held at in progress (never passing, never merged). Once there
+      // is one, the request is done — the label comes off and the head is judged.
+      if (facts.rereviewSince && opts.rereviewLabel) {
+        if (!facts.headVerdict) {
+          if (!opts.dryRun && facts.headSha) {
+            await pendCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp, {
+              title: "Re-review requested",
+              summary: `\`${opts.rereviewLabel}\` was added at ${facts.rereviewSince}: waiting for a fresh review and a fresh verdict on \`${facts.headSha.slice(0, 7)}\`. Earlier verdicts no longer count, and nothing is merged until then.`,
+            });
+          }
+          core.info(`PR #${n}: re-review requested — held until a fresh verdict`);
+          continue;
+        }
+        if (!opts.dryRun) {
+          try {
+            await octokit.rest.issues.removeLabel({ owner, repo, issue_number: n, name: opts.rereviewLabel });
+            core.info(`PR #${n}: fresh verdict after the re-review request — removed \`${opts.rereviewLabel}\``);
+          } catch (e) {
+            core.warning(`PR #${n}: could not remove \`${opts.rereviewLabel}\`: ${(e as Error).message}`);
+          }
+        }
+      }
       const verdictless = !facts.headVerdict && !onDependabotLane;
       if (verdictless) {
         const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
@@ -1002,6 +1078,8 @@ export async function run(): Promise<void> {
     // consumer's identity and human-gate wiring don't have to be restated in the
     // policy file. Inputs win over the policy file, same as branch-prefix.
     // The verdict words the compiler passes from foundry.config.yaml (`verdicts:`).
+    const rereviewInput = core.getInput("rereview-label").trim();
+    if (rereviewInput) policy.rereviewLabel = rereviewInput;
     const verdictsInput = core.getInput("verdicts").trim();
     if (verdictsInput) policy.verdictWords = parseVerdictWords(verdictsInput);
     const botLoginInput = core.getInput("bot-login").trim();
@@ -1064,6 +1142,7 @@ export async function run(): Promise<void> {
         timeBudgetSeconds: parseInt(core.getInput("time-budget-seconds"), 10) || undefined,
         // The window advances once per schedule period: computed from the clock,
         // not a run counter, which event runs of the same workflow also advance.
+        rereviewLabel: policy.rereviewLabel,
         rotation: Math.floor(Date.now() / (1000 * (parseInt(core.getInput("rotation-period-seconds"), 10) || 300))),
       });
       core.setOutput("evaluated", String(r.evaluated));

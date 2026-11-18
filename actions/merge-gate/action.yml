@@ -110,6 +110,14 @@ inputs:
       can publish one this gate — or a ruleset pinned to the App — accepts.
     required: false
     default: ""
+  rereview-label:
+    description: >
+      With `merge`: the label that asks for a fresh review and verdict on the
+      head. While it is on a PR, only verdicts posted after it was added count;
+      until one exists the gate's result is held at in progress and nothing is
+      merged. Once one exists the gate removes the label. Empty: off.
+    required: false
+    default: ""
   rotation-period-seconds:
     description: >
       With `merge` and no `pr-number`: the schedule's period. The pass's window
