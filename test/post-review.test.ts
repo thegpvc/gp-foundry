@@ -145,6 +145,7 @@ if [ "$method" != "GET" ]; then
   [ -n "\${STUB_NO_URL:-}" ] || echo '{"id":99,"html_url":"https://github.com/o/r/pull/7#pullrequestreview-99"}'
   exit 0
 fi
+if [ -n "\${STUB_EVENTS_FAIL:-}" ] && [[ "$path" == */events* ]]; then echo 'gh: Server Error (HTTP 502)' >&2; exit 1; fi
 file="$FIXTURES/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
 [ -f "$file" ] || { echo "stub gh: no fixture for $path" >&2; exit 1; }
 if [ -n "$jqexpr" ]; then jq -r "$jqexpr" "$file"; else cat "$file"; fi
@@ -180,7 +181,13 @@ function runPost(
   writeFileSync(join(bin, "gh"), GH_STUB);
   chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(fx, "repos/o/r/pulls/7/reviews?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(reviews));
-  if (events) writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
+  if (events) {
+    writeFileSync(join(fx, "repos/o/r/issues/7/events?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify(events));
+    // The labels on the PR: those whose latest event (in API order) is "labeled".
+    const on = new Map<string, boolean>();
+    for (const e of events as { event: string; label?: { name: string } }[]) if (e.label) on.set(e.label.name, e.event === "labeled");
+    writeFileSync(join(fx, "repos/o/r/issues/7/labels?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify([...on].filter(([, v]) => v).map(([name]) => ({ name }))));
+  }
   if (verdictChecks && step.env.VERDICT_CHECK) {
     const q = `repos/o/r/commits/head1/check-runs?check_name=${encodeURIComponent(step.env.VERDICT_CHECK).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())}&filter=all&per_page=100`;
     writeFileSync(join(fx, q.replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify({ check_runs: verdictChecks }));
@@ -609,9 +616,24 @@ describe("a re-review request: the post step posts a fresh review on the same he
     expect(r.posts).toEqual([]);
   });
 
-  it("an unreadable label history: posts anyway, with a warning (a duplicate at worst, never a dropped request)", () => {
-    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"]);
+  it("the label on but its history unreadable: posts anyway, with a warning (a duplicate at worst, never a dropped request)", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], { STUB_EVENTS_FAIL: "1" }, ["src/a.ts"], labelled);
     expect(r.status).toBe(0);
+    expect(r.posts).toHaveLength(1);
+  });
+
+  it("the label NOT on: no history read is needed, and a re-run stays idempotent", () => {
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], { STUB_EVENTS_FAIL: "1" }, ["src/a.ts"], []);
+    expect(r.posts).toEqual([]);
+  });
+
+  it("removed and re-added in the same second: API order decides, as in the gate (the request stands)", () => {
+    const toggled = [
+      { event: "labeled", label: { name: "re-review" }, created_at: "2026-11-17T10:00:00Z" },
+      { event: "unlabeled", label: { name: "re-review" }, created_at: "2026-11-17T12:00:00Z" },
+      { event: "labeled", label: { name: "re-review" }, created_at: "2026-11-17T12:00:00Z" },
+    ];
+    const r = runPost(step(), fence(REVIEW), [mine("2026-11-17T11:00:00Z")], {}, ["src/a.ts"], toggled);
     expect(r.posts).toHaveLength(1);
   });
 
@@ -633,7 +655,7 @@ describe("quiet_verdicts: a verdict that needs nothing from the author is a chec
   const CHECK = "gp-foundry/verdict (approver)";
   const approve = { body: "Looks right.\n\n**Verdict:** APPROVE", comments: [{ path: "src/a.ts", line: 4, body: "Nit: name." }] };
   const reject = { body: "One blocker.\n\n**Verdict:** REQUEST_CHANGES", comments: [] };
-  const ours = (over: object = {}) => ({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-bot" }, ...over });
+  const ours = (over: object = {}) => ({ name: CHECK, head_sha: "head1", status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-bot" }, output: { title: "Verdict: APPROVE" }, ...over });
 
   it("an APPROVE is delivered as the App's completed check on the head — no review", () => {
     const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, []);
@@ -665,6 +687,33 @@ describe("quiet_verdicts: a verdict that needs nothing from the author is a chec
   it("a check of the same name from another App does not", () => {
     const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ app: { slug: "someone-else" } })]);
     expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("the title comes from the verdict line, even with findings and a trailing HTML comment", () => {
+    const body = { body: "Looks good.\n\n**Verdict:** APPROVE\n<!-- note -->", comments: [{ path: "src/a.ts", line: 2, body: "nit: rename foo" }] };
+    const r = runPost(quietStep(), fence(body), [], {}, ["src/a.ts"], undefined, []);
+    const c = r.writes[0]!.body;
+    expect(c.output.title).toBe("Verdict: APPROVE");
+    expect(c.output.summary).toBe("Looks good.\n\n### Findings\n\n- `src/a.ts:2` — nit: rename foo");
+  });
+
+  it("a check of the right name and App but no verdict title is not a verdict: delivered again", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ output: { title: "Verdict: foo bar" } })]);
+    expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
+  });
+
+  it("the App's slug is compared without case", () => {
+    const r = runPost(quietStep(), fence(approve), [], {}, ["src/a.ts"], undefined, [ours({ app: { slug: "Agent-Bot" } })]);
+    expect(r.writes).toEqual([]);
+  });
+
+  it("a token from another App than identity.bot_login names: posted as a review, with a warning", () => {
+    const s = quietStep();
+    expect(s.env.MINTED_APP).toBe("${{ steps.app-token.outputs.app-slug }}");
+    const r = runPost(s, fence(approve), [], { MINTED_APP: "other-app" }, ["src/a.ts"], undefined, []);
+    expect(r.posts).toHaveLength(1);
+    expect(r.stdout).toContain("posted as a review");
+    expect(runPost(s, fence(approve), [], { MINTED_APP: "agent-bot" }, ["src/a.ts"], undefined, []).writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs"]);
   });
 
   it("an unreadable check history: nothing posted, red (a retry must not deliver twice)", () => {

@@ -50,7 +50,7 @@ import {
   type VerdictEvent,
   type VerdictTrustPolicy,
 } from "./gate.js";
-import { parseVerdictWords, verdictLine, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
+import { parseVerdictWords, quietVerdictOf, verdictLine, verdictRegexSource, type QuietCheckRunLike, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
 import { isFresh, requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 import { excludeLabelQualifier, reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
@@ -162,17 +162,25 @@ export function actionsRunId(c: { details_url?: string | null; html_url?: string
  *   - its name is the gate job's own check-run name.
  *
  * The second rule also drops a job of that name in ANOTHER workflow from the
- * rollup; the compiler names the gate's job after its node, so give the node an
- * id no CI job uses. The gate's published result (`check-name`) is left out by
- * name separately.
+ * rollup, so the compiler gives the gate's job a name no CI job would carry:
+ * `gp-foundry gate (<node>)`. The gate's published result (`check-name`) is left
+ * out by name separately.
+ *
+ * Before 0.5.0 the job was named after its node alone. Runs of that name still
+ * on an open PR's head after an upgrade — in progress, or cancelled by the first
+ * run under the new name — are the gate's own too. Only those states: a
+ * completed run of that name that passed or failed may be a CI job, and is CI.
  */
 export function isOwnGateRun(
-  c: { name?: string | null; app?: { slug?: string | null } | null; details_url?: string | null; html_url?: string | null },
+  c: { name?: string | null; status?: string | null; conclusion?: string | null; app?: { slug?: string | null } | null; details_url?: string | null; html_url?: string | null },
   self: GateRun | undefined,
 ): boolean {
   if (!self || c.app?.slug !== CHECK_APP) return false;
   if (self.runId && actionsRunId(c) === self.runId) return true;
-  return !!self.jobCheckName && c.name === self.jobCheckName;
+  if (!self.jobCheckName) return false;
+  if (c.name === self.jobCheckName) return true;
+  const legacy = /^gp-foundry gate \((.+)\)$/.exec(self.jobCheckName)?.[1];
+  return !!legacy && c.name === legacy && (c.status !== "completed" || c.conclusion === "cancelled");
 }
 
 // GraphQL is the only API with thread resolution; same shape as agent-context's
@@ -312,31 +320,22 @@ export async function fetchReviewThreads(octokit: Octokit, owner: string, repo: 
 }
 
 /**
- * The quiet verdicts on a head (quiet_verdicts=), as review-shaped records: the
- * named check runs, completed, owned by the harness App (any other app's run of
- * the same name is ignored), whose title is `Verdict: <WORD>`. Each becomes the
- * bot's COMMENTED review on the head, submitted when the check completed, whose
- * body ends in that verdict line.
+ * The quiet verdicts among a head's check runs (quiet_verdicts=), as review-shaped
+ * records: each check that quietVerdictOf (src/shared/verdicts.ts) accepts becomes
+ * the bot's COMMENTED review on the head, submitted when the check completed, whose
+ * body ends in its verdict line.
  */
-export async function quietVerdictReviews(
-  checksOctokit: Octokit,
-  owner: string,
-  repo: string,
+export function quietVerdictReviews(
+  checkRuns: QuietCheckRunLike[],
   headSha: string,
   policy: PolicyFile,
-): Promise<{ submitted_at: string; commit_id: string; state: string; user: { login: string }; author_association: string; body: string }[]> {
+): { submitted_at: string; commit_id: string; state: string; user: { login: string }; author_association: string; body: string }[] {
   if (!policy.verdictChecks?.length || !policy.verdictApp) return [];
   const author = policy.botLogin ?? `${policy.verdictApp}[bot]`;
-  const out: Awaited<ReturnType<typeof quietVerdictReviews>> = [];
-  for (const name of policy.verdictChecks) {
-    const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
-    for (const r of runs) {
-      const word = /^Verdict: (\S+)$/.exec((r.output?.title ?? "").trim())?.[1];
-      if (r.name !== name || r.app?.slug !== policy.verdictApp || r.status !== "completed" || !r.completed_at || r.head_sha !== headSha || !word) continue;
-      out.push({ submitted_at: r.completed_at, commit_id: headSha, state: "COMMENTED", user: { login: author }, author_association: "NONE", body: `${r.output?.summary ?? ""}\n\n${verdictLine(word)}` });
-    }
-  }
-  return out;
+  return checkRuns.flatMap((r) => {
+    const q = quietVerdictOf(r, { checks: policy.verdictChecks!, app: policy.verdictApp!, headSha });
+    return q ? [{ submitted_at: q.at, commit_id: headSha, state: "COMMENTED", user: { login: author }, author_association: "NONE", body: `${q.summary}\n\n${verdictLine(q.word)}` }] : [];
+  });
 }
 
 export async function gatherFacts(
@@ -360,12 +359,45 @@ export async function gatherFacts(
   // Collect verdict-bearing events (reviews + marker comments) in time order, then
   // apply the integrity rule: latest verdict wins, approval must match the head SHA
   // (or, for comments, postdate the head commit). See gate.latestValidApproval.
+  // The head's check runs, read first: CI below, and the quiet verdicts with the reviews.
+  type CheckRunRaw = {
+    id?: number | null;
+    name?: string | null;
+    status?: string | null;
+    conclusion?: string | null;
+    app?: { slug?: string | null } | null;
+    details_url?: string | null;
+    html_url?: string | null;
+    completed_at?: string | null;
+    head_sha?: string | null;
+    output?: { title?: string | null; summary?: string | null } | null;
+  };
+  let checkRunsRaw: CheckRunRaw[];
+  try {
+    // Deliberately a SEPARATE token from the one that merges. Reading check-runs
+    // needs the Checks permission, which only a GitHub App has — fine-grained
+    // PATs cannot grant it at all (GitHub's permission list has no Checks entry).
+    // GITHUB_TOKEN is an App installation token, so the caller passes it here for
+    // this read while the merge itself keeps using the PAT, which is what makes
+    // the merge attributable and lets its events cascade.
+    checkRunsRaw = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
+  } catch (e) {
+    // Fail closed, but say what to wire up — see describeCheckRunsFailure.
+    throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }));
+  }
   const rawEvents: VerdictEvent[] = [];
   const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 });
   // quiet_verdicts: a verdict delivered as a check run joins the reviews as the
   // bot's verdict on the head, at the time it completed — so "latest verdict
-  // wins" orders the two kinds together.
-  reviews.push(...((await quietVerdictReviews(checksOctokit, owner, repo, pr.head.sha, policy)) as typeof reviews));
+  // wins" orders the two kinds together. Put FIRST: the orderings are stable, so
+  // a review from the same second wins the tie (a rejection is never outranked
+  // by an approval it cannot be ordered against).
+  reviews.unshift(...(quietVerdictReviews(checkRunsRaw, pr.head.sha, policy) as typeof reviews));
+  // …and it is not CI. Only the harness App's run is left out: a run of the same
+  // name from anything else is judged like any other check.
+  checkRunsRaw = checkRunsRaw.filter(
+    (c) => !(policy.verdictApp && policy.verdictChecks?.includes(c.name ?? "") && (c.app?.slug ?? "").toLowerCase() === policy.verdictApp.toLowerCase()),
+  );
   // Approval is tested FIRST: per the reviewer contract the verdict is the body's
   // final "**Verdict:** …" line, and an approval may legitimately quote or discuss
   // the earlier REQUEST_CHANGES items in its prose. A body matching the approval
@@ -422,30 +454,7 @@ export async function gatherFacts(
   const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
   const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions, ...(f.previous_filename ? { previousPath: f.previous_filename } : {}) }));
 
-  // A quiet verdict is a check run on the head, but not CI.
-  const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ...(policy.verdictChecks ?? [])]);
-  type CheckRunRaw = {
-    id?: number | null;
-    name?: string | null;
-    status?: string | null;
-    conclusion?: string | null;
-    app?: { slug?: string | null } | null;
-    details_url?: string | null;
-    html_url?: string | null;
-  };
-  let checkRunsRaw: CheckRunRaw[];
-  try {
-    // Deliberately a SEPARATE token from the one that merges. Reading check-runs
-    // needs the Checks permission, which only a GitHub App has — fine-grained
-    // PATs cannot grant it at all (GitHub's permission list has no Checks entry).
-    // GITHUB_TOKEN is an App installation token, so the caller passes it here for
-    // this read while the merge itself keeps using the PAT, which is what makes
-    // the merge attributable and lets its events cascade.
-    checkRunsRaw = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: pr.head.sha, per_page: 100 });
-  } catch (e) {
-    // Fail closed, but say what to wire up — see describeCheckRunsFailure.
-    throw new Error(describeCheckRunsFailure(e as { status?: number; message?: string }));
-  }
+  const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
   // The gate's own job is not CI: this run is in progress while it reads, and an
   // earlier run of the gate cancelled by a newer event would otherwise read as
   // failing CI. Dropped before anything else reads the list (see isOwnGateRun).
@@ -1115,14 +1124,20 @@ export async function runHybridGate(opts: {
       if (facts.rereview && opts.rereviewLabel && !onDependabotLane) {
         const held = facts.rereview.unreadable
           ? `could not read when \`${opts.rereviewLabel}\` was added, so whether the verdict on \`${(facts.headSha ?? "").slice(0, 7)}\` is fresh is unknown. The next run tries again; nothing is merged until then.`
-          : !facts.headVerdict
+          : !facts.rereview.since
+            ? // The label is on, but its history shows no labeled event as its latest:
+              // the request cannot be dated, so no verdict can be shown to answer it.
+              // Held, not judged on a verdict it may have been asking to replace —
+              // usually a moment's lag in the events API, which the next run clears.
+              `\`${opts.rereviewLabel}\` is on this PR, but its history does not say when it was added, so no verdict can be shown to be newer. The next run tries again; if this persists, remove the label and add it again. Nothing is merged until then.`
+            : !facts.headVerdict
             ? `\`${opts.rereviewLabel}\` was added${facts.rereview.since ? ` at ${facts.rereview.since}` : ""}: waiting for a fresh review and a fresh verdict on \`${(facts.headSha ?? "").slice(0, 7)}\`. Earlier verdicts no longer count, and nothing is merged until then.`
             : undefined;
         if (held) {
           if (!opts.dryRun && facts.headSha) {
             await pendCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp, { title: "Re-review requested", summary: held });
           }
-          core.info(`PR #${n}: re-review requested — held (${facts.rereview.unreadable ? "label history unreadable" : "no fresh verdict yet"})`);
+          core.info(`PR #${n}: re-review requested — held (${facts.rereview.unreadable ? "label history unreadable" : !facts.rereview.since ? "request cannot be dated" : "no fresh verdict yet"})`);
           continue;
         }
         // Done: the label comes off — LAST, once this PR is published and merged.

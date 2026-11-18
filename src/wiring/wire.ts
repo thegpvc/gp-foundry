@@ -332,6 +332,8 @@ export function wire(ir: Harness): WiringPlan {
   const rollout = rolloutOf(ir.config);
   const botLogin = ir.config.identity?.bot_login;
 
+  // quiet_verdicts= anywhere in the graph: every single gate is then nudged by dispatch.
+  const quietGraph = nudgedGatesOf(ir.nodes, ir.config).length > 0;
   for (const node of ir.nodes) {
     if (node.type === "start" || node.type === "exit") continue;
     if (diamonds.memberIds.has(node.id)) continue;
@@ -394,7 +396,7 @@ export function wire(ir: Harness): WiringPlan {
     if (node.attrs.schedule !== undefined) {
       triggers.schedule = [{ cron: String(node.attrs.schedule) }];
       // A gate nudged by quiet verdicts takes the PR to evaluate as a dispatch input.
-      const nudged = singleGate && nudgedGatesOf(ir.nodes, ir.config).some((g) => g.id === node.id);
+      const nudged = singleGate && quietGraph;
       triggers.workflow_dispatch = nudged
         ? { inputs: { pr: { description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass", required: false, type: "string" } } }
         : {};
@@ -482,7 +484,7 @@ export function wire(ir: Harness): WiringPlan {
       // collapses to one evaluation of its latest state. The scheduled pass has
       // its own slot and is never cancelled by an event.
       // A nudged gate's dispatch for one PR (inputs.pr) shares that PR's slot.
-      if (nudgedGatesOf(ir.nodes, ir.config).some((g) => g.id === node.id)) {
+      if (quietGraph) {
         const pr = "(github.event.pull_request.number || inputs.pr)";
         nw.concurrency = {
           group: `\${{ ${pr} && format('${node.id}-pr-{0}', ${pr}) || '${node.id}' }}`,

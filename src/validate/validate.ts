@@ -21,6 +21,8 @@ import {
   publishesCheck,
   isSweep,
   quietVerdictsRaw,
+  verdictCheckName,
+  sweepRequiresReview,
   botAppSlug,
   parsePostMarker,
   postsReview,
@@ -672,6 +674,33 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           level: "error",
           code: "node.quiet-verdicts-needs-app",
           message: `quiet_verdicts= on '${n.id}' needs App auth with identity.bot_login set to the App's bot (\`<app>[bot]\`): the verdict is a check run the App owns, and only the App's runs count`,
+          where: at,
+        });
+      } else if (!sweepRequiresReview(n)) {
+        diags.push({
+          level: "warning",
+          code: "node.quiet-verdicts-unfindable",
+          message: `quiet_verdicts= on '${n.id}' without requires_review=true: a PR whose only bot verdict is quiet leaves no bot review, so the gate's scheduled pass (which finds PRs by \`reviewed-by:\`) cannot find it — it relies on the dispatch after the verdict alone`,
+          hint: "set requires_review=true so a reviewer lane's review precedes the verdict",
+          where: at,
+        });
+      }
+      // Verdict checks are told apart by name: two lanes on one name would read
+      // each other's verdict as their own, and a CI or gate check of that name
+      // would be read as a verdict's.
+      const name = verdictCheckName(n);
+      const clash = ir.nodes.find(
+        (m) =>
+          m.id !== n.id &&
+          ((m.attrs.quiet_verdicts !== undefined && verdictCheckName(m) === name) ||
+            (m.type === "merge-gate" && String(m.attrs.check_name ?? `gp-foundry/approval (${m.id})`) === name)),
+      );
+      if (clash) {
+        diags.push({
+          level: "error",
+          code: "node.duplicate-verdict-check",
+          message: `verdict check '${name}' on '${n.id}' is also used by '${clash.id}': each quiet verdict lane needs a check name of its own`,
+          hint: "set verdict_check= to a distinct name",
           where: at,
         });
       }

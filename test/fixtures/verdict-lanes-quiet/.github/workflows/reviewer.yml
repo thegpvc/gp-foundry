@@ -336,15 +336,24 @@ jobs:
           POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
           SINCE=""
           if [ -n "${REREVIEW_LABEL:-}" ]; then
-            # The request time: the label's last "labeled" event, if that is its latest
-            # event (removed by hand, there is no request). See src/shared/rereview.ts.
-            if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == env.REREVIEW_LABEL) | "\(.created_at) \(.event)"' | sort | tail -n 1); then
-              case "$LAST_EVENT" in *" labeled") SINCE="${LAST_EVENT%% *}" ;; esac
-            else
-              # Unknown: post. On a first run nothing is lost either way; on a re-run of a
-              # re-review the worst case is the review posted twice, not a request dropped.
-              echo "::warning::could not read the PR's label history — posting without the re-review check"
-              SINCE="9999"
+            # Only a PR that carries the label has a request to answer.
+            if ! LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels?per_page=100" --paginate --jq '.[].name'); then
+              echo "::warning::could not read the PR's labels — any re-review request is left for the next run"
+            elif grep -qxF -- "$REREVIEW_LABEL" <<< "$LABELS"; then
+              # The request time: the label's latest event in the API's (chronological)
+              # order, if that is a "labeled" one. See src/shared/rereview.ts.
+              if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == env.REREVIEW_LABEL) | "\(.created_at) \(.event)"' | tail -n 1); then
+                case "$LAST_EVENT" in
+                  *" labeled") SINCE="${LAST_EVENT%% *}" ;;
+                  # On, but undateable: the request stands; nothing earlier answers it.
+                  *) SINCE="9999" ;;
+                esac
+              else
+                # The label is on but its history is unreadable: post. The worst case is
+                # the review posted twice on a re-run, not a request dropped.
+                echo "::warning::could not read the PR's label history — posting without the re-review check"
+                SINCE="9999"
+              fi
             fi
           fi
           export MARKER POSTED SINCE

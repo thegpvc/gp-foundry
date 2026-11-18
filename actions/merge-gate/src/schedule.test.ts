@@ -695,12 +695,14 @@ describe("0.4.1: the re-review label at the gate", () => {
     expect(w.prs.get(1)!.labels).toEqual(["re-review"]);
   });
 
-  it("a request that cannot be dated has no cutoff: judged as usual, and the label comes off", async () => {
+  it("a request that cannot be dated holds (it is not used up on the old verdict), and says to re-add the label", async () => {
     const w = new World();
-    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: before, labels: ["re-review"], rereviewAt: LABELLED, undated: true });
-    await tick(w, { prNumber: 1, rereview: true });
-    expect(current(w, 1, "success")).toBe(true);
-    expect(w.prs.get(1)!.labels).toEqual([]);
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", verdictAt: after, labels: ["re-review"], rereviewAt: LABELLED, undated: true });
+    await tick(w, { prNumber: 1, merge: "agent-only", rereview: true });
+    expect(w.result(1)!.status).toBe("in_progress");
+    expect(w.result(1)!.output.summary).toContain("remove the label and add it again");
+    expect(w.merged).toEqual([]);
+    expect(w.prs.get(1)!.labels).toEqual(["re-review"]);
   });
 
   it("the label comes off only AFTER the merge: its unlabeled event's run cannot cancel a merge halfway", async () => {
@@ -729,6 +731,25 @@ describe("0.4.1: the re-review label at the gate", () => {
     await tick(w, { prNumber: 1 });
     expect(current(w, 1, "success")).toBe(true);
     expect(w.calls["issues.listEvents"]).toBeUndefined();
+  });
+});
+
+describe("upgrading past the gate job's rename (`<node>` → `gp-foundry gate (<node>)`)", () => {
+  const NEW = { runId: SELF.runId, jobCheckName: "gp-foundry gate (gate)" };
+  it.each([
+    ["in progress", "in_progress", null],
+    ["cancelled", "completed", "cancelled"],
+  ])("an old-named run of the gate left %s on the head is not failing CI", async (_label, status, conclusion) => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status, conclusion, details_url: runUrl(6999) }] });
+    await tick(w, { prNumber: 1, self: NEW });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+  it("a completed, failed job of that old name is still CI (it may be a real CI job)", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE", extra: [{ name: "gate", status: "completed", conclusion: "failure", details_url: runUrl(6999) }] });
+    await tick(w, { self: NEW });
+    expect(current(w, 1, "failure")).toBe(true);
   });
 });
 
@@ -772,6 +793,22 @@ describe("quiet_verdicts: a verdict delivered as a check run", () => {
     w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
     await tick(w, { prNumber: 1, quiet: true });
     expect(current(w, 1, "success")).toBe(true);
+  });
+
+  it("a same-second tie between a quiet APPROVE and a REQUEST_CHANGES review: the review wins", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "REQUEST_CHANGES", verdictAt: T(10) });
+    w.prs.get(1)!.extra = [{ ...quiet("APPROVE", T(10)), head_sha: w.headSha(1) }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "failure")).toBe(true);
+  });
+
+  it("a failing CI check that merely shares the verdict check's name is still CI", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    w.prs.get(1)!.extra = [{ name: QUIET_CHECK, status: "completed", conclusion: "failure" }];
+    await tick(w, { prNumber: 1, quiet: true });
+    expect(current(w, 1, "failure")).toBe(true);
   });
 
   it("a check of the same name from another App is no verdict", async () => {

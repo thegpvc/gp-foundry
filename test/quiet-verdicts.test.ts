@@ -181,7 +181,7 @@ describe("the sweep: a quiet verdict decides the head", () => {
     [`repos/o/r/commits/sha${n}/status`]: { total_count: 0 },
     [`repos/o/r/pulls/${n}/reviews?per_page=100`]: reviews,
   });
-  const quiet = (over: object = {}) => ({ name: CHECK, status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-app" }, ...over });
+  const quiet = (over: object = {}) => ({ name: CHECK, status: "completed", conclusion: "success", completed_at: "2026-11-18T10:00:00Z", app: { slug: "agent-app" }, output: { title: "Verdict: APPROVE" }, ...over });
   const pr = (n: number, since?: string) => ({ number: n, sha: `sha${n}`, base: "main", requested: 0, quiet: 3600, ...(since ? { since } : {}) });
   const scoped = (...p: unknown[]) => ({ SCOPED: JSON.stringify(p), SCOPE_LISTED: "true" });
 
@@ -193,6 +193,21 @@ describe("the sweep: a quiet verdict decides the head", () => {
     });
     expect(r.stdout).toContain("#1: already decided at sha1 (a quiet verdict)");
     expect(r.prs.map((p: any) => p.number)).toEqual([2, 3]);
+  });
+
+  it("a quiet head with NO check runs at all is still selected once the PR has settled (the settle timer is not clobbered)", () => {
+    const empty = {
+      "repos/o/r/commits/sha1/check-runs?per_page=100&filter=all": { check_runs: [] },
+      "repos/o/r/commits/sha1/status": { total_count: 0 },
+      "repos/o/r/pulls/1/reviews?per_page=100": reviewed(1),
+    };
+    const r = runStep(select(), scoped(pr(1)), empty);
+    expect(r.prs.map((p: any) => p.number)).toEqual([1]);
+  });
+
+  it("a check of that name and App without a verdict title does not decide", () => {
+    const r = runStep(select(), scoped(pr(1)), head(1, [quiet({ output: { title: "Verdict: foo bar" } })]));
+    expect(r.prs.map((p: any) => p.number)).toEqual([1]);
   });
 
   it("mixed history: a verdict review decides as before, a quiet check as well", () => {

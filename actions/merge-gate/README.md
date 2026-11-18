@@ -245,7 +245,8 @@ verdict when `verdict-checks` names it (the compiler writes it) and its app is
 "Latest verdict wins" still holds across both kinds: the check counts at its
 `completed_at`, a review at its `submitted_at`. A check run starts no gate run the way a
 review's event does, so the lane's post step dispatches the gate with the PR as its `pr`
-input (`pr-number` falls back to it), and the scheduled pass covers a failed dispatch.
+input (`pr-number` falls back to it). The scheduled pass covers a failed dispatch when the PR
+carries a bot review for its `reviewed-by:` search (a quiet lane with `requires_review=true`).
 
 **Reading a verdict yourself** (a formal-approval publisher, a dashboard). The latest
 verdict on a head is the newest of:

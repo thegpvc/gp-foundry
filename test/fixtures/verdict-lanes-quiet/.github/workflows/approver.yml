@@ -103,11 +103,12 @@ jobs:
                 ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
                 ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
                 ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
-                ([.[] | select(.name == env.VERDICT_CHECK and .app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length) ] | @tsv' \
+                ([.[] | select((.name == env.VERDICT_CHECK and ((.app.slug // "") | ascii_downcase) == (env.BOT_APP | ascii_downcase) and .status == "completed" and ((.output.title // "") | test("^Verdict: [A-Za-z][A-Za-z0-9_-]*$")) and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE)))] | length) ] | @tsv' \
               | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5; q+=$6} END {print t+0, r+0, s+0, f+0, i+0, q+0}') || { echo "#$NUM: could not read check-runs"; continue; }
-            read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET <<< "$CHECKS"
+            # (QUIET_VERDICTS, not QUIET: that is the seconds since the PR changed.)
+            read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET_VERDICTS <<< "$CHECKS"
             # quiet_verdicts: a verdict delivered as a check run by the harness App decides the head too.
-            if [ "$QUIET" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi
+            if [ "$QUIET_VERDICTS" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi
             if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
             if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then
               echo "#$NUM: no check-run on $SHA yet and the PR changed ${QUIET}s ago — waiting for CI to register"
@@ -268,6 +269,7 @@ jobs:
           QUIET_LINES: "**Verdict:** APPROVE"
           VERDICT_CHECK: gp-foundry/verdict (approver)
           BOT_APP: agent-app
+          MINTED_APP: ${{ steps.app-token.outputs.app-slug }}
           GATE_WORKFLOWS: gate.yml
           DISPATCH_TOKEN: ${{ github.token }}
           BASE_BRANCH: main
@@ -366,15 +368,24 @@ jobs:
           POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
           SINCE=""
           if [ -n "${REREVIEW_LABEL:-}" ]; then
-            # The request time: the label's last "labeled" event, if that is its latest
-            # event (removed by hand, there is no request). See src/shared/rereview.ts.
-            if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == env.REREVIEW_LABEL) | "\(.created_at) \(.event)"' | sort | tail -n 1); then
-              case "$LAST_EVENT" in *" labeled") SINCE="${LAST_EVENT%% *}" ;; esac
-            else
-              # Unknown: post. On a first run nothing is lost either way; on a re-run of a
-              # re-review the worst case is the review posted twice, not a request dropped.
-              echo "::warning::could not read the PR's label history — posting without the re-review check"
-              SINCE="9999"
+            # Only a PR that carries the label has a request to answer.
+            if ! LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels?per_page=100" --paginate --jq '.[].name'); then
+              echo "::warning::could not read the PR's labels — any re-review request is left for the next run"
+            elif grep -qxF -- "$REREVIEW_LABEL" <<< "$LABELS"; then
+              # The request time: the label's latest event in the API's (chronological)
+              # order, if that is a "labeled" one. See src/shared/rereview.ts.
+              if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == env.REREVIEW_LABEL) | "\(.created_at) \(.event)"' | tail -n 1); then
+                case "$LAST_EVENT" in
+                  *" labeled") SINCE="${LAST_EVENT%% *}" ;;
+                  # On, but undateable: the request stands; nothing earlier answers it.
+                  *) SINCE="9999" ;;
+                esac
+              else
+                # The label is on but its history is unreadable: post. The worst case is
+                # the review posted twice on a re-run, not a request dropped.
+                echo "::warning::could not read the PR's label history — posting without the re-review check"
+                SINCE="9999"
+              fi
             fi
           fi
           export MARKER POSTED SINCE
@@ -393,8 +404,7 @@ jobs:
           # quiet_verdicts: a verdict delivered as a check run counts as posted too — this
           # lane's check on this head, from the harness App, after any re-review request.
           if ! QUIET_EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '
-            [.check_runs[] | select(.app.slug == env.BOT_APP and .head_sha == env.HEAD_SHA)
-             | select(env.SINCE == "" or (.completed_at // "") > env.SINCE)] | length' \
+            [.check_runs[] | select((.name == env.VERDICT_CHECK and ((.app.slug // "") | ascii_downcase) == (env.BOT_APP | ascii_downcase) and .status == "completed" and ((.output.title // "") | test("^Verdict: [A-Za-z][A-Za-z0-9_-]*$")) and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE)))] | length' \
             | awk '{s+=$1} END {print s+0}'); then
             echo "::error::could not read the head's check runs — not posting, so a re-run cannot deliver the verdict twice"
             exit 1
@@ -448,18 +458,29 @@ jobs:
           # quiet_verdicts: a verdict that needs nothing from the author is delivered as a
           # check run on the head, owned by the harness App — no timeline entry, no
           # notification. The gate and the sweep read it like a verdict review.
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          QUIET_OK=""
           if jq -e '(((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.QUIET_LINES | split("\n") | any(.[]; . == $line))' <<< "$REVIEW" > /dev/null; then
+            if [ -n "${MINTED_APP:-}" ] && [ "$(lower "$MINTED_APP")" != "$(lower "$BOT_APP")" ]; then
+              echo "::warning::the lane's token belongs to the App '$MINTED_APP', but identity.bot_login names '$BOT_APP' — no reader would trust its check, so the verdict is posted as a review"
+            else
+              QUIET_OK=1
+            fi
+          fi
+          if [ -n "$QUIET_OK" ]; then
             QUIET=$(mktemp)
-            printf '%s' "$REVIEW" > "$QUIET"
-            flatten "$QUIET" null > "$QUIET.flat"
             jq -c --arg name "$VERDICT_CHECK" --arg sha "$HEAD_SHA" --arg ext "gp-foundry:verdict:$NODE:$HEAD_SHA" '
-              (.body | gsub("<!--[\\s\\S]*?-->"; "") | sub("\\s+$"; "") | split("\n")) as $l
-              | ($l[-1] | gsub("^\\s+|\\s+$"; "")) as $v
-              | ($l[:-1] | join("\n") | sub("\\s+$"; "")) as $b
+              (.body | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(sub("\\s+$"; ""))) as $l
+              | ([$l | to_entries[] | select(.value | test("\\S")) | .key] | last) as $i
+              | ($l[$i] | gsub("^\\s+|\\s+$"; "")) as $v
+              | ($l[:$i] | join("\n") | sub("\\s+$"; "")) as $above
+              | [(.comments // [])[] | "- `\(.path):\(.line)` — \(.body | gsub("\n"; " "))"] as $f
+              | (if ($f | length) == 0 then $above
+                 else ($above + (if ($above | length) > 0 then "\n\n" else "" end) + "### Findings\n\n" + ($f | join("\n"))) end) as $b
               | {name: $name, head_sha: $sha, status: "completed", conclusion: "success", external_id: $ext,
-                 output: {title: ("Verdict: " + ($v | split(" ") | last)),
-                          summary: (if ($b | length) == 0 then "(no findings)" else $b[0:65000] end)}}' "$QUIET.flat" > "$QUIET.check"
-            if gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input "$QUIET.check" > "$RESP" 2> "$ERR"; then
+                 output: {title: ("Verdict: " + ($v | ltrimstr("**Verdict:**") | gsub("^\\s+"; ""))),
+                          summary: (if ($b | length) == 0 then "(no findings)" else $b[0:65000] end)}}' <<< "$REVIEW" > "$QUIET"
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input "$QUIET" > "$RESP" 2> "$ERR"; then
               echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
               URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
               if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \`$VERDICT_CHECK\` on $HEAD_SHA."; fi
@@ -587,9 +608,9 @@ jobs:
                 ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""
                 # quiet_verdicts: a verdict delivered as the harness App's check run counts too.
                 if [ -n "$VERDICTS" ]; then
-                  QUIET=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '
-                    [.check_runs[] | select(.app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length' | awk '{s+=$1} END {print s+0}') || QUIET=""
-                  if [ -z "$QUIET" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET)); fi
+                  QUIET_VERDICTS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '
+                    [.check_runs[] | select((.name == env.VERDICT_CHECK and ((.app.slug // "") | ascii_downcase) == (env.BOT_APP | ascii_downcase) and .status == "completed" and ((.output.title // "") | test("^Verdict: [A-Za-z][A-Za-z0-9_-]*$")) and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE)))] | length' | awk '{s+=$1} END {print s+0}') || QUIET_VERDICTS=""
+                  if [ -z "$QUIET_VERDICTS" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET_VERDICTS)); fi
                 fi
                 if [ -z "$VERDICTS" ]; then
                   echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"

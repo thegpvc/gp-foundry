@@ -11,6 +11,7 @@
  * they need no write, and check-runs cannot be read with a fine-grained PAT at all.
  * Untrusted values never reach the script text — everything arrives via `env:`.
  */
+import { QUIET_CHECK_JQ } from "../shared/verdicts.js";
 import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
   quietVerdictsOf,
@@ -566,11 +567,12 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length)${quiet ? "," : " ] | @tsv' \\"}`,
     ...(quiet
       ? [
-          `      ([.[] | select(.name == env.VERDICT_CHECK and .app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length) ] | @tsv' \\`,
+          `      ([.[] | select(${QUIET_CHECK_JQ})] | length) ] | @tsv' \\`,
           `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5; q+=$6} END {print t+0, r+0, s+0, f+0, i+0, q+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
-          `  read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET <<< "$CHECKS"`,
+          `  # (QUIET_VERDICTS, not QUIET: that is the seconds since the PR changed.)`,
+          `  read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET_VERDICTS <<< "$CHECKS"`,
           `  # quiet_verdicts: a verdict delivered as a check run by the harness App decides the head too.`,
-          `  if [ "$QUIET" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi`,
+          `  if [ "$QUIET_VERDICTS" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi`,
         ]
       : [
           `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
@@ -732,9 +734,9 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
             ? [
                 `      # quiet_verdicts: a verdict delivered as the harness App's check run counts too.`,
                 `      if [ -n "$VERDICTS" ]; then`,
-                `        QUIET=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '`,
-                `          [.check_runs[] | select(.app.slug == env.BOT_APP and .status == "completed" and ((env.SINCE // "") == "" or (.completed_at // "") > env.SINCE))] | length' | awk '{s+=$1} END {print s+0}') || QUIET=""`,
-                `        if [ -z "$QUIET" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET)); fi`,
+                `        QUIET_VERDICTS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '`,
+                `          [.check_runs[] | select(${QUIET_CHECK_JQ})] | length' | awk '{s+=$1} END {print s+0}') || QUIET_VERDICTS=""`,
+                `        if [ -z "$QUIET_VERDICTS" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET_VERDICTS)); fi`,
                 `      fi`,
               ]
             : []),

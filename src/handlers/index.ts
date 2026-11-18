@@ -742,7 +742,8 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       ...(rereview ? { "rereview-label": rereview } : {}),
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
-      "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).some((g) => g.id === node.id)
+      // A nudged gate (quiet verdicts in the graph) also takes the PR as a dispatch input.
+      "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).length
         ? "${{ github.event.pull_request.number || inputs.pr }}"
         : "${{ github.event.pull_request.number }}",
       // The schedule's period: the pass's window moves once per period.

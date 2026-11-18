@@ -1,5 +1,5 @@
 import type { getOctokit } from "@actions/github";
-import { verdictLine } from "../../../src/shared/verdicts.js";
+import { quietVerdictOf, verdictLine } from "../../../src/shared/verdicts.js";
 import type {
   ChangedFileData,
   CheckRunData,
@@ -77,10 +77,10 @@ async function fetchIssue(
 }
 
 /**
- * The quiet verdicts among a head's check runs, as review records: completed runs
- * of a named verdict check, owned by the harness App (another app's run of the
- * same name is ignored), titled `Verdict: <WORD>`. The body is the check's
- * summary followed by the verdict line, as a verdict review would read.
+ * The quiet verdicts among a head's check runs, as review records: each run that
+ * quietVerdictOf (src/shared/verdicts.ts — the one definition every reader uses)
+ * accepts. The body is the check's summary followed by the verdict line, as a
+ * verdict review would read.
  */
 export function quietVerdictReviews(
   checkRuns: CheckRunData[] | undefined,
@@ -88,19 +88,17 @@ export function quietVerdictReviews(
   headSha: string | undefined,
 ): ReviewData[] {
   if (!checkRuns || !verdictChecks?.checks.length) return [];
-  const out: ReviewData[] = [];
-  for (const r of checkRuns) {
-    const word = /^Verdict: (\S+)$/.exec((r.output?.title ?? "").trim())?.[1];
-    if (!verdictChecks.checks.includes(r.name) || r.app?.slug !== verdictChecks.app || r.status !== "completed" || !word) continue;
-    out.push({
+  return checkRuns.flatMap((r) => {
+    const q = quietVerdictOf(r, { ...verdictChecks, ...(headSha ? { headSha } : {}) });
+    if (!q) return [];
+    return [{
       user: { login: `${verdictChecks.app}[bot]` } as ReviewData["user"],
-      state: `VERDICT (check run \`${r.name}\`)`,
-      submitted_at: r.completed_at ?? undefined,
-      body: `${r.output?.summary ?? ""}\n\n${verdictLine(word)}`,
+      state: `VERDICT (check run \`${q.name}\`)`,
+      submitted_at: q.at,
+      body: `${q.summary}\n\n${verdictLine(q.word)}`,
       commit_id: r.head_sha ?? headSha ?? null,
-    });
-  }
-  return out;
+    }];
+  });
 }
 
 async function fetchPRFull(
