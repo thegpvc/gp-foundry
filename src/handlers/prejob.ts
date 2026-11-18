@@ -96,7 +96,7 @@ const BY_BOT_JQ = `(env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)`;
 // A re-review request (src/shared/rereview.ts): with env.SINCE set, a review
 // from before the request was made does not count — neither as a verdict nor as
 // the review an approver acts on. Unset or empty: every review counts.
-const FRESH_JQ = `select((env.SINCE // "") == "" or (.submitted_at // "") >= env.SINCE)`;
+const FRESH_JQ = `select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE)`;
 const VERDICT_REVIEWS_JQ = [
   `[ .[] | select(.commit_id == env.SHA)`,
   `  | select(${BY_BOT_JQ}) | ${FRESH_JQ}`,
@@ -251,12 +251,6 @@ function emitHybridGuard(ctx: EmitContext): WorkflowJobFragment {
     SCOPE_RUN: "${{ steps.scope.outputs.run }}",
     SCOPE_REASON: "${{ steps.scope.outputs.reason }}",
   };
-  const rereview = rereviewLabelOf(ctx.config);
-  if (rereview) {
-    env.REREVIEW_LABEL = rereview;
-    env.EVENT_ACTION = "${{ github.event.action }}";
-    env.EVENT_LABEL = "${{ github.event.label.name }}";
-  }
   const lines = [
     `RUN=true; REASON=""; HEAD_SHA=""; DIFF_HASH=""`,
     `# The lane's stamp step edits only a review submitted after this moment (its own).`,
@@ -271,13 +265,6 @@ function emitHybridGuard(ctx: EmitContext): WorkflowJobFragment {
     `# Scope was decided by the step above, by the rule every lane and the gate share.`,
     `if [ "$SCOPE_RUN" != "true" ]; then skip "$SCOPE_REASON"; fi`,
     ``,
-    ...(rereview
-      ? [
-          `# A re-review request asks for a fresh review of this very diff: never skip it as unchanged.`,
-          `if [ "\${EVENT_ACTION:-}" = "labeled" ] && [ "\${EVENT_LABEL:-}" = "$REREVIEW_LABEL" ]; then finish; fi`,
-          ``,
-        ]
-      : []),
     `# From here on only the unchanged-diff skip, which fails OPEN: a lane that runs`,
     `# once too often costs a run, one wrongly skipped costs a review nobody misses.`,
     `PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" 2>/dev/null) || PR_JSON=""`,
@@ -572,9 +559,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
     `    .check_runs | [ length,`,
     `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
-    `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") >= env.SINCE))] | length),`,
-    `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") >= env.SINCE))] | length),`,
-    `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") >= env.SINCE))] | length) ] | @tsv' \\`,
+    `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
+    `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
+    `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length) ] | @tsv' \\`,
     `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
     `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
     `  if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
@@ -733,7 +720,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `        # run on every tick forever. One check-run per such run; the selector`,
           `        # stops at $MAX_IDLE.`,
           `        PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-          `          [.check_runs[] | select(.name == env.IDLE_CHECK and ((env.SINCE // "") == "" or (.started_at // "") >= env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
+          `          [.check_runs[] | select(.name == env.IDLE_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
           `        N=$((PRIOR + 1))`,
           `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
           `          TITLE="$NODE stopped after $N runs without a verdict"`,
@@ -764,7 +751,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
           `      # One check-run per failed attempt; the selector counts them and stops at $MAX_FAILURES.`,
           `      # filter=all, or GitHub returns only the newest one and the count never passes 1.`,
           `      PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-          `        [.check_runs[] | select(.name == env.FAILED_CHECK and ((env.SINCE // "") == "" or (.started_at // "") >= env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
+          `        [.check_runs[] | select(.name == env.FAILED_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
           `      N=$((PRIOR + 1))`,
           `      if [ "$N" -ge "$MAX_FAILURES" ]; then`,
           `        TITLE="$NODE gave up after $N failed runs"`,

@@ -27,6 +27,8 @@ export interface PrFile {
   path: string;
   additions: number;
   deletions?: number;
+  /** A renamed file's old path: a rename touches both. */
+  previousPath?: string;
 }
 
 /** A check-run observed on the head SHA, as summarized by the caller. */
@@ -116,10 +118,12 @@ export interface PullRequestFacts {
   /** Why a sign-off that looked present could not be accepted (shown on the check). */
   signoffUnavailable?: string;
   /**
-   * The re-review label is on the PR, added at this time: only reviews from after
-   * it count towards the head's verdict (see src/shared/rereview.ts).
+   * The re-review label is on the PR (src/shared/rereview.ts). `since`: when it
+   * was added — only reviews after it count towards the head's verdict; absent
+   * when the request cannot be dated (no cutoff). `unreadable`: the label's
+   * history could not be read, so whether a verdict is fresh is unknown.
    */
-  rereviewSince?: string;
+  rereview?: { since?: string; unreadable?: boolean };
 }
 
 export type HeadVerdict = "approve" | "reject" | "escalate";
@@ -514,9 +518,12 @@ export function handWrittenAdditions(files: PrFile[], excludeGlobs?: string[]): 
  */
 export function firstProtectedPath(files: PrFile[], protectedPaths?: string[], excludeGlobs?: string[]): string | undefined {
   if (!protectedPaths || protectedPaths.length === 0) return undefined;
-  const considered = files.filter((f) => !anyGlobMatches(excludeGlobs, f.path));
+  // A rename touches both its paths: moving a file out of a protected path, or
+  // renaming it to a name the excludes cover, is still a change to that file.
+  const paths = files.flatMap((f) => (f.previousPath && f.previousPath !== f.path ? [f.path, f.previousPath] : [f.path]));
+  const considered = paths.filter((p) => !anyGlobMatches(excludeGlobs, p));
   for (const pattern of protectedPaths) {
-    if (considered.some((f) => globMatch(pattern, f.path))) return pattern;
+    if (considered.some((p) => globMatch(pattern, p))) return pattern;
   }
   return undefined;
 }

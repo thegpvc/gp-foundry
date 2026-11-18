@@ -15,7 +15,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { inScope, isAgentWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
 import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
-import { lastLabeledAt, type LabelEvent } from "../../../src/shared/rereview.js";
+import { requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
@@ -105,22 +105,25 @@ export async function listInScope(
 ): Promise<ScopedPr[] | undefined> {
   const out = await listCandidates(octokit, opts);
   if (!out || !opts.rereviewLabel) return out?.map(({ labels: _l, ...p }) => p);
-  // A PR carrying the re-review label: when it was added (one read per such PR).
-  // Unreadable counts as "just now", so nothing from before it is mistaken as fresh.
+  // A PR carrying the re-review label: when it was added (one read per such PR;
+  // the rule is src/shared/rereview.ts). If that cannot be read, the PR is left
+  // out of this tick — neither judged on records the request made stale, nor on
+  // a guessed time — and the next tick tries again.
   const result: ScopedPr[] = [];
   for (const { labels, ...p } of out) {
     if (!labels.includes(opts.rereviewLabel)) {
       result.push(p);
       continue;
     }
-    let since: string | undefined;
+    let events: LabelEvent[];
     try {
-      const events = await octokit.paginate(octokit.rest.issues.listEvents, { owner: opts.owner, repo: opts.repo, issue_number: p.number, per_page: 100 });
-      since = lastLabeledAt(events as LabelEvent[], opts.rereviewLabel);
-    } catch {
-      // fall through
+      events = (await octokit.paginate(octokit.rest.issues.listEvents, { owner: opts.owner, repo: opts.repo, issue_number: p.number, per_page: 100 })) as LabelEvent[];
+    } catch (e) {
+      core.warning(`#${p.number}: could not read when \`${opts.rereviewLabel}\` was added (${(e as Error).message}) — left for the next tick`);
+      continue;
     }
-    result.push({ ...p, since: since ?? new Date(opts.nowMs ?? Date.now()).toISOString() });
+    const since = requestedAt(events, opts.rereviewLabel);
+    result.push(since ? { ...p, since } : p);
   }
   return result;
 }

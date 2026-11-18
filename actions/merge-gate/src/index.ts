@@ -12,7 +12,7 @@
  * No gp-dixie hardcodes live here: everything comes from the policy file / inputs.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import yaml from "js-yaml";
@@ -52,7 +52,7 @@ import {
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
-import { isFresh, lastLabeledAt, type LabelEvent } from "../../../src/shared/rereview.js";
+import { isFresh, requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 import { excludeLabelQualifier, reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
@@ -382,7 +382,7 @@ export async function gatherFacts(
   const approvedAt = latestValidApproval(events, pr.head.sha, headCommittedAt);
 
   const filesRaw = await octokit.paginate(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
-  const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions }));
+  const files: PrFile[] = filesRaw.map((f) => ({ path: f.filename, additions: f.additions, deletions: f.deletions, ...(f.previous_filename ? { previousPath: f.previous_filename } : {}) }));
 
   const ignore = new Set(policy.ciIgnoreCheckNames ?? []);
   type CheckRunRaw = {
@@ -449,12 +449,19 @@ export async function gatherFacts(
     policy.botLogin,
   );
   // A re-review request: only verdicts posted after the label was added count.
-  let rereviewSince: string | undefined;
+  // An unreadable history is recorded, not thrown: the caller holds the result.
+  let rereview: PullRequestFacts["rereview"];
   if (policy.rereviewLabel && labels.includes(policy.rereviewLabel)) {
-    const events = await octokit.paginate(octokit.rest.issues.listEvents, { owner, repo, issue_number: prNumber, per_page: 100 });
-    // Unknown (no labeled event found) counts as "just now": nothing is fresh yet.
-    rereviewSince = lastLabeledAt(events as LabelEvent[], policy.rereviewLabel) ?? new Date().toISOString();
+    try {
+      const events = await octokit.paginate(octokit.rest.issues.listEvents, { owner, repo, issue_number: prNumber, per_page: 100 });
+      const since = requestedAt(events as LabelEvent[], policy.rereviewLabel);
+      rereview = since ? { since } : {};
+    } catch (e) {
+      core.warning(`PR #${prNumber}: could not read when \`${policy.rereviewLabel}\` was added — ${(e as Error).message}`);
+      rereview = { unreadable: true };
+    }
   }
+  const rereviewSince = rereview?.since;
   const headVerdict = latestHeadVerdict(
     reviews
       .filter((r) => r.submitted_at && isFresh(r.submitted_at, rereviewSince))
@@ -490,7 +497,7 @@ export async function gatherFacts(
     }
   }
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}), ...(rereviewSince ? { rereviewSince } : {}) };
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}), ...(rereview ? { rereview } : {}) };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -858,16 +865,6 @@ export type MergeSetting = "off" | "agent-only";
 export const GATE_TICK_LIMIT = 20;
 
 /**
- * The conclusions the single gate publishes, each only from a verdict on the head.
- * Anything else completed under the check's name is not a result to withdraw: in
- * particular the `neutral` "Awaiting the approver" that 0.3.x put on undecided
- * heads. Superseding that with an in-progress run would hold the head in
- * progress until a verdict arrived, and the approver's sweep used to skip any
- * head with a check still running — so the verdict never came.
- */
-const VERDICT_RESULTS = new Set(["success", "failure", "action_required"]);
-
-/**
  * Withdraw the gate's result from a head that no longer has a verdict (the
  * approver's review was dismissed). A completed run is not reopened — its
  * conclusion would stand — but superseded: a NEW run of the same name, in
@@ -878,7 +875,12 @@ const VERDICT_RESULTS = new Set(["success", "failure", "action_required"]);
 export async function withdrawCheck(checksOctokit: Octokit, owner: string, repo: string, headSha: string, name: string, app: string): Promise<boolean> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
-  if (!mine || mine.status !== "completed" || !VERDICT_RESULTS.has(mine.conclusion ?? "")) return false;
+  // Any completed result, including the `neutral` "Awaiting the approver" 0.3.x
+  // left on undecided heads: GitHub counts neutral as passing a required check,
+  // so it must not stand without a verdict. (Holding the head in progress no
+  // longer starves it: the approver's select job does not wait on the gate's own
+  // checks — GATE_CHECKS.)
+  if (!mine || mine.status !== "completed") return false;
   await checksOctokit.rest.checks.create({
     owner,
     repo,
@@ -1059,6 +1061,7 @@ export async function runHybridGate(opts: {
       continue;
     }
     evaluated++;
+    let removeRereviewLabel = false;
     try {
       const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit, opts.self);
       // No verdict from the approver on this head: no result. A missing required
@@ -1068,33 +1071,31 @@ export async function runHybridGate(opts: {
       // A re-review request: until there is a verdict newer than the label, the
       // result is held at in progress (never passing, never merged). Once there
       // is one, the request is done — the label comes off and the head is judged.
-      if (facts.rereviewSince && opts.rereviewLabel) {
-        if (!facts.headVerdict) {
+      //
+      // (The dependabot lane never gets a verdict, so the label means nothing there.)
+      if (facts.rereview && opts.rereviewLabel && !onDependabotLane) {
+        const held = facts.rereview.unreadable
+          ? `could not read when \`${opts.rereviewLabel}\` was added, so whether the verdict on \`${(facts.headSha ?? "").slice(0, 7)}\` is fresh is unknown. The next run tries again; nothing is merged until then.`
+          : !facts.headVerdict
+            ? `\`${opts.rereviewLabel}\` was added${facts.rereview.since ? ` at ${facts.rereview.since}` : ""}: waiting for a fresh review and a fresh verdict on \`${(facts.headSha ?? "").slice(0, 7)}\`. Earlier verdicts no longer count, and nothing is merged until then.`
+            : undefined;
+        if (held) {
           if (!opts.dryRun && facts.headSha) {
-            await pendCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp, {
-              title: "Re-review requested",
-              summary: `\`${opts.rereviewLabel}\` was added at ${facts.rereviewSince}: waiting for a fresh review and a fresh verdict on \`${facts.headSha.slice(0, 7)}\`. Earlier verdicts no longer count, and nothing is merged until then.`,
-            });
+            await pendCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp, { title: "Re-review requested", summary: held });
           }
-          core.info(`PR #${n}: re-review requested — held until a fresh verdict`);
+          core.info(`PR #${n}: re-review requested — held (${facts.rereview.unreadable ? "label history unreadable" : "no fresh verdict yet"})`);
           continue;
         }
-        if (!opts.dryRun) {
-          try {
-            await octokit.rest.issues.removeLabel({ owner, repo, issue_number: n, name: opts.rereviewLabel });
-            core.info(`PR #${n}: fresh verdict after the re-review request — removed \`${opts.rereviewLabel}\``);
-          } catch (e) {
-            core.warning(`PR #${n}: could not remove \`${opts.rereviewLabel}\`: ${(e as Error).message}`);
-          }
-        }
+        // Done: the label comes off — LAST, once this PR is published and merged.
+        // Its removal is itself a PR event, and that event's gate run, in the same
+        // concurrency group, would cancel this one partway through a merge.
+        removeRereviewLabel = true;
       }
       const verdictless = !facts.headVerdict && !onDependabotLane;
       if (verdictless) {
         const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
         if (mine && !opts.dryRun && facts.headSha && (await withdrawCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp))) {
           core.info(`PR #${n}: verdict gone from ${facts.headSha.slice(0, 8)} — result withdrawn`);
-        } else if (mine && mine.status === "completed" && !VERDICT_RESULTS.has(mine.conclusion ?? "")) {
-          core.info(`PR #${n}: no verdict on this head yet — its earlier \`${mine.conclusion}\` result (not one this gate publishes) is left as it is`);
         } else {
           core.info(`PR #${n}: no verdict from the approver on this head yet — no result published`);
         }
@@ -1156,6 +1157,15 @@ export async function runHybridGate(opts: {
       if (await actOnDecision(octokit, owner, repo, n, facts, mergeDecision, base, opts.dryRun)) mergedPr = String(n);
     } catch (e) {
       core.warning(`PR #${n}: not evaluated this tick — ${(e as Error).message}`);
+    } finally {
+      if (removeRereviewLabel && opts.rereviewLabel && !opts.dryRun) {
+        try {
+          await octokit.rest.issues.removeLabel({ owner, repo, issue_number: n, name: opts.rereviewLabel });
+          core.info(`PR #${n}: a fresh verdict answers the re-review request — removed \`${opts.rereviewLabel}\``);
+        } catch (e) {
+          core.warning(`PR #${n}: could not remove \`${opts.rereviewLabel}\`: ${(e as Error).message}`);
+        }
+      }
     }
   }
   core.info(`${evaluated} PR(s) in scope${mergedPr ? `; merged #${mergedPr}` : ""}`);
@@ -1178,6 +1188,13 @@ export async function run(): Promise<void> {
     const branchPrefixInput = core.getInput("branch-prefix");
     const dryRun = core.getInput("dry-run") === "true";
 
+    // The single gate reads its policy from the BASE branch. On the PR that adds
+    // the harness the base has none yet: an event run there has nothing to judge
+    // by, which is not a failure of that PR. (A scheduled run still fails loudly.)
+    if (core.getInput("merge").trim() && prNumberInput && !existsSync(policyPath)) {
+      core.notice(`merge-gate: no policy at ${policyPath} on the base branch yet — nothing to evaluate until it is merged`);
+      return;
+    }
     const policy = loadPolicy(policyPath);
     // Fail loudly on a policy handoff that is not one: it would otherwise be ignored.
     validateHandoffClauses(policy.handoffClauses);

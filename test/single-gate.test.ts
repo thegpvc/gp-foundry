@@ -348,9 +348,9 @@ describe("the single gate also evaluates one PR when something that decides it c
   });
 
   it("names its own job's check run, so the gate leaves it out of the CI rollup", () => {
-    expect(gateStep(wf().jobs.gate).with["job-check-name"]).toBe("gate");
-    // The job has no display name: GitHub names its check run by the job id.
-    expect(wf().jobs.gate.name).toBeUndefined();
+    // A name no CI job would have: the gate leaves out every github-actions run of it.
+    expect(gateStep(wf().jobs.gate).with["job-check-name"]).toBe("gp-foundry gate (gate)");
+    expect(wf().jobs.gate.name).toBe("gp-foundry gate (gate)");
   });
 
   it("the older gates are untouched: schedule only, one slot", () => {

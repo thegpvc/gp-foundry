@@ -538,6 +538,12 @@ describe("firstProtectedPath", () => {
       expect(policy.protectedPathExcludeGlobs).toEqual(tests);
       expect(firstProtectedPath([{ path: "pkg/auth/x_test.go", additions: 1 }], policy.protectedPaths, policy.protectedPathExcludeGlobs)).toBeUndefined();
     });
+    it("a rename counts both paths: out of a protected path, or onto an excluded name, is still protected", () => {
+      expect(firstProtectedPath([{ path: "src/init.sql", previousPath: "db/migrations/0001_init.sql", additions: 0 }], ["db/migrations/"])).toBe("db/migrations/");
+      expect(firstProtectedPath([{ path: "pkg/auth/x_test.go", previousPath: "pkg/auth/x.go", additions: 0 }], ["pkg/auth/"], tests)).toBe("pkg/auth/");
+      // A test file renamed to another test file stays excluded.
+      expect(firstProtectedPath([{ path: "pkg/auth/y_test.go", previousPath: "pkg/auth/x_test.go", additions: 0 }], ["pkg/auth/"], tests)).toBeUndefined();
+    });
     it("empty or absent: unchanged", () => {
       const files = [{ path: "pkg/auth/token_test.go", additions: 1 }];
       expect(firstProtectedPath(files, ["pkg/auth/"])).toBe("pkg/auth/");

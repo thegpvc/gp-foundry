@@ -172,8 +172,15 @@ already made is not reported as a rejection.
 
 **Re-review (`rereview-label`).** While that label is on a PR, only verdicts posted after
 it was last added count. Until one exists the check is put back to in progress ("Re-review
-requested") and nothing is merged; once one exists the gate removes the label and judges the
-head as usual. The token needs `issues: write` to remove it.
+requested") and nothing is merged; once one exists the gate judges the head as usual and,
+last, removes the label (its `unlabeled` event starts another gate run, which must not cancel
+this one mid-merge). If the label's history cannot be read, the check is held the same way.
+The token needs `issues: write` (or `pull-requests: write`) to remove it.
+
+**Its own job** is named `gp-foundry gate (<node>)` (the `job-check-name` input), a name no CI
+job would carry: every `github-actions` check run of that name is left out of the CI rollup.
+On the PR that adds the harness the base branch has no policy yet; an event run there is a
+notice, not a failure.
 
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
@@ -300,10 +307,10 @@ protectedPaths:
   - "db/migrations/"
   - ".github/workflows/"
   - "terraform/"
-protectedPathExcludeGlobs:   # optional: not "protected" even under a protected path
-  - "**/*_test.go"
   - "CLAUDE.md"
   - "scope.yaml"
+protectedPathExcludeGlobs:   # optional: not "protected" even under a protected path
+  - "**/*_test.go"
 blockingLabels:
   - "needs-human"
   - "rebase-needed"
