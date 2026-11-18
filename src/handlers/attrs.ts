@@ -528,8 +528,12 @@ export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, w
 export function singleGatePrefilter(rollout: Rollout, botLogin: string | undefined): string {
   const by = (login: string) => `${PR}.user.login == ${exprString(login)}`;
   const bots = [...(botLogin ? [botLogin] : []), ...(rollout.authors ?? [])].filter((a, i, all) => all.indexOf(a) === i);
+  const scope = scopePrefilter(rollout, botLogin, false);
+  // Admission by login alone (authors, no opt-in label) already names every
+  // author it lets in, bots included: nothing to add.
+  if (rollout.authors !== undefined && rollout.optInLabel === undefined) return scope;
   const notOtherBot = `(${[`${PR}.user.type != 'Bot'`, ...bots.map(by)].join(" || ")})`;
-  return `${scopePrefilter(rollout, botLogin, false)} && ${notOtherBot}`;
+  return `${scope} && ${notOtherBot}`;
 }
 
 /** The job that decides whether (or for which PRs) the node's own job runs. */

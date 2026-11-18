@@ -88,7 +88,8 @@ every in-scope PR. Both are gone.
   result; the pass or the next event settles it. Failed CI, and any other failing
   clause, are still published.
 - **The policy came from the PR on PR events.** The gate's checkout now names the
-  base branch on every trigger.
+  base branch on every trigger. (A PR that edits the workflow file itself still runs
+  its own copy on `pull_request`; `.github/` belongs among the protected paths.)
 - **Skipped PRs filled the window.** The pass applies the scope rule before taking
   its window (and the search leaves out the skip label), so a tick evaluates up to
   20 PRs in scope.
