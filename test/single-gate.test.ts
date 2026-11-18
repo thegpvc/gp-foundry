@@ -40,7 +40,8 @@ const codes = (ds: Diagnostic[], level?: string) => ds.filter((d) => !level || d
 describe('merge="off"', () => {
   it("publishes a check and can do nothing else", () => {
     const job = gateJob('merge="off"', PAT);
-    expect(job.permissions).toEqual({ contents: "read", "pull-requests": "read", checks: "write" });
+    // actions: read — to tell its own earlier runs from a CI job of the same name.
+    expect(job.permissions).toEqual({ contents: "read", "pull-requests": "read", checks: "write", actions: "read" });
     const w = gateStep(job).with;
     expect(w.merge).toBe("off");
     expect(w.mode).toBeUndefined();
@@ -90,7 +91,7 @@ describe("the compiled step meets the action's inputs", () => {
 describe('merge="agent-only"', () => {
   it("merges under the harness identity and keeps reading checks with GITHUB_TOKEN (PAT auth)", () => {
     const job = gateJob('merge="agent-only"', PAT);
-    expect(job.permissions).toEqual({ contents: "write", "pull-requests": "write", issues: "write", checks: "write" });
+    expect(job.permissions).toEqual({ contents: "write", "pull-requests": "write", issues: "write", checks: "write", actions: "read" });
     const w = gateStep(job).with;
     expect(w.merge).toBe("agent-only");
     expect(w.token).toBe("${{ secrets.AGENT_PAT }}"); // a PAT merge cascades; GITHUB_TOKEN's would not
@@ -107,9 +108,9 @@ describe("under App auth the check is the App's, not github-actions'", () => {
       expect(w["checks-token"], merge).toBe("${{ steps.app-token.outputs.token }}");
       expect(w["check-app"], merge).toBe("${{ steps.app-token.outputs.app-slug }}");
       expect(w.token, merge).toBe("${{ steps.app-token.outputs.token }}");
-      // The App token does all of it, so GITHUB_TOKEN keeps only the checkout:
-      // it can neither write a check nor merge.
-      expect(job.permissions, merge).toEqual({ contents: "read" });
+      // The App token does all of it, so GITHUB_TOKEN keeps only the checkout and
+      // reading workflow runs: it can neither write a check nor merge.
+      expect(job.permissions, merge).toEqual({ contents: "read", actions: "read" });
     }
   });
 
@@ -347,10 +348,11 @@ describe("the single gate also evaluates one PR when something that decides it c
     expect(gateStep(other.jobs.gate).with["base-branch"]).toBe("develop");
   });
 
-  it("names its own job's check run, so the gate leaves it out of the CI rollup", () => {
-    // A name no CI job would have: the gate leaves out every github-actions run of it.
-    expect(gateStep(wf().jobs.gate).with["job-check-name"]).toBe("gp-foundry gate (gate)");
-    expect(wf().jobs.gate.name).toBe("gp-foundry gate (gate)");
+  it("names its own job's check run, so the gate leaves it out of the CI rollup — and its workflow, so a CI job may share the name", () => {
+    // Named after its node, like every lane, so its check groups with theirs.
+    expect(wf().jobs.gate.name).toBeUndefined();
+    expect(gateStep(wf().jobs.gate).with["job-check-name"]).toBe("gate");
+    expect(gateStep(wf().jobs.gate).with["gate-workflow"]).toBe(".github/workflows/gate.yml");
   });
 
   it("the older gates are untouched: schedule only, one slot", () => {

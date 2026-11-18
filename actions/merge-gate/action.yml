@@ -114,11 +114,25 @@ inputs:
     description: >
       The check-run name GitHub Actions gives the gate's own job (its `name:`,
       else its job id); the compiler writes it. The gate's job sits on the PR's
-      head during an event run, so the CI rollup leaves out every check run of
-      this name written by github-actions — earlier runs of the gate, in
-      progress, cancelled or timed out — as well as every job of the current
-      workflow run (GITHUB_RUN_ID). A CI job of the same name in another
-      workflow is left out too: keep the gate's job name distinct.
+      head during an event run, so the CI rollup leaves out the gate's own runs:
+      every job of the current workflow run (GITHUB_RUN_ID), and earlier runs of
+      the gate under this name. With `gate-workflow`, a run of this name counts
+      as the gate's only if its workflow run is of that file, so a CI job may
+      share the name; without it, the name alone decides.
+  gate-workflow:
+    description: >
+      The gate's workflow file (`.github/workflows/<node>.yml`); the compiler
+      writes it. A check run named like the gate's job is the gate's own only
+      when its workflow run is of this file (one read per run, with
+      `actions-token`).
+    required: false
+    default: ""
+  actions-token:
+    description: >
+      With `gate-workflow`: a token that can read workflow runs (`actions:
+      read`). Defaults to the job's GITHUB_TOKEN.
+    required: false
+    default: ${{ github.token }}
   verdict-checks:
     description: >
       Newline-separated names of the check runs that lanes with quiet_verdicts
