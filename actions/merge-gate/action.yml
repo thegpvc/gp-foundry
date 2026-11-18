@@ -110,11 +110,13 @@ inputs:
       can publish one this gate — or a ruleset pinned to the App — accepts.
     required: false
     default: ""
-  rotation:
+  rotation-period-seconds:
     description: >
-      With `merge` and no `pr-number`: a number that advances every scheduled
-      run (the compiler passes the run number). It moves the pass's window of 20
-      PRs, so successive ticks cover every candidate without stored state.
+      With `merge` and no `pr-number`: the schedule's period. The pass's window
+      of 20 PRs advances once per period, computed from the clock — not from a
+      run counter, which event runs of the same workflow also advance — so
+      successive ticks cover every candidate without stored state. The compiler
+      derives it from the node's cron. Default 300.
     required: false
     default: ""
   time-budget-seconds:

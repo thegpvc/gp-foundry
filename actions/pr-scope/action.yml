@@ -73,9 +73,9 @@ outputs:
     description: "One line saying why."
   prs:
     description: >-
-      With `list`: a JSON array, round-robin by author (each author's newest PR,
-      then each author's next, longest-waiting author first), of {number, sha,
-      base, requested, quiet} — head SHA, base ref, the number of pending review
+      With `list`: a JSON array of {number, sha, base, requested, quiet}. With
+      `reviewed-by`: round-robin by author (each author's newest PR, then each
+      author's next, longest-waiting author first); otherwise oldest first — head SHA, base ref, the number of pending review
       requests, and seconds since the PR last changed.
   listed:
     description: 'With `list`: "true" when the open PRs could be listed, "false" when the API was unavailable.' 

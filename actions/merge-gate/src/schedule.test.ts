@@ -170,8 +170,9 @@ class World {
             const all = [ci, ...gate];
             return { check_runs: check_name ? all.filter((c) => c.name === check_name) : all };
           }),
-          create: call("checks.create", ({ head_sha, name, conclusion, output }: any) => {
-            w.checks.push({ id: w.nextId++, sha: head_sha, name, app: APP, status: "completed", conclusion, output });
+          create: call("checks.create", ({ head_sha, name, status, conclusion, output }: any) => {
+            const st = status ?? "completed";
+            w.checks.push({ id: w.nextId++, sha: head_sha, name, app: APP, status: st, conclusion: st === "completed" ? conclusion : null, output });
             return {};
           }),
           update: call("checks.update", ({ check_run_id, status, conclusion, output }: any) => {
@@ -259,6 +260,28 @@ describe("candidates: only PRs the bot has reviewed", () => {
     expect(w.result(1)!.status).toBe("in_progress");
     expect(w.result(1)!.conclusion).toBeNull();
     expect(w.result(1)!.output.title).toBe("Awaiting the approver");
+    // Superseded by a new run, not reopened: the old run keeps its conclusion but is no longer the newest.
+    expect(w.checks).toHaveLength(2);
+    // A new verdict completes the newest run.
+    w.prs.get(1)!.verdict = "APPROVE";
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.checks).toHaveLength(2);
+  });
+
+  it("a targeted run on a PR into another branch does nothing", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    const o = w.octokit();
+    const get = o.rest.pulls.get;
+    o.rest.pulls.get = async (p: any) => {
+      const r = await get(p);
+      return { data: { ...r.data, base: { ref: "release/1.x" } } };
+    };
+    const r = await runHybridGate({ octokit: o, checksOctokit: o, owner: "o", repo: "r", policy: { ...POLICY }, checkName: CHECK, checkApp: APP, baseBranch: "main", merge: "agent-only", rollout: undefined, prNumber: 1, dryRun: false });
+    expect(r.evaluated).toBe(0);
+    expect(w.checks).toEqual([]);
+    expect(w.merged).toEqual([]);
   });
 
   it("a failed search is a quiet tick — no fallback to walking every open PR", async () => {

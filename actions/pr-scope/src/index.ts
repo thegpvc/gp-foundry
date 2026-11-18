@@ -168,7 +168,8 @@ export async function listInScope(
     requested: (p.requested_reviewers?.length ?? 0) + (p.requested_teams?.length ?? 0),
     updatedAt: Date.parse(p.updated_at) || 0,
   }));
-  return roundRobinByAuthor(cands.filter(keep)).map(toScoped);
+  // Without the reviewed-by search: oldest first, as before.
+  return cands.filter(keep).map(toScoped);
 }
 
 export async function run(): Promise<void> {

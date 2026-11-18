@@ -639,6 +639,24 @@ function emitMergeGate(ctx: EmitContext): WorkflowJobFragment {
  * adopts only runs that App wrote. (A fine-grained PAT cannot write checks at
  * all, so the other auth modes stay on GITHUB_TOKEN.)
  */
+/**
+ * The period of a cron schedule, in seconds, for the common shapes: every N
+ * minutes, hourly at a minute, daily at a time. Anything else: 300. Only used to
+ * advance the gate pass's window once per tick.
+ */
+export function cronPeriodSeconds(cron: string): number {
+  const f = cron.trim().split(/\s+/);
+  if (f.length !== 5) return 300;
+  const [min, hour, dom, mon, dow] = f;
+  const rest = [dom, mon, dow].every((x) => x === "*");
+  const every = /^\*\/(\d+)$/;
+  if (rest && hour === "*" && every.test(min!)) return Number(every.exec(min!)![1]) * 60;
+  if (rest && hour === "*" && /^\d+$/.test(min!)) return 3600;
+  if (rest && /^\d+$/.test(min!) && every.test(hour!)) return Number(every.exec(hour!)![1]) * 3600;
+  if (rest && /^\d+$/.test(min!) && /^\d+$/.test(hour!)) return 86400;
+  return 300;
+}
+
 function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: string[]): WorkflowJobFragment {
   const node = ctx.node;
   const merging = merge === "agent-only";
@@ -691,8 +709,8 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
       "pr-number": "${{ github.event.pull_request.number }}",
-      // Moves the scheduled pass's window each tick.
-      rotation: "${{ github.run_number }}",
+      // The schedule's period: the pass's window moves once per period.
+      "rotation-period-seconds": String(cronPeriodSeconds(String(node.attrs.schedule ?? ""))),
       // Leave the job two minutes to finish the PR it is on and exit cleanly.
       "time-budget-seconds": String(Math.max(60, (timeoutOf(node, 10) - 2) * 60)),
     },

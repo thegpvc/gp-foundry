@@ -55,6 +55,9 @@ interface World {
   headRef?: string;
   /** Who authored each commit on the head, as GitHub attributes it (default: all the bot's). */
   commits?: (string | null)[];
+  /** The merge call fails; with `mergedElsewhere`, because another run merged the PR first. */
+  mergeFails?: boolean;
+  mergedElsewhere?: boolean;
   /** GitHub's review decision for the PR; an Error makes the read fail. */
   reviewDecision?: string | null | Error;
   /** Who opened the PR (default: the harness bot). */
@@ -126,7 +129,14 @@ function makeOctokit(world: World) {
         ),
         listFiles: rec("pulls.listFiles", [{ filename: "src/w.ts", additions: 10, deletions: 0 }]),
         listCommits: rec("pulls.listCommits", (world.commits ?? [BOT]).map((login) => ({ author: login ? { login } : null }))),
-        merge: rec("pulls.merge", {}),
+        merge: async (params: any) => {
+          calls.push({ method: "pulls.merge", params });
+          if (world.mergeFails) {
+            if (world.mergedElsewhere) (pr as any).merged = true;
+            throw new Error("Pull Request is not mergeable");
+          }
+          return { data: {} };
+        },
       },
       issues: {
         listComments: rec("issues.listComments", []),
@@ -767,6 +777,13 @@ describe("sign-off on a policy handoff (handoff_clauses)", () => {
     expect(c.conclusion).toBe("success");
   });
 
+  it("a person without write access cannot sign off, even with no review rule on the branch", async () => {
+    const outsider = { ...formal("stranger", "APPROVED", 2), author_association: "CONTRIBUTOR" };
+    const c = await evaluate({ reviews: [botVerdict("APPROVE"), outsider], reviewDecision: null });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).not.toContain("signed off");
+  });
+
   it("another bot's formal approval counts like a person's", async () => {
     const c = await evaluate({ reviews: [botVerdict("APPROVE"), formal("review-app[bot]", "APPROVED", 2)] });
     expect(c.conclusion).toBe("success");
@@ -881,3 +898,21 @@ describe("sign-off on a policy handoff (handoff_clauses)", () => {
   });
 });
 
+
+describe("a merge another run got to first", () => {
+  it("is not reported as a rejected merge: no rebase label, no comment", async () => {
+    setup({ mergeFails: true, mergedElsewhere: true });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+    expect(methods()).not.toContain("issues.addLabels");
+    expect(methods()).not.toContain("issues.createComment");
+  });
+
+  it("a merge that is really rejected still is", async () => {
+    setup({ mergeFails: true });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("issues.addLabels");
+  });
+});

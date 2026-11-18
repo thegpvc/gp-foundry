@@ -99,11 +99,15 @@ export async function searchCandidates(
       }
       for (const n of r.search.nodes) {
         if (!n || n.number === undefined || !n.headRefOid) continue;
+        // GraphQL names a GitHub App's bot `my-app`; REST, review authors and
+        // identity.bot_login all say `my-app[bot]`. Use the REST form throughout.
+        const login = n.author?.login ?? "";
+        const author = n.author?.__typename === "Bot" && login && !login.endsWith("[bot]") ? `${login}[bot]` : login;
         byNumber.set(n.number, {
           number: n.number,
           sha: n.headRefOid,
           base: n.baseRefName ?? "",
-          author: n.author?.login ?? "",
+          author,
           authorType: n.author?.__typename ?? "",
           draft: !!n.isDraft,
           labels: (n.labels?.nodes ?? []).map((l) => l.name),

@@ -12,6 +12,7 @@ import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
 import { evalGuard } from "../src/sim/gh-expr.js";
+import { cronPeriodSeconds } from "../src/handlers/index.js";
 import type { Diagnostic, FoundryConfig, Harness } from "../src/ir/types.js";
 
 const BOT = "agent-bot[bot]";
@@ -251,7 +252,9 @@ describe("the single gate also evaluates one PR when something that decides it c
   it("evaluates the event's PR, and the pass when scheduled, within the job's time", () => {
     const w = gateStep(wf().jobs.gate).with;
     expect(w["pr-number"]).toBe("${{ github.event.pull_request.number }}");
-    expect(w.rotation).toBe("${{ github.run_number }}");
+    // The window advances once per schedule period (from the clock, not a run counter).
+    expect(w["rotation-period-seconds"]).toBe("600");
+    expect(w.rotation).toBeUndefined();
     expect(w["time-budget-seconds"]).toBe("480"); // a 10-minute job, two minutes to spare
     expect(gateStep(wf('merge="off", timeout=30').jobs.gate).with["time-budget-seconds"]).toBe("1680");
   });
@@ -265,7 +268,7 @@ describe("the single gate also evaluates one PR when something that decides it c
   describe("which runs do anything", () => {
     const guard = () => wf().jobs.gate.if as string;
     const run = (event_name: string, event: object = {}, actor = "alice") => evalGuard(guard(), { github: { event_name, actor, repository: "o/r", event } } as any);
-    const pr = (over: object = {}) => ({ state: "open", head: { repo: { full_name: "o/r" } }, ...over });
+    const pr = (over: object = {}) => ({ state: "open", base: { ref: "main" }, head: { repo: { full_name: "o/r" } }, ...over });
 
     it("the schedule and a manual run, always", () => {
       expect(run("schedule")).toBe(true);
@@ -282,10 +285,14 @@ describe("the single gate also evaluates one PR when something that decides it c
       expect(run("pull_request", { action: "synchronize", pull_request: pr() }, "dependabot[bot]")).toBe(false);
     });
 
-    it("not a closed PR, nor a label the harness put on itself", () => {
+    it("not a closed PR, nor one into another branch", () => {
       expect(run("pull_request", { action: "labeled", pull_request: pr({ state: "closed" }) })).toBe(false);
-      expect(run("pull_request", { action: "labeled", pull_request: pr(), sender: { login: BOT } })).toBe(false);
-      expect(run("pull_request_review", { action: "submitted", pull_request: pr(), sender: { login: BOT } })).toBe(true); // its verdict: yes
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ base: { ref: "release/1.x" } }) })).toBe(false);
+    });
+
+    it("labels and reviews from the harness's own identity DO run it: the reviewer's hold, the approver's verdict", () => {
+      expect(run("pull_request", { action: "labeled", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
+      expect(run("pull_request_review", { action: "submitted", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
     });
   });
 
@@ -296,5 +303,19 @@ describe("the single gate also evaluates one PR when something that decides it c
       expect(w.concurrency, attrs).toEqual({ group: "gate", "cancel-in-progress": false });
       expect(gateStep(w.jobs.gate).with["pr-number"], attrs).toBeUndefined();
     }
+  });
+});
+
+describe("cronPeriodSeconds", () => {
+  it.each([
+    ["*/10 * * * *", 600],
+    ["*/5 * * * *", 300],
+    ["17 * * * *", 3600],
+    ["0 */2 * * *", 7200],
+    ["0 7 * * *", 86400],
+    ["0 7 * * 1-5", 300],
+    ["nonsense", 300],
+  ])("%s → %i", (cron, s) => {
+    expect(cronPeriodSeconds(cron)).toBe(s);
   });
 });

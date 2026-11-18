@@ -292,19 +292,19 @@ const GATE_PR_EVENTS = ["synchronize", "reopened", "ready_for_review", "labeled"
  * always (the pass). An event run only for an open PR from this repository not
  * triggered by Dependabot: a fork or Dependabot event gets no secrets and a
  * read-only token, so it could neither mint the App token nor write the check —
- * the scheduled pass covers those PRs. Labels the harness itself applies are
- * ignored too: re-evaluating on the gate's own label adds a run and nothing else.
- * Scope (the rollout) is decided inside the gate, against the live PR.
+ * the scheduled pass covers those PRs. Only PRs into the configured base
+ * branch. Scope (the rollout) is decided inside the gate, against the live PR.
  */
-function singleGateGuard(botLogin: string | undefined): string {
+function singleGateGuard(baseBranch: string): string {
   const pr = "github.event.pull_request";
+  // Labels are NOT filtered by who applied them: the harness identity is shared
+  // by every lane, and a reviewer's escalation or hold label must reach the gate.
+  // The gate's own labels cost one extra, converging run.
   const event = [
     `${pr}.state == 'open'`,
+    `${pr}.base.ref == ${exprString(baseBranch)}`,
     `${pr}.head.repo.full_name == github.repository`,
     `github.actor != 'dependabot[bot]'`,
-    ...(botLogin
-      ? [`!((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.sender.login == ${exprString(botLogin)})`]
-      : []),
   ].join(" && ");
   return `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (${event})`;
 }
@@ -385,7 +385,7 @@ export function wire(ir: Harness): WiringPlan {
         // The single gate also evaluates ONE PR the moment something that decides
         // it changes: a review, a label, a review request, a new commit. CI
         // finishing and threads resolving have no usable event; the scheduled
-        // pass (least recently evaluated first) picks those up.
+        // pass (a rotating window over the PRs the bot has reviewed) picks those up.
         triggers.pull_request = { types: [...GATE_PR_EVENTS] };
         triggers.pull_request_review = { types: ["submitted", "dismissed"] };
       }
@@ -460,7 +460,7 @@ export function wire(ir: Harness): WiringPlan {
     if (guard) nw.guard = guard;
     if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? optIn : undefined);
     if (singleGate) {
-      nw.guard = singleGateGuard(botLogin);
+      nw.guard = singleGateGuard(ir.config.repo.base_branch);
       // One slot per PR for event runs, newest wins: a burst of events on a PR
       // collapses to one evaluation of its latest state. The scheduled pass has
       // its own slot and is never cancelled by an event.

@@ -59,9 +59,10 @@ scheduled pass (which runs on the default branch with secrets).
    takes candidates **round-robin by author** (each author's newest PR first, the
    longest-waiting author first in each round), so one author's flood cannot take every
    slot.
-4. **A rotating window of 20 per tick** for the gate's pass, moved by the run number: every
-   candidate within ⌈candidates ÷ 20⌉ ticks, no stored state, nothing extra read to
-   order it. Stops within a time budget derived from the job's timeout.
+4. **A rotating window of 20 per tick** for the gate's pass, advanced once per schedule
+   period from the clock (a run counter would also be advanced by event runs): every
+   candidate within ⌈candidates ÷ 20⌉ regular ticks, no stored state, nothing extra read
+   to order it. Stops within a time budget derived from the job's timeout.
 5. **Search failure is a quiet tick.** A failed or truncated (over 1,000 results) search
    evaluates nothing and says so; it does not fall back to walking every open PR.
    Verdicts still arrive through the review event.
@@ -107,7 +108,8 @@ merged without someone bypassing it.
 - **Who can sign off.** A formal `APPROVED` review on the **exact head commit**, standing
   (that reviewer's latest decisive review: not dismissed, not followed by their own
   request for changes), from any account **other than the harness's own identity** — a
-  person, or another bot. The pipeline already declined; its own approval cannot clear
+  person with a trusted association (by default write access: OWNER, MEMBER,
+  COLLABORATOR), or another bot. The pipeline already declined; its own approval cannot clear
   its own handoff. (GitHub already prevents an author approving their own PR.)
 - **GitHub's own review decision must agree.** The PR's `reviewDecision` must be
   `APPROVED`, or empty when the branch requires no reviews. That is how branch protection,

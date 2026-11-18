@@ -150,15 +150,23 @@ fork and Dependabot PRs.
 
 The pass looks only at open PRs `bot-login` has reviewed — one search, which returns the
 head SHA, author and labels in the same call — plus dependabot's when the policy runs its
-lane. It evaluates a window of 20 of them per tick that moves with `rotation`, so every
-candidate is reached within ⌈candidates ÷ 20⌉ ticks, and stops within
-`time-budget-seconds`. If the search fails or would be truncated (over 1,000 results), the
+lane. It evaluates a window of 20 of them per tick that advances once per schedule period
+(`rotation-period-seconds`, from the clock — event runs of the same workflow do not move
+it), so every candidate is reached within ⌈candidates ÷ 20⌉ regular ticks, and stops
+within `time-budget-seconds`. An event run evaluates only a PR into `base-branch`. If the search fails or would be truncated (over 1,000 results), the
 tick evaluates nothing rather than walk every open PR.
 
 **No result without a verdict.** A head the approver has given no verdict on gets no
 check: a missing required check blocks a merge, whereas a `neutral` one would pass it
 (GitHub counts `success`, `neutral` and `skipped` as passing). If a verdict is dismissed,
-the result on that head goes back to in progress. The dependabot lane needs no verdict.
+the result on that head goes back to in progress (a new in-progress run supersedes the
+completed one). The dependabot lane needs no verdict.
+
+**Merges.** Event runs for different PRs run in parallel, so two ready agent PRs can be
+merged within seconds of each other — as GitHub's own auto-merge would. Each merge pins
+the commit it evaluated; turn on "require branches to be up to date" in branch
+protection if merges must be serialized against the latest base. A merge another run
+already made is not reported as a rejection.
 
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
@@ -172,7 +180,9 @@ Opt-in, and only for the check (`merge`, or mode evaluate). `handoffClauses:
   ("A person decides: protected-path") instead of `failure`.
 - A **sign-off** clears it: a standing formal `APPROVED` review of the exact head
   commit (that reviewer's latest decisive review — not dismissed, not followed by
-  their own change request) from anyone other than `bot-login`, with GitHub's own
+  their own change request) from anyone other than `bot-login` — a person with a
+  trusted association (`trustedAuthorAssociations`, by default OWNER, MEMBER,
+  COLLABORATOR), or another bot — with GitHub's own
   review decision `APPROVED`, or empty where the branch requires no review. That
   decision is how required approvals and code owners are respected. If it cannot be
   read, the handoff stays outstanding and the check says why.

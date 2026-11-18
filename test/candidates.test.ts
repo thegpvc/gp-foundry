@@ -77,6 +77,16 @@ describe("searchCandidates", () => {
     expect(await searchCandidates(g.fn, { owner: "o", repo: "r", qualifiers: ["reviewed-by:b", "author:app/dependabot"] })).toHaveLength(3);
   });
 
+  it("names a GitHub App's bot the REST way, so it compares with bot_login and dependabot[bot]", async () => {
+    const fn = async () =>
+      ({ search: { issueCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+        { ...node(1), author: { __typename: "Bot", login: "dependabot" } },
+        { ...node(2), author: { __typename: "User", login: "alice" } },
+      ] } }) as any;
+    const got = await searchCandidates(fn, { owner: "o", repo: "r", qualifiers: ["x"] });
+    expect(got.map((c) => c.author)).toEqual(["dependabot[bot]", "alice"]);
+  });
+
   it("refuses a result set GitHub would truncate", async () => {
     await expect(searchCandidates(gql(1500).fn, { owner: "o", repo: "r", qualifiers: ["reviewed-by:b"] })).rejects.toThrow(/more than GitHub returns/);
   });

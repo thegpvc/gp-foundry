@@ -139,7 +139,7 @@ describe("pr-scope: listing for a sweep", () => {
   }
   const opts = { owner: "o", repo: "r", baseBranch: "main", botLogin: BOT, nowMs: NOW, retryDelayMs: 0 };
 
-  it("returns the in-scope PRs, round-robin by author, with what the selector needs", async () => {
+  it("returns the in-scope PRs, oldest first, with what the selector needs", async () => {
     const o = lister([
       [
         open(1, "alice", { requested_reviewers: [{ login: "x" }], requested_teams: [{ slug: "t" }] }),
@@ -150,10 +150,9 @@ describe("pr-scope: listing for a sweep", () => {
       ],
     ]);
     const prs = await listInScope(o, { ...opts, rollout: { authors: ["alice"] } });
-    // Same age, so authors fall back to login order: agent-bot[bot] before alice.
     expect(prs).toEqual([
-      { number: 3, sha: "sha3", base: "release", requested: 0, quiet: 60 },
       { number: 1, sha: "sha1", base: "main", requested: 2, quiet: 60 },
+      { number: 3, sha: "sha3", base: "release", requested: 0, quiet: 60 },
     ]);
     expect(o.seen[0]).toMatchObject({ state: "open", base: "main", sort: "created", direction: "asc" });
   });
