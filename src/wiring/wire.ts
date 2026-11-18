@@ -9,6 +9,7 @@
 import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, WiringPlan } from "../ir/types.js";
 import { AGENT_TYPES } from "../ir/types.js";
 import {
+  mergeSettingOf,
   isReadingPrLane,
   isWritingPrLane,
   rolloutOf,
@@ -283,6 +284,31 @@ function concurrencyKey(
   return { group: `${node.id}-${num}`, "cancel-in-progress": cancel };
 }
 
+/** The pull_request events that change what the single gate would decide. */
+const GATE_PR_EVENTS = ["synchronize", "reopened", "ready_for_review", "labeled", "unlabeled", "review_requested", "review_request_removed"] as const;
+
+/**
+ * Which runs of a single-gate workflow do anything. Scheduled and manual runs
+ * always (the pass). An event run only for an open PR from this repository not
+ * triggered by Dependabot: a fork or Dependabot event gets no secrets and a
+ * read-only token, so it could neither mint the App token nor write the check —
+ * the scheduled pass covers those PRs. Only PRs into the configured base
+ * branch. Scope (the rollout) is decided inside the gate, against the live PR.
+ */
+function singleGateGuard(baseBranch: string): string {
+  const pr = "github.event.pull_request";
+  // Labels are NOT filtered by who applied them: the harness identity is shared
+  // by every lane, and a reviewer's escalation or hold label must reach the gate.
+  // The gate's own labels cost one extra, converging run.
+  const event = [
+    `${pr}.state == 'open'`,
+    `${pr}.base.ref == ${exprString(baseBranch)}`,
+    `${pr}.head.repo.full_name == github.repository`,
+    `github.actor != 'dependabot[bot]'`,
+  ].join(" && ");
+  return `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (${event})`;
+}
+
 export function wire(ir: Harness): WiringPlan {
   const perNode: Record<string, NodeWiring> = {};
   const byId = new Map(ir.nodes.map((n) => [n.id, n] as const));
@@ -343,6 +369,8 @@ export function wire(ir: Harness): WiringPlan {
     const unguardedEvents = new Set<string>();
     const allEvents = new Set<string>();
     const dispatches: { toNode: string; when?: string }[] = [];
+    // A gate with merge= (which validate() holds to a hybrid harness).
+    const singleGate = node.type === "merge-gate" && mergeSettingOf(node) !== undefined;
     const hybridLane = rollout !== undefined && (isReadingPrLane(node) || isWritingPrLane(node));
     // The label that admits a PR by itself: the rollout's, for a hybrid reading
     // lane (a writing lane is never opted in by label); else the node's own.
@@ -353,6 +381,14 @@ export function wire(ir: Harness): WiringPlan {
     if (node.attrs.schedule !== undefined) {
       triggers.schedule = [{ cron: String(node.attrs.schedule) }];
       triggers.workflow_dispatch = {};
+      if (singleGate) {
+        // The single gate also evaluates ONE PR the moment something that decides
+        // it changes: a review, a label, a review request, a new commit. CI
+        // finishing and threads resolving have no usable event; the scheduled
+        // pass (a rotating window over the PRs the bot has reviewed) picks those up.
+        triggers.pull_request = { types: [...GATE_PR_EVENTS] };
+        triggers.pull_request_review = { types: ["submitted", "dismissed"] };
+      }
     } else {
       for (const e of incoming.get(node.id) ?? []) {
         const w = wireEdge(e, node, ir.config);
@@ -423,6 +459,16 @@ export function wire(ir: Harness): WiringPlan {
     };
     if (guard) nw.guard = guard;
     if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? optIn : undefined);
+    if (singleGate) {
+      nw.guard = singleGateGuard(ir.config.repo.base_branch);
+      // One slot per PR for event runs, newest wins: a burst of events on a PR
+      // collapses to one evaluation of its latest state. The scheduled pass has
+      // its own slot and is never cancelled by an event.
+      nw.concurrency = {
+        group: `\${{ github.event.pull_request.number && format('${node.id}-pr-{0}', github.event.pull_request.number) || '${node.id}' }}`,
+        "cancel-in-progress": "${{ github.event.pull_request.number != null }}",
+      };
+    }
     perNode[node.id] = nw;
   }
 

@@ -11,6 +11,8 @@ import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
+import { evalGuard } from "../src/sim/gh-expr.js";
+import { cronPeriodSeconds } from "../src/handlers/index.js";
 import type { Diagnostic, FoundryConfig, Harness } from "../src/ir/types.js";
 
 const BOT = "agent-bot[bot]";
@@ -228,5 +230,92 @@ describe("HARNESS.md", () => {
     const md = (attrs: string) => compile(mkHarness(gateDot(attrs))).files.find((f) => f.path.endsWith("HARNESS.md"))!.contents;
     expect(md('merge="off"')).toContain("merge off → check gp-foundry/approval (gate)");
     expect(md('merge="agent-only", check_name="acme/approval"')).toContain("merge agent-only → check acme/approval");
+  });
+});
+
+describe("the single gate also evaluates one PR when something that decides it changes", () => {
+  const wf = (attrs = 'merge="off"', cfg: Partial<FoundryConfig> = APP) => {
+    const { files } = compile(mkHarness(gateDot(attrs), cfg));
+    return yaml.load(files.find((f) => f.path.endsWith("/gate.yml"))!.contents) as any;
+  };
+
+  it("listens for reviews, labels, review requests and new commits, besides its schedule", () => {
+    const on = wf().on;
+    expect(on.schedule).toEqual([{ cron: "*/10 * * * *" }]);
+    expect(on.workflow_dispatch).toEqual({});
+    expect(on.pull_request.types).toEqual(["synchronize", "reopened", "ready_for_review", "labeled", "unlabeled", "review_requested", "review_request_removed"]);
+    expect(on.pull_request_review.types).toEqual(["submitted", "dismissed"]);
+    // No check_run / check_suite / workflow_run: CI finishing is the scheduled pass's.
+    expect(Object.keys(on).sort()).toEqual(["pull_request", "pull_request_review", "schedule", "workflow_dispatch"]);
+  });
+
+  it("evaluates the event's PR, and the pass when scheduled, within the job's time", () => {
+    const w = gateStep(wf().jobs.gate).with;
+    expect(w["pr-number"]).toBe("${{ github.event.pull_request.number }}");
+    // The window advances once per schedule period (from the clock, not a run counter).
+    expect(w["rotation-period-seconds"]).toBe("600");
+    expect(w.rotation).toBeUndefined();
+    expect(w["time-budget-seconds"]).toBe("480"); // a 10-minute job, two minutes to spare
+    expect(gateStep(wf('merge="off", timeout=30').jobs.gate).with["time-budget-seconds"]).toBe("1680");
+  });
+
+  it("one concurrency slot per PR for events, newest wins; the schedule has its own", () => {
+    const c = wf().concurrency;
+    expect(c.group).toBe("${{ github.event.pull_request.number && format('gate-pr-{0}', github.event.pull_request.number) || 'gate' }}");
+    expect(c["cancel-in-progress"]).toBe("${{ github.event.pull_request.number != null }}");
+  });
+
+  describe("which runs do anything", () => {
+    const guard = () => wf().jobs.gate.if as string;
+    const run = (event_name: string, event: object = {}, actor = "alice") => evalGuard(guard(), { github: { event_name, actor, repository: "o/r", event } } as any);
+    const pr = (over: object = {}) => ({ state: "open", base: { ref: "main" }, head: { repo: { full_name: "o/r" } }, ...over });
+
+    it("the schedule and a manual run, always", () => {
+      expect(run("schedule")).toBe(true);
+      expect(run("workflow_dispatch")).toBe(true);
+    });
+
+    it("an event on an open PR from this repo", () => {
+      expect(run("pull_request_review", { action: "submitted", pull_request: pr() })).toBe(true);
+      expect(run("pull_request", { action: "unlabeled", pull_request: pr(), sender: { login: "alice" } })).toBe(true);
+    });
+
+    it("not a fork's, nor one Dependabot triggered: no secrets there — the schedule covers them", () => {
+      expect(run("pull_request", { action: "synchronize", pull_request: pr({ head: { repo: { full_name: "someone/fork" } } }) })).toBe(false);
+      expect(run("pull_request", { action: "synchronize", pull_request: pr() }, "dependabot[bot]")).toBe(false);
+    });
+
+    it("not a closed PR, nor one into another branch", () => {
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ state: "closed" }) })).toBe(false);
+      expect(run("pull_request", { action: "labeled", pull_request: pr({ base: { ref: "release/1.x" } }) })).toBe(false);
+    });
+
+    it("labels and reviews from the harness's own identity DO run it: the reviewer's hold, the approver's verdict", () => {
+      expect(run("pull_request", { action: "labeled", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
+      expect(run("pull_request_review", { action: "submitted", pull_request: pr(), sender: { login: BOT } }, BOT)).toBe(true);
+    });
+  });
+
+  it("the older gates are untouched: schedule only, one slot", () => {
+    for (const attrs of ['mode="evaluate"', ""]) {
+      const w = wf(attrs, { ...APP, rollout: undefined } as Partial<FoundryConfig>);
+      expect(Object.keys(w.on).sort(), attrs).toEqual(["schedule", "workflow_dispatch"]);
+      expect(w.concurrency, attrs).toEqual({ group: "gate", "cancel-in-progress": false });
+      expect(gateStep(w.jobs.gate).with["pr-number"], attrs).toBeUndefined();
+    }
+  });
+});
+
+describe("cronPeriodSeconds", () => {
+  it.each([
+    ["*/10 * * * *", 600],
+    ["*/5 * * * *", 300],
+    ["17 * * * *", 3600],
+    ["0 */2 * * *", 7200],
+    ["0 7 * * *", 86400],
+    ["0 7 * * 1-5", 300],
+    ["nonsense", 300],
+  ])("%s → %i", (cron, s) => {
+    expect(cronPeriodSeconds(cron)).toBe(s);
   });
 });

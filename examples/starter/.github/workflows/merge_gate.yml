@@ -5,14 +5,28 @@ name: merge_gate
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+      - review_requested
+      - review_request_removed
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
 concurrency:
-  group: merge_gate
-  cancel-in-progress: false
+  group: ${{ github.event.pull_request.number && format('merge_gate-pr-{0}', github.event.pull_request.number) || 'merge_gate' }}
+  cancel-in-progress: ${{ github.event.pull_request.number != null }}
 permissions:
   contents: read
 jobs:
   merge_gate:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     permissions:
       contents: read
       pull-requests: read
@@ -35,3 +49,6 @@ jobs:
           base-branch: main
           bot-login: agent-bot
           rollout: "{\"authors\":[]}"
+          pr-number: ${{ github.event.pull_request.number }}
+          rotation-period-seconds: "1800"
+          time-budget-seconds: "480"

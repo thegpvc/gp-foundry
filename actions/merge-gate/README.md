@@ -142,8 +142,56 @@ to that App alone. Anything that requires it downstream (another gate's
 `required-checks`, a ruleset) should name it pinned to the App:
 `<check name>@<app slug>`.
 
+**When it runs.** The compiler wires the gate to evaluate one PR (`pr-number`) when
+something that decides it changes — a review submitted or dismissed (the approver's
+verdict among them), a label, a review request, a new commit, ready for review — and to
+run a scheduled pass for what has no usable event: CI finishing, a thread resolved,
+fork and Dependabot PRs.
+
+The pass looks only at open PRs `bot-login` has reviewed — one search, which returns the
+head SHA, author and labels in the same call — plus dependabot's when the policy runs its
+lane. It evaluates a window of 20 of them per tick that advances once per schedule period
+(`rotation-period-seconds`, from the clock — event runs of the same workflow do not move
+it), so every candidate is reached within ⌈candidates ÷ 20⌉ regular ticks, and stops
+within `time-budget-seconds`. An event run evaluates only a PR into `base-branch`. If the search fails or would be truncated (over 1,000 results), the
+tick evaluates nothing rather than walk every open PR.
+
+**No result without a verdict.** A head the approver has given no verdict on gets no
+check: a missing required check blocks a merge, whereas a `neutral` one would pass it
+(GitHub counts `success`, `neutral` and `skipped` as passing). If a verdict is dismissed,
+the result on that head goes back to in progress (a new in-progress run supersedes the
+completed one). The dependabot lane needs no verdict.
+
+**Merges.** Event runs for different PRs run in parallel, so two ready agent PRs can be
+merged within seconds of each other — as GitHub's own auto-merge would. Each merge pins
+the commit it evaluated; turn on "require branches to be up to date" in branch
+protection if merges must be serialized against the latest base. A merge another run
+already made is not reported as a rejection.
+
 `mode` (below) is the older interface and is unchanged; `merge` and `mode`
 cannot both be set.
+
+## Policy handoffs (`handoffClauses`)
+
+Opt-in, and only for the check (`merge`, or mode evaluate). `handoffClauses:
+[protected-path, too-large]` makes those clauses mean "a person should look":
+
+- While a handoff clause is the only thing failing, the check is `action_required`
+  ("A person decides: protected-path") instead of `failure`.
+- A **sign-off** clears it: a standing formal `APPROVED` review of the exact head
+  commit (that reviewer's latest decisive review — not dismissed, not followed by
+  their own change request) from anyone other than `bot-login` — a person with a
+  trusted association (`trustedAuthorAssociations`, by default OWNER, MEMBER,
+  COLLABORATOR), or another bot — with GitHub's own
+  review decision `APPROVED`, or empty where the branch requires no review. That
+  decision is how required approvals and code owners are respected. If it cannot be
+  read, the handoff stays outstanding and the check says why.
+- A sign-off clears **only** the handoff clauses. CI, open threads, review requests,
+  change requests and holds still decide the result. An agent `ESCALATE` (a judgment
+  call) and an escalation label (an explicit hold) are never cleared by it.
+- The check names who signed off and on which commit, and keeps the agent's verdict.
+- Merging never reads a sign-off: with `merge: agent-only` a handoff clause still
+  holds the merge, and the gate posts no review of its own.
 
 ## Evaluate mode
 

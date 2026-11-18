@@ -107,6 +107,14 @@ export interface PullRequestFacts {
   escalated?: boolean;
   /** The trusted reviewer's latest verdict on the head, if any (see latestHeadVerdict). */
   headVerdict?: HeadVerdict;
+  /**
+   * A sign-off on a policy handoff: a standing formal APPROVED review on this
+   * exact head from someone other than the harness's identity, with GitHub's own
+   * review decision met. Gathered only when the policy has handoff_clauses.
+   */
+  signoff?: { reviewer: string; sha: string };
+  /** Why a sign-off that looked present could not be accepted (shown on the check). */
+  signoffUnavailable?: string;
 }
 
 export type HeadVerdict = "approve" | "reject" | "escalate";
@@ -202,6 +210,14 @@ export interface MergePolicy {
    * still fails on it (the check's text lists those clauses).
    */
   noVerdictConclusion?: "failure" | "neutral";
+  /**
+   * Evaluate mode, opt-in: the policy clauses that hand a change to a person
+   * instead of failing it. While one is outstanding the check is
+   * `action_required`; a standing formal approval on the head from someone other
+   * than the harness's identity, with GitHub's own review decision met, signs it
+   * off in the check (see PullRequestFacts.signoff). Never affects merging.
+   */
+  handoffClauses?: HandoffClause[];
   /**
    * Labels to apply for a given skip outcome. Lets a consumer route skips to
    * the right agent (e.g. needsHuman -> "needs-human", rebase -> "rebase-needed").
@@ -812,6 +828,66 @@ export function awaitingApprover(
 }
 
 export type CheckConclusion = "success" | "failure" | "action_required" | "neutral";
+
+/** The only clauses a policy may make a handoff: they say a person should look, not that something is broken. */
+export const HANDOFF_CLAUSES = ["protected-path", "too-large"] as const;
+export type HandoffClause = (typeof HANDOFF_CLAUSES)[number];
+
+/** Throws on a `handoff_clauses` entry that is not a handoff clause. */
+export function validateHandoffClauses(raw: unknown): HandoffClause[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`handoff_clauses must be a list, e.g. [protected-path, too-large]`);
+  for (const c of raw) {
+    if (!(HANDOFF_CLAUSES as readonly string[]).includes(String(c))) {
+      throw new Error(`handoff_clauses: '${String(c)}' cannot be a handoff — only ${HANDOFF_CLAUSES.join(" and ")} can`);
+    }
+  }
+  return raw as HandoffClause[];
+}
+
+/** What the evaluate check reports for a head: the result with any policy handoff taken into account. */
+export interface CheckVerdict {
+  /** The clause the check names: the first still failing, or ready. */
+  decision: MergeDecision;
+  conclusion: CheckConclusion;
+  /** Handoff clauses failing on this head with no sign-off: a person decides. */
+  outstanding: MergeDecision[];
+  /** Handoff clauses failing on this head that a sign-off has cleared. */
+  signedOff: MergeDecision[];
+  /** For a neutral check: the other clauses still failing (see awaitingApprover). */
+  alsoFailing?: MergeDecision[];
+}
+
+/**
+ * The evaluate check's verdict on a head. Without `handoffClauses` in the policy
+ * this is exactly the original rule (checkConclusion over evaluateMergeGate).
+ *
+ * With it: a handoff clause failing on its own is `action_required` (a person
+ * decides), not `failure`; a sign-off clears ONLY the handoff clauses, and the
+ * check then reports whatever else the policy says. An escalation from the
+ * agent, or an escalation label, is a judgment call or an explicit hold and is
+ * never cleared by a sign-off. Merging never reads this: see evaluateMergeGate.
+ */
+export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, nowMs: number = Date.now()): CheckVerdict {
+  const handoff = new Set<string>(policy.handoffClauses ?? []);
+  const failing = failingClauses(pr, policy, nowMs);
+  const handoffs = failing.filter((d) => handoff.has(d.code));
+  const signedOff = pr.signoff ? handoffs : [];
+  const outstanding = pr.signoff ? [] : handoffs;
+  const remaining = failing.filter((d) => !signedOff.includes(d));
+  const decision: MergeDecision = signedOff.length
+    ? (remaining[0] ?? { action: "merge", code: "ready-to-merge", reason: "every clause passes, the policy handoff signed off" })
+    : evaluateMergeGate(pr, policy, nowMs);
+  const awaiting =
+    policy.noVerdictConclusion === "neutral" ? awaitingApprover(pr, policy, nowMs)?.filter((d) => !signedOff.includes(d)) : undefined;
+
+  let conclusion: CheckConclusion;
+  if (pr.escalated) conclusion = "action_required";
+  else if (remaining.length === 0) conclusion = "success";
+  else if (outstanding.length && remaining.every((d) => handoff.has(d.code))) conclusion = "action_required";
+  else conclusion = awaiting !== undefined ? "neutral" : "failure";
+  return { decision, conclusion, outstanding, signedOff, ...(awaiting !== undefined ? { alsoFailing: awaiting } : {}) };
+}
 
 /**
  * The evaluate-mode check run's conclusion: `action_required` when the reviewer

@@ -302,7 +302,8 @@ export interface NodeWiring {
   triggers: Record<string, unknown>;
   /** Job-level `if:` guard combining incoming edges' `when=`. */
   guard?: string;
-  concurrency?: { group: string; "cancel-in-progress": boolean };
+  /** `cancel-in-progress` may be an expression, so one workflow can treat event and scheduled runs differently. */
+  concurrency?: { group: string; "cancel-in-progress": boolean | string };
   /** Cross-workflow dispatches this node performs (e.g. Janitor -> Fixer). */
   dispatches: { toNode: string; when?: string }[];
 }

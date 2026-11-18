@@ -19,6 +19,9 @@ import yaml from "js-yaml";
 import {
   escalationLabel,
   sameLogin,
+  checkVerdict,
+  validateHandoffClauses,
+  parseTimestamp,
   standingChangeRequests,
   visibleBody,
   checkConclusion,
@@ -49,6 +52,7 @@ import {
 } from "./gate.js";
 import { parseVerdictWords, verdictRegexSource, type VerdictWords } from "../../../src/shared/verdicts.js";
 import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
+import { reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
 interface PolicyFile extends MergePolicy, VerdictTrustPolicy {
   approvalBodyRegex?: string;
@@ -159,6 +163,73 @@ interface ThreadsQueryResult {
       };
     } | null;
   } | null;
+}
+
+/** One formal review, as the sign-off rule reads it. */
+export interface SignoffReview {
+  at: string;
+  author?: string | null;
+  /** GitHub's user type for the author ("User", "Bot"). */
+  authorType?: string | null;
+  /** The author's association with the repo (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, …). */
+  association?: string | null;
+  state?: string | null;
+  sha?: string | null;
+}
+
+/**
+ * The candidates for signing off a policy handoff on `headSha`: reviewers whose
+ * latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED — a COMMENTED
+ * review changes no one's standing) is an APPROVED review of this exact commit,
+ * from anyone but the harness's identity and the PR's author. Most recent first.
+ * A bot other than the harness counts like a person.
+ */
+export function signoffCandidates(
+  reviews: SignoffReview[],
+  headSha: string,
+  harness: string | undefined,
+  prAuthor: string | undefined,
+  // Who may sign off: a person whose association is trusted (by default write
+  // access: OWNER, MEMBER, COLLABORATOR — the policy's trusted_author_associations),
+  // or another bot (an App installed on the repo). Without this, anyone who can
+  // review — read access is enough — could sign off a branch with no review rule.
+  trustedAssociations: string[] = ["OWNER", "MEMBER", "COLLABORATOR"],
+): { reviewer: string; at: string }[] {
+  const trusted = new Set(trustedAssociations.map((a) => a.toUpperCase()));
+  const eligible = (r: SignoffReview & { login: string }) =>
+    (r.authorType ?? "").toLowerCase() === "bot" || r.login.toLowerCase().endsWith("[bot]") || trusted.has((r.association ?? "").toUpperCase());
+  const latest = new Map<string, SignoffReview & { login: string }>();
+  for (const r of reviews) {
+    const state = (r.state ?? "").toUpperCase();
+    if (!r.author || !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(state)) continue;
+    const key = r.author.toLowerCase();
+    const prev = latest.get(key);
+    if (!prev || parseTimestamp(r.at) >= parseTimestamp(prev.at)) latest.set(key, { ...r, state, login: r.author });
+  }
+  return [...latest.values()]
+    .filter((r) => r.state === "APPROVED" && r.sha === headSha && !sameLogin(r.login, harness) && !sameLogin(r.login, prAuthor) && eligible(r))
+    .sort((a, b) => parseTimestamp(b.at) - parseTimestamp(a.at))
+    .map((r) => ({ reviewer: r.login, at: r.at }));
+}
+
+const REVIEW_DECISION_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewDecision } }
+}`;
+
+/**
+ * GitHub's own review decision for the PR — the result of branch protection's
+ * required approvals and code owners, which the gate does not re-implement.
+ * `null` when the branch requires no review. Throws when it cannot be read.
+ */
+export async function fetchReviewDecision(octokit: Octokit, owner: string, repo: string, number: number): Promise<string | null> {
+  const r = await octokit.graphql<{ repository: { pullRequest: { reviewDecision: string | null } | null } | null }>(REVIEW_DECISION_QUERY, {
+    owner,
+    repo,
+    number,
+  });
+  const pr = r.repository?.pullRequest;
+  if (!pr) throw new Error(`PR #${number} not found`);
+  return pr.reviewDecision ?? null;
 }
 
 /** Every review thread of a PR. Throws on any failure: the caller fails closed. */
@@ -317,7 +388,33 @@ export async function gatherFacts(octokit: Octokit, owner: string, repo: string,
     markers,
   );
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict };
+  // A sign-off on a policy handoff. Only when the policy names handoff clauses,
+  // and GitHub's review decision is read only when there is a candidate.
+  let signoff: PullRequestFacts["signoff"];
+  let signoffUnavailable: string | undefined;
+  if (policy.handoffClauses?.length) {
+    const candidates = signoffCandidates(
+      reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, authorType: r.user?.type, association: r.author_association, state: r.state, sha: r.commit_id })),
+      pr.head.sha,
+      policy.botLogin,
+      authorLogin,
+      policy.trustedAuthorAssociations?.length ? policy.trustedAuthorAssociations : undefined,
+    );
+    if (candidates.length) {
+      let decision: string | null | undefined;
+      try {
+        decision = await fetchReviewDecision(octokit, owner, repo, prNumber);
+      } catch (e) {
+        signoffUnavailable = `GitHub's review decision for this PR could not be read (${(e as Error).message}), so ${candidates[0]!.reviewer}'s approval cannot be accepted as a sign-off yet`;
+      }
+      if (decision === null || decision === "APPROVED") signoff = { reviewer: candidates[0]!.reviewer, sha: pr.head.sha };
+      else if (decision !== undefined) {
+        signoffUnavailable = `${candidates[0]!.reviewer} approved this head, but GitHub's review requirements are not met yet (review decision: ${decision})`;
+      }
+    }
+  }
+
+  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}) };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -386,6 +483,17 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
         ...(facts.headSha ? { sha: facts.headSha } : {}),
       });
     } catch (e) {
+      // Another run (an event run and the scheduled pass can both reach a ready
+      // PR) may have merged it first. Then there is nothing wrong to report.
+      try {
+        const now = (await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
+        if (now.merged) {
+          core.info(`PR #${prNumber} was merged by another run`);
+          return false;
+        }
+      } catch {
+        // fall through to the rejected-merge handling
+      }
       // A merge can still fail at merge time (e.g. a conflict that appeared after
       // another PR landed, or the head moved). Don't crash the poller — label it
       // so a Fixer rebases it and the next run re-scores the new head.
@@ -475,27 +583,45 @@ function awaitingSummary(alsoFailing: MergeDecision[], facts: PullRequestFacts, 
  * it — so the next tick can tell nothing changed and skip the write. (The
  * ready-to-merge reason carries "approved Nm ago", so success gets fixed text.)
  */
-export function renderCheckOutput(decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
-  const alsoFailing = policy.noVerdictConclusion === "neutral" ? awaitingApprover(facts, policy) : undefined;
-  const conclusion = checkConclusion(decision, facts, { awaitingApprover: alsoFailing !== undefined });
+export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFacts, policy: PolicyFile, ownCheck: string): CheckOutput {
+  const verdict = checkVerdict(facts, policy);
+  const { decision, conclusion, outstanding, signedOff } = verdict;
+  const alsoFailing = verdict.alsoFailing;
+  const handoffOnly = conclusion === "action_required" && !facts.escalated;
   const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
-  const title =
-    conclusion === "action_required"
+  const signed = signedOff.length && facts.signoff
+    ? `Policy handoff signed off: ${signedOff.map((d) => `\`${d.code}\``).join(", ")} by @${facts.signoff.reviewer} on \`${facts.signoff.sha.slice(0, 7)}\`.` +
+      (facts.headVerdict ? ` The reviewer's own verdict on this head stands: ${facts.headVerdict}.` : "")
+    : "";
+  const title = handoffOnly
+    ? `A person decides: ${outstanding.map((d) => d.code).join(", ")}`
+    : conclusion === "action_required"
       ? "Escalated: a human decides"
       : conclusion === "success"
-        ? "Ready to merge"
+        ? signed ? `Ready to merge — signed off by @${facts.signoff!.reviewer}` : "Ready to merge"
         : conclusion === "neutral"
           ? "Awaiting the approver"
           : `Not ready: ${decision.code}`;
-  const summary =
-    conclusion === "action_required"
+  const handoffSummary = [
+    ...outstanding.map((d) => `\`${d.code}\` — ${d.reason}.`),
+    "",
+    `This change needs a person. A formal approval of this head from someone other than \`${policy.botLogin ?? "the pipeline"}\`, once GitHub's own review requirements are met, signs it off here.`,
+    ...(facts.signoffUnavailable ? ["", `Not yet: ${facts.signoffUnavailable}.`] : []),
+  ].join("\n");
+  const base =
+    handoffOnly
+      ? handoffSummary
+      : conclusion === "action_required"
       ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}`
       : conclusion === "neutral"
         ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;
+  const summary = [base, signed, !signed && !handoffOnly && facts.signoffUnavailable ? `Policy handoff not signed off: ${facts.signoffUnavailable}.` : ""]
+    .filter(Boolean)
+    .join("\n\n");
 
   const sections: string[] = [];
   const threads = openThreads(facts, policy);
@@ -600,6 +726,11 @@ export async function runEvaluate(opts: {
   if (policy.noVerdictConclusion !== undefined && policy.noVerdictConclusion !== "failure" && policy.noVerdictConclusion !== "neutral") {
     throw new Error(`no_verdict_conclusion must be "failure" or "neutral", got ${JSON.stringify(policy.noVerdictConclusion)}`);
   }
+  if (policy.noVerdictConclusion === "neutral") {
+    core.warning(
+      'no_verdict_conclusion: neutral — GitHub counts a neutral check as PASSING a required status check, so a head the approver has not decided would pass one. Prefer merge="off", which publishes no result until there is a verdict.',
+    );
+  }
   // mergeable_state is computed lazily and only a merge attempt settles it; an
   // evaluate gate makes no attempt, so the rebase clause is off unless set.
   if (policy.requireCleanRebase === undefined) policy.requireCleanRebase = false;
@@ -645,12 +776,39 @@ export async function runEvaluate(opts: {
 
 export type MergeSetting = "off" | "agent-only";
 
+/** How many PRs one scheduled pass of the single gate evaluates. Not a setting. */
+export const GATE_TICK_LIMIT = 20;
+
 /**
- * The single gate (`merge=` on the node). Each tick, for every pull request the
- * pipeline looks at — the rollout dial decides that, not a branch prefix:
+ * Withdraw the gate's result from a head that no longer has a verdict (the
+ * approver's review was dismissed). A completed run is not reopened — its
+ * conclusion would stand — but superseded: a NEW run of the same name, in
+ * progress, which is the one GitHub reads for this commit from then on. In
+ * progress never counts as passing a required check. The gate's next result
+ * on this head completes that new run (publishCheck adopts the newest).
+ */
+export async function withdrawCheck(checksOctokit: Octokit, owner: string, repo: string, headSha: string, name: string, app: string): Promise<boolean> {
+  const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
+  const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
+  if (!mine || mine.status !== "completed") return false;
+  await checksOctokit.rest.checks.create({
+    owner,
+    repo,
+    name,
+    head_sha: headSha,
+    status: "in_progress",
+    output: { title: "Awaiting the approver", summary: "The approver's verdict on this head is gone (dismissed). The gate publishes a result once there is one." },
+  });
+  return true;
+}
+
+/**
+ * The single gate (`merge=` on the node), for one PR (an event run) or for a
+ * window of the PRs the bot has reviewed (the scheduled pass):
  *
  *   1. work out the result against the policy;
- *   2. publish it as the check on the PR's head, human PR or agent PR alike;
+ *   2. publish it as the check on the PR's head, human PR or agent PR alike —
+ *      but only once the approver has a verdict on that head;
  *   3. with merge="agent-only", act on a PR the pipeline WROTE: merge it when
  *      ready, or apply the policy's labels when not.
  *
@@ -671,6 +829,12 @@ export async function runHybridGate(opts: {
   rollout: Rollout | undefined;
   prNumber?: number;
   dryRun: boolean;
+  /** Scheduled pass: stop starting new evaluations after this many seconds. */
+  timeBudgetSeconds?: number;
+  /** Scheduled pass: the run number, which moves the pass's window each tick. */
+  rotation?: number;
+  /** Injected clock, for tests. */
+  now?: () => number;
 }): Promise<{ evaluated: number; written: number; mergedPr: string }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
@@ -687,15 +851,62 @@ export async function runHybridGate(opts: {
   const botLogin = base.botLogin;
   const dependabotLane = (base.dependabot?.autoMerge?.length ?? 0) > 0;
 
-  const prs =
-    opts.prNumber !== undefined
-      ? [(await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data]
-      : await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
+  const now = opts.now ?? Date.now;
+  const started = now();
+  const deadline = opts.timeBudgetSeconds ? started + opts.timeBudgetSeconds * 1000 : Infinity;
+
+  // A targeted run (an event on one PR) evaluates that PR. The scheduled pass
+  // evaluates a rotating window of the PRs the gate could have something to say
+  // about: the gate publishes only once the approver has a verdict on the head,
+  // and a verdict is a review by the harness bot — so the candidates are one
+  // search for open PRs the bot has reviewed (plus dependabot's, when the policy
+  // runs that lane).
+  type Pr = { number: number; draft?: boolean | null; user?: { login?: string; type?: string } | null; labels: { name?: string }[] };
+  let prs: Pr[];
+  if (opts.prNumber !== undefined) {
+    const one = (await octokit.rest.pulls.get({ owner, repo, pull_number: opts.prNumber })).data;
+    if (one.state !== "open") {
+      core.info(`PR #${one.number} is ${one.state} — nothing to evaluate`);
+      return { evaluated: 0, written: 0, mergedPr: "" };
+    }
+    // The gate is configured for one base branch; a PR into any other is not its to judge or merge.
+    if (one.base.ref !== opts.baseBranch) {
+      core.info(`PR #${one.number} targets ${one.base.ref}, not ${opts.baseBranch} — not this gate's`);
+      return { evaluated: 0, written: 0, mergedPr: "" };
+    }
+    prs = [one];
+  } else if (botLogin) {
+    let found: Candidate[];
+    try {
+      found = await searchCandidates((q, v) => octokit.graphql(q, v), {
+        owner,
+        repo,
+        base: opts.baseBranch,
+        qualifiers: [reviewedByQualifier(botLogin), ...(dependabotLane ? ["author:app/dependabot"] : [])],
+      });
+    } catch (e) {
+      // No fallback to walking every open PR: that is what used to time out.
+      // Verdicts reach the gate through the review event regardless.
+      core.notice(`could not search for the PRs to evaluate (${(e as Error).message}) — nothing evaluated this tick; the next tick tries again`);
+      return { evaluated: 0, written: 0, mergedPr: "" };
+    }
+    const window = rotatingWindow(found, GATE_TICK_LIMIT, opts.rotation ?? 0);
+    core.info(`${found.length} open PR(s) reviewed by ${botLogin}; evaluating ${window.length} this tick`);
+    prs = window.map((c) => ({ number: c.number, draft: c.draft, user: { login: c.author, type: c.authorType }, labels: c.labels.map((name) => ({ name })) }));
+  } else {
+    // No bot login to search by: the original listing, in a rotating window.
+    const open = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "open", base: opts.baseBranch, sort: "created", direction: "asc", per_page: 100 });
+    prs = rotatingWindow(open, GATE_TICK_LIMIT, opts.rotation ?? 0);
+  }
 
   let evaluated = 0;
   let written = 0;
   let mergedPr = "";
   for (const p of prs) {
+    if (now() > deadline) {
+      core.info("near the job's time limit — the rest wait for the next tick");
+      break;
+    }
     const n = p.number;
     const author = p.user?.login;
     const scope = inScope(
@@ -713,6 +924,19 @@ export async function runHybridGate(opts: {
     evaluated++;
     try {
       const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit);
+      // No verdict from the approver on this head: no result. A missing required
+      // check blocks a merge; a neutral one would PASS it. (The dependabot lane
+      // needs no verdict.) A result already on this head — its verdict since
+      // dismissed — is withdrawn to in progress.
+      const verdictless = !facts.headVerdict && !onDependabotLane;
+      if (verdictless) {
+        const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
+        if (mine && !opts.dryRun && facts.headSha && (await withdrawCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp))) {
+          core.info(`PR #${n}: verdict gone from ${facts.headSha.slice(0, 8)} — result withdrawn`);
+        } else {
+          core.info(`PR #${n}: no verdict from the approver on this head yet — no result published`);
+        }
+      }
 
       // Who merges this PR? Only asked when the gate may merge at all.
       let writer: { agentWritten: boolean; detail: string } | undefined;
@@ -740,7 +964,7 @@ export async function runHybridGate(opts: {
         out.text = out.text ? `${out.text}\n\n${line}` : line;
       }
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
-      if (!opts.dryRun && facts.headSha) {
+      if (!opts.dryRun && facts.headSha && !verdictless) {
         const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
         if (result !== "unchanged") written++;
         core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
@@ -771,6 +995,8 @@ export async function run(): Promise<void> {
     const dryRun = core.getInput("dry-run") === "true";
 
     const policy = loadPolicy(policyPath);
+    // Fail loudly on a policy handoff that is not one: it would otherwise be ignored.
+    validateHandoffClauses(policy.handoffClauses);
     if (branchPrefixInput) policy.branchPrefix = branchPrefixInput; // input overrides policy file
     // The compiler passes these from foundry.config.yaml / the graph, so a
     // consumer's identity and human-gate wiring don't have to be restated in the
@@ -835,6 +1061,10 @@ export async function run(): Promise<void> {
         octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun, rollout,
         merge: mergeSetting,
         checkApp: core.getInput("check-app").trim() || CHECK_APP,
+        timeBudgetSeconds: parseInt(core.getInput("time-budget-seconds"), 10) || undefined,
+        // The window advances once per schedule period: computed from the clock,
+        // not a run counter, which event runs of the same workflow also advance.
+        rotation: Math.floor(Date.now() / (1000 * (parseInt(core.getInput("rotation-period-seconds"), 10) || 300))),
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));
