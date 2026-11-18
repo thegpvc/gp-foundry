@@ -9,19 +9,19 @@ describe("roundRobinByAuthor", () => {
   it("gives one author with many PRs one place per round", () => {
     const flood = Array.from({ length: 6 }, (_, i) => c(100 + i, "prolific", 1000 + i));
     const order = roundRobinByAuthor([...flood, c(1, "alice", 500), c(2, "bob", 600)]).map((x) => x.number);
-    // Round 1: one each (longest-waiting author first), then the flood drains.
-    expect(order.slice(0, 3).sort()).toEqual([1, 105, 2].sort());
-    expect(order.slice(3)).toEqual([104, 103, 102, 101, 100]);
+    // Round 1: one each, longest-waiting author first and each author's oldest PR; then the flood drains, oldest first.
+    expect(order.slice(0, 3)).toEqual([1, 2, 100]);
+    expect(order.slice(3)).toEqual([101, 102, 103, 104, 105]);
   });
 
-  it("takes each author's newest PR first; authors who have waited longest lead each round", () => {
+  it("takes each author's oldest PR first; authors who have waited longest lead each round", () => {
     const order = roundRobinByAuthor([c(1, "a", 10), c(2, "a", 30), c(3, "b", 5), c(4, "b", 20)]).map((x) => x.number);
-    expect(order).toEqual([4, 2, 3, 1]); // b waited longest (5 < 10); newest of each first
+    expect(order).toEqual([3, 1, 4, 2]); // b waited longest (5 < 10); oldest of each first
   });
 
   it("treats logins case-insensitively and is deterministic", () => {
     const xs = [c(1, "Alice", 1), c(2, "alice", 2), c(3, "bob", 3)];
-    expect(roundRobinByAuthor(xs).map((x) => x.number)).toEqual([2, 3, 1]);
+    expect(roundRobinByAuthor(xs).map((x) => x.number)).toEqual([1, 3, 2]);
     expect(roundRobinByAuthor([...xs].reverse())).toEqual(roundRobinByAuthor(xs));
   });
 

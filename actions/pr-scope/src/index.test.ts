@@ -224,8 +224,8 @@ describe("pr-scope: listing only PRs the bot has reviewed", () => {
     const o = searcher([[...flood, node(1, "alice", "2025-12-31T00:00:00Z"), node(2, "dependabot[bot]", "2026-01-01T00:00:00Z"), node(3, "bob", "2026-01-01T00:30:00Z", { isDraft: true })]]);
     const prs = await listInScope(o, opts);
     expect(o.queries).toEqual([`repo:o/r is:pr is:open base:main reviewed-by:${BOT}`]);
-    // alice waited longest; prolific's newest first; dependabot (another bot) and the draft are out.
-    expect(prs!.map((p) => p.number)).toEqual([1, 104, 103, 102, 101, 100]);
+    // alice waited longest; then prolific, oldest first; dependabot (another bot) and the draft are out.
+    expect(prs!.map((p) => p.number)).toEqual([1, 100, 101, 102, 103, 104]);
     expect(prs![0]).toEqual({ number: 1, sha: "sha1", base: "main", requested: 0, quiet: 90000 });
   });
 

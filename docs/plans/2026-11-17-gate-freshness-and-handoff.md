@@ -56,7 +56,7 @@ scheduled pass (which runs on the default branch with secrets).
    head SHA, author and labels too. In a busy repo this cuts ~800 open PRs to the ~80 the
    bot has reviewed. Dependabot's PRs are searched too when the policy runs that lane.
    The approver's select job uses the same search when it has `requires_review=true`, and
-   takes candidates **round-robin by author** (each author's newest PR first, the
+   takes candidates **round-robin by author** (each author's oldest PR first, the
    longest-waiting author first in each round), so one author's flood cannot take every
    slot.
 4. **A rotating window of 20 per tick** for the gate's pass, advanced once per schedule

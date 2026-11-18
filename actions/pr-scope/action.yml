@@ -74,7 +74,7 @@ outputs:
   prs:
     description: >-
       With `list`: a JSON array of {number, sha, base, requested, quiet}. With
-      `reviewed-by`: round-robin by author (each author's newest PR, then each
+      `reviewed-by`: round-robin by author (each author's oldest PR, then each
       author's next, longest-waiting author first); otherwise oldest first — head SHA, base ref, the number of pending review
       requests, and seconds since the PR last changed.
   listed:

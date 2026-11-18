@@ -123,12 +123,13 @@ export async function searchCandidates(
 }
 
 /**
- * Round-robin by author: each author's newest PR first, then each author's
- * second newest, and so on, so one author with hundreds of open PRs takes one
- * place per round rather than every place. Authors are ordered by how long
- * their longest-waiting PR has gone unchanged, so whoever has waited longest
- * goes first in each round. "Newest" is the PR's last update — a cheap stand-in
- * for its head's age that needs no extra read.
+ * Round-robin by author: each author's oldest PR first, then each author's
+ * second oldest, and so on, so one author with hundreds of open PRs takes one
+ * place per round rather than every place, and nobody's older PRs wait behind
+ * their newer ones. Authors are ordered by how long their longest-waiting PR has
+ * gone unchanged, so whoever has waited longest goes first in each round. "Oldest"
+ * is by the PR's last update — a cheap stand-in for its head's age that needs no
+ * extra read.
  */
 export function roundRobinByAuthor(cands: Candidate[]): Candidate[] {
   const byAuthor = new Map<string, Candidate[]>();
@@ -140,7 +141,7 @@ export function roundRobinByAuthor(cands: Candidate[]): Candidate[] {
   const queues = [...byAuthor.entries()]
     .map(([author, list]) => ({
       author,
-      list: [...list].sort((a, b) => b.updatedAt - a.updatedAt || b.number - a.number),
+      list: [...list].sort((a, b) => a.updatedAt - b.updatedAt || a.number - b.number),
       waited: Math.min(...list.map((c) => c.updatedAt)),
     }))
     .sort((a, b) => a.waited - b.waited || (a.author < b.author ? -1 : 1));
