@@ -1053,7 +1053,7 @@ export async function runHybridGate(opts: {
   self?: GateRun;
   /** The re-review label, when the harness has one (the policy carries it too). */
   rereviewLabel?: string;
-}): Promise<{ evaluated: number; written: number; mergedPr: string }> {
+}): Promise<{ evaluated: number; written: number; mergedPr: string; publishedPrs?: number[] }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
     throw new Error(`no_verdict_conclusion must be "failure" or "neutral", got ${JSON.stringify(opts.policy.noVerdictConclusion)}`);
@@ -1143,6 +1143,8 @@ export async function runHybridGate(opts: {
 
   let evaluated = 0;
   let written = 0;
+  // The PRs whose result this run changed: what a dispatch= on the gate wakes its targets for.
+  const publishedPrs: number[] = [];
   let mergedPr = "";
   for (const p of prs) {
     if (now() > deadline) {
@@ -1247,7 +1249,10 @@ export async function runHybridGate(opts: {
         core.info(`PR #${n}: CI is still running on ${(facts.headSha ?? "").slice(0, 8)} — no result from an event run; the scheduled pass settles it`);
       } else if (!opts.dryRun && facts.headSha && !verdictless) {
         const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
-        if (result !== "unchanged") written++;
+        if (result !== "unchanged") {
+          written++;
+          publishedPrs.push(n);
+        }
         core.info(`PR #${n}: check \`${checkName}\` ${result} on ${facts.headSha.slice(0, 8)}`);
       }
 
@@ -1272,7 +1277,7 @@ export async function runHybridGate(opts: {
     }
   }
   core.info(`${evaluated} PR(s) in scope${mergedPr ? `; merged #${mergedPr}` : ""}`);
-  return { evaluated, written, mergedPr };
+  return { evaluated, written, mergedPr, publishedPrs };
 }
 
 /** The gate's own run: GITHUB_RUN_ID from the runner, the job's check-run name from the compiler. */
@@ -1389,6 +1394,7 @@ export async function run(): Promise<void> {
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));
+      core.setOutput("published-prs", (r.publishedPrs ?? []).join(","));
       core.setOutput("merged", String(r.mergedPr !== ""));
       core.setOutput("merged-pr", r.mergedPr);
       return;

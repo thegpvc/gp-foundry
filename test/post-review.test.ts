@@ -749,7 +749,7 @@ describe("quiet_verdicts: the gate is nudged, since a check run starts no gate r
 
   it("after delivering the check, dispatches the gate for this PR with the job's own token", () => {
     const s = step();
-    expect(s.env).toMatchObject({ GATE_WORKFLOWS: "merge_gate.yml", DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: "main" });
+    expect(s.env).toMatchObject({ QUIET_GATES: "merge_gate.yml pr", DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: "main" });
     const r = runPost(s, fence(approve), [], { DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
     expect(r.status).toBe(0);
     expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/check-runs", "POST repos/o/r/actions/workflows/merge_gate.yml/dispatches"]);
@@ -759,11 +759,56 @@ describe("quiet_verdicts: the gate is nudged, since a check run starts no gate r
   it("a failed dispatch is a warning: the verdict is delivered, the scheduled pass catches up", () => {
     const r = runPost(step(), fence(approve), [], { STUB_DISPATCH_FAIL: "1", DISPATCH_TOKEN: "gt" }, ["src/a.ts"], undefined, []);
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain("its scheduled pass will evaluate it");
+    expect(r.stdout).toContain("its own schedule will run it");
   });
 
   it("a review-delivered verdict dispatches nothing: its own event starts the gate", () => {
     const r = runPost(step(), fence({ body: "No.\n\n**Verdict:** REQUEST_CHANGES" }), [], {}, ["src/a.ts"], undefined, []);
     expect(r.writes.map((w) => w.call)).toEqual(["POST repos/o/r/pulls/7/reviews"]);
+  });
+});
+
+describe("dispatch=: the post step wakes its targets once the review is posted (#49)", () => {
+  const DISPATCHING = `digraph t {
+  start    [type=start]
+  reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", post="review", dispatch="approver, formal-approval.yml"]
+  approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/5 * * * *", post="review"]
+  start    -> reviewer [on="pull_request.opened, pull_request.synchronize"]
+}`;
+  const step = () => {
+    const { files } = compile(mkHarness(DISPATCHING));
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/reviewer.yml"))!.contents) as any;
+    return stepNamed(wf.jobs.reviewer, "Post the review");
+  };
+  const calls = (r: Ran) => r.writes.map((w) => w.call);
+
+  it("after posting: the sweep with no inputs, the workflow file with the PR", () => {
+    const r = runPost(step(), fence(REVIEW), [], { DISPATCH_TOKEN: "gt" });
+    expect(r.status).toBe(0);
+    expect(calls(r)).toEqual([
+      "POST repos/o/r/pulls/7/reviews",
+      "POST repos/o/r/actions/workflows/approver.yml/dispatches",
+      "POST repos/o/r/actions/workflows/formal-approval.yml/dispatches",
+    ]);
+    expect(r.writes[1]!.body).toEqual({ ref: "main" });
+    expect(r.writes[2]!.body).toEqual({ ref: "main", "inputs[pr]": "7" });
+  });
+
+  it("after the 422 retry's post too", () => {
+    const r = runPost(step(), fence(REVIEW), [], { DISPATCH_TOKEN: "gt", STUB_422_IF_COMMENTS: "1" });
+    expect(r.status).toBe(0);
+    expect(calls(r).filter((c) => c.endsWith("/dispatches"))).toHaveLength(2);
+  });
+
+  it("nothing posted (already posted on this head): nothing dispatched", () => {
+    const r = runPost(step(), fence(REVIEW), [{ user: { login: BOT }, commit_id: "head1", body: "PR #7 head head1\n\nx\n\n<!-- gp-foundry:posted:reviewer:head1 -->" }], { DISPATCH_TOKEN: "gt" });
+    expect(calls(r)).toEqual([]);
+  });
+
+  it("a failed dispatch is a warning; the review stands", () => {
+    const r = runPost(step(), fence(REVIEW), [], { DISPATCH_TOKEN: "gt", STUB_DISPATCH_FAIL: "1" });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("::warning::could not start approver.yml");
+    expect(r.posts).toHaveLength(1);
   });
 });

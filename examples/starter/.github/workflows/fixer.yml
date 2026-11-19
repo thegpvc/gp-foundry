@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Is this a PR the pipeline wrote?
         id: scope
-        uses: thegpvc/gp-foundry/actions/pr-scope@v0.5.1
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.6.0
         with:
           number: ${{ github.event.pull_request.number }}
           token: ${{ github.token }}
@@ -115,13 +115,20 @@ jobs:
             ] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')
           [ -n "$COUNT" ] || COUNT=0
           echo "attempts so far: $COUNT / $MAX"
+          # The label and the comments are the visible record, not the control flow:
+          # a failure to write one (a token without the scope, a transient API error)
+          # is a warning, and the decision — stop, or run the attempt — still stands.
           if [ "$COUNT" -gt "$MAX" ]; then
-            gh pr edit "$PR" --add-label "needs-human" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human'
-            gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (fixer)\n\nExhausted (%s/%s requested-changes rounds) — labeling `needs-human` and stopping. A human should take this over.\n\n%s' "$COUNT" "$MAX" "$MARKER")"
             echo "exhausted=true" >> "$GITHUB_OUTPUT"
+            gh pr edit "$PR" --add-label "needs-human" 2>/dev/null \
+              || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human' >/dev/null \
+              || echo "::warning::could not label #$PR 'needs-human' — the attempt budget is exhausted all the same"
+            gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (fixer)\n\nExhausted (%s/%s requested-changes rounds) — labeling `needs-human` and stopping. A human should take this over.\n\n%s' "$COUNT" "$MAX" "$MARKER")" >/dev/null \
+              || echo "::warning::could not post the exhaustion notice on #$PR"
           else
-            gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null
             echo "exhausted=false" >> "$GITHUB_OUTPUT"
+            gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null \
+              || echo "::warning::could not post the attempt marker on #$PR (attempt $COUNT/$MAX is counted all the same; the count comes from the reviews)"
           fi
       - name: Setup agent toolchain
         if: steps.attempts.outputs.exhausted != 'true'
@@ -129,7 +136,7 @@ jobs:
       - name: Fetch context
         id: ctx
         if: steps.attempts.outputs.exhausted != 'true'
-        uses: thegpvc/gp-foundry/actions/agent-context@v0.5.1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.6.0
         with:
           type: pr-review
           number: ${{ github.event.pull_request.number }}
@@ -139,7 +146,7 @@ jobs:
       - name: Run agent
         if: steps.attempts.outputs.exhausted != 'true'
         timeout-minutes: 25
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.5.1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.6.0
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/fixer.md
           model: claude-opus-4-8
@@ -154,6 +161,16 @@ jobs:
         env:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |-
+          # An untracked scratch draft at the root (a PR body or reply written for
+          # --body-file) is not part of the fix: drop it rather than commit it.
+          while IFS= read -r f; do
+            case "$f" in
+              */*) ;;
+              .pr-body*|pr-body*|.pr_body*|pr_body*|PR_BODY*|.pr-description*|pr-description*|.issue-comment*|issue-comment*|.comment-body*|.review-body*)
+                echo "::warning::'$f' looks like an agent's scratch file — not committing it"
+                rm -f -- "$f" ;;
+            esac
+          done < <(git ls-files --others --exclude-standard)
           # Commit anything the agent left uncommitted...
           if [ -n "$(git status --porcelain)" ]; then
             git add -A

@@ -50,6 +50,25 @@ inputs:
   comment-target:
     description: "Where to post no-changes-comment: 'pr' or 'issue'."
     default: "pr"
+  scratch-paths:
+    description: >-
+      Newline-separated globs, matched from the repository root, of an agent's
+      scratch files (PR-body and comment drafts written for `--body-file`). A NEW
+      file matching one — absent from the base branch — is dropped before the
+      push, whether the agent committed it or not. A file the base branch already
+      has is never touched. Empty disables it.
+    default: |
+      .pr-body*
+      pr-body*
+      .pr_body*
+      pr_body*
+      PR_BODY*
+      .pr-description*
+      pr-description*
+      .issue-comment*
+      issue-comment*
+      .comment-body*
+      .review-body*
 
 runs:
   using: composite
@@ -99,6 +118,7 @@ runs:
         BASE_BRANCH: ${{ inputs.base-branch }}
         IMMUTABLE_PATHS: ${{ steps.immutable.outputs.paths }}
         ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+        SCRATCH_PATHS: ${{ inputs.scratch-paths }}
       run: |
         # Revert any changes to immutable paths — the restricted App token
         # typically lacks permission to push them (e.g. `workflows`), so the
@@ -169,11 +189,38 @@ runs:
           done <<< "$(changed_under '.')"
         fi
 
+        # An agent's scratch files (a PR body drafted for --body-file, say) are not
+        # part of the change. Only NEW files: one the base branch has is the repo's.
+        if [ -n "$SCRATCH_PATHS" ]; then
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # Root files only: in a case pattern `*` also matches `/`, so without
+            # this `pr-body*` would claim a new `pr-body-tool/` directory.
+            case "$f" in */*) continue ;; esac
+            git cat-file -e "${BASE_REF}:${f}" 2>/dev/null && continue
+            while IFS= read -r G; do
+              G="$(printf '%s' "$G" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              [ -z "$G" ] && continue
+              # shellcheck disable=SC2254 # G is a glob on purpose
+              case "$f" in
+                $G)
+                  echo "::warning::'$f' looks like an agent's scratch file — not committing it"
+                  restore_from_base "$f"
+                  break ;;
+              esac
+            done <<< "$SCRATCH_PATHS"
+          done <<< "$(changed_under '.')"
+        fi
+
         # Fold the restorations into the branch's tip commit — but only when there
         # IS a commit of our own to amend. With nothing ahead of base, `--amend`
         # would rewrite the base commit itself.
         if ! git diff --staged --quiet; then
-          if [ "$(git rev-list "${BASE_REF}..HEAD" --count 2>/dev/null || echo 0)" -gt 0 ]; then
+          # A tip the agent already pushed is not ours to rewrite: amending it would
+          # make the push below a non-fast-forward. Commit the removal on top.
+          if [ -n "$(git branch -r --contains HEAD 2>/dev/null)" ]; then
+            git commit -m "chore: strip edits the agent may not push"
+          elif [ "$(git rev-list "${BASE_REF}..HEAD" --count 2>/dev/null || echo 0)" -gt 0 ]; then
             # Amending fails when the restoration empties the tip commit — i.e. the
             # illegal edit WAS the whole commit. Drop that commit instead; anything
             # else the agent left behind is committed by the next step.
@@ -237,12 +284,17 @@ runs:
         ISSUE_NUMBER: ${{ inputs.issue-number }}
         BRANCH: ${{ steps.pushbranch.outputs.branch }}
       run: |
+        # A record of the outcome, not the outcome: a failed post is a warning.
         if [ "$COMMENT_TARGET" = "issue" ] && [ -n "$ISSUE_NUMBER" ]; then
-          gh issue comment "$ISSUE_NUMBER" --body "$COMMENT_BODY"
+          gh issue comment "$ISSUE_NUMBER" --body "$COMMENT_BODY" \
+            || echo "::warning::could not post the no-changes comment on #$ISSUE_NUMBER"
         elif [ "$COMMENT_TARGET" = "pr" ]; then
-          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')
+          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty' || true)
           if [ -n "$PR_NUM" ]; then
-            gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+            gh pr comment "$PR_NUM" --body "$COMMENT_BODY" \
+              || echo "::warning::could not post the no-changes comment on #$PR_NUM"
+          else
+            echo "::notice::no PR on $BRANCH to post the no-changes comment on (comment-target: pr)"
           fi
         fi
 

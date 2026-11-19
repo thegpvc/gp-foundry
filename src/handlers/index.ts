@@ -15,9 +15,12 @@ import type {
 import type { GateSpec } from "./attrs.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
 import { parseRollout } from "../shared/scope.js";
+import { SCRATCH_GLOBS } from "../shared/scratch.js";
 import type { MergeSetting } from "./attrs.js";
-import { postReviewStep, reviewOutputContract } from "./post-review.js";
+import { postDispatchTargets, postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
+  dispatchTargetsOf,
+  noChangesCommentOf,
   nudgedGatesOf,
   quietVerdictsOf,
   verdictChecksOf,
@@ -182,7 +185,7 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   const app = appTokenStep(ctx, appScope(node, quiet ? { ...permissions, checks: "write" } : permissions));
   // …and nudges the gate with the job's own token, which may start a workflow by
   // dispatch (and needs no new App permission).
-  if (quiet && nudgedGatesOf(ctx.nodes ?? [], ctx.config).length) permissions.actions = "write";
+  if (postDispatchTargets(ctx).length) permissions.actions = "write";
   if (app) steps.push(app);
 
   // Checkout FIRST: in vendored mode the wait-for-checks gate below is a LOCAL
@@ -415,6 +418,11 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
       // fuller body — this fires only as a safety net if it didn't.
       "pr-title": "${{ github.event.issue.title }}",
       "pr-body": `### 🛠️ Auto-created (fallback)\n\nThe agent finished but didn't open a PR itself, so one was created automatically. See the commits and the linked issue for context.\n\nCloses #${ISSUE_NUMBER}`,
+      // no_changes_comment=: a run that committed nothing says so, rather than
+      // leaving the issue without a trace.
+      ...(noChangesCommentOf(node)
+        ? { "no-changes-comment": noChangesCommentOf(node)!.body, "comment-target": noChangesCommentOf(node)!.target }
+        : {}),
     },
   });
 
@@ -477,13 +485,20 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
         `  ] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')`,
         `[ -n "$COUNT" ] || COUNT=0`,
         `echo "attempts so far: $COUNT / $MAX"`,
+        `# The label and the comments are the visible record, not the control flow:`,
+        `# a failure to write one (a token without the scope, a transient API error)`,
+        `# is a warning, and the decision — stop, or run the attempt — still stands.`,
         `if [ "$COUNT" -gt "$MAX" ]; then`,
-        `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}'`,
-        `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s requested-changes rounds) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")"`,
         `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
+        `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null \\`,
+        `    || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}' >/dev/null \\`,
+        `    || echo "::warning::could not label #$PR '${needsHuman}' — the attempt budget is exhausted all the same"`,
+        `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s requested-changes rounds) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")" >/dev/null \\`,
+        `    || echo "::warning::could not post the exhaustion notice on #$PR"`,
         `else`,
-        `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null`,
         `  echo "exhausted=false" >> "$GITHUB_OUTPUT"`,
+        `  gh pr comment "$PR" --body "$(printf '%s attempt %s of %s' "$MARKER" "$COUNT" "$MAX")" >/dev/null \\`,
+        `    || echo "::warning::could not post the attempt marker on #$PR (attempt $COUNT/$MAX is counted all the same; the count comes from the reviews)"`,
         `fi`,
       ].join("\n"),
     }),
@@ -506,6 +521,16 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
       if: `${notExhausted} && !cancelled()`,
       env: { BRANCH: PR_HEAD_REF },
       run: [
+        `# An untracked scratch draft at the root (a PR body or reply written for`,
+        `# --body-file) is not part of the fix: drop it rather than commit it.`,
+        `while IFS= read -r f; do`,
+        `  case "$f" in`,
+        `    */*) ;;`,
+        `    ${SCRATCH_GLOBS.join("|")})`,
+        `      echo "::warning::'$f' looks like an agent's scratch file — not committing it"`,
+        `      rm -f -- "$f" ;;`,
+        `  esac`,
+        `done < <(git ls-files --others --exclude-standard)`,
         `# Commit anything the agent left uncommitted...`,
         `if [ -n "$(git status --porcelain)" ]; then`,
         `  git add -A`,
@@ -712,7 +737,10 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   const checkout = checkoutStep(ctx, { persistCredentials: false, ref: ctx.config.repo.base_branch });
   checkout.with = { ...checkout.with, token: "${{ github.token }}" };
   steps.push(checkout);
+  // dispatch= on the gate: wake these workflows for each PR whose result changed.
+  const targets = dispatchTargetsOf(node, ctx.nodes ?? []);
   steps.push({
+    ...(targets.length ? { id: "gate" } : {}),
     uses: ctx.actionRef("merge-gate"),
     name: merging ? "Evaluate merge gate (publish check, merge agent-written PRs)" : "Evaluate merge gate (publish check, never merge)",
     with: {
@@ -740,7 +768,7 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       // An event run evaluates the one PR it is about; a scheduled run (empty
       // here) is the bounded pass over every PR in scope.
       // A nudged gate (quiet verdicts in the graph) also takes the PR as a dispatch input.
-      "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).length
+      "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).some((g) => g.id === node.id)
         ? "${{ github.event.pull_request.number || inputs.pr }}"
         : "${{ github.event.pull_request.number }}",
       // The schedule's period: the pass's window moves once per period.
@@ -749,6 +777,47 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       "time-budget-seconds": String(Math.max(60, (timeoutOf(node, 10) - 2) * 60)),
     },
   });
+  if (targets.length) {
+    steps.push(
+      runStep({
+        name: "Wake downstream workflows",
+        // After the gate published: each target hears of each PR whose result changed.
+        if: "${{ !cancelled() && steps.gate.outputs.published-prs != '' }}",
+        env: {
+          GH_TOKEN: "${{ github.token }}",
+          PRS: "${{ steps.gate.outputs.published-prs }}",
+          DISPATCH_TARGETS: targets.map((t) => `${t.workflow} ${t.withPr ? "pr" : "-"}`).join("\n"),
+          BASE_BRANCH: ctx.config.repo.base_branch,
+        },
+        run: [
+          `# dispatch=: start each target now rather than at its next scheduled run, with`,
+          `# the job's own GITHUB_TOKEN (workflow_dispatch is the one event it can start).`,
+          `# A "pr" target runs once per PR, with the PR as its \`pr\` input; any other once.`,
+          `# Best effort: a failed dispatch is a warning.`,
+          `ERR=$(mktemp)`,
+          `start() { # <workflow> [pr]`,
+          `  local ARGS=(-f ref="$BASE_BRANCH")`,
+          `  if [ -n "\${2:-}" ]; then ARGS+=(-f "inputs[pr]=$2"); fi`,
+          `  if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$1/dispatches" "\${ARGS[@]}" > /dev/null 2> "$ERR"; then`,
+          `    echo "started $1\${2:+ for #$2}"`,
+          `  else`,
+          `    echo "::warning::could not start $1\${2:+ for #$2} ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — its own schedule will run it"`,
+          `  fi`,
+          `}`,
+          `while read -r WF WITH; do`,
+          `  [ -n "$WF" ] || continue`,
+          `  if [ "$WITH" = "pr" ]; then`,
+          `    for N in \${PRS//,/ }; do start "$WF" "$N"; done`,
+          `  else`,
+          `    start "$WF"`,
+          `  fi`,
+          `done <<< "$DISPATCH_TARGETS"`,
+        ].join("\n"),
+      }),
+    );
+  }
+  // read: to tell its own earlier runs from a CI job of the same name; write: to dispatch.
+  const actionsPerm = targets.length ? ("write" as const) : ("read" as const);
   return {
     jobId: node.id,
     name: node.id,
@@ -758,10 +827,10 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
     // `actions: read`: the job's own token reads which workflow a run named like
     // the gate's job belongs to (gate-workflow) — no App permission needed.
     permissions: app
-      ? { contents: "read", actions: "read" }
+      ? { contents: "read", actions: actionsPerm }
       : merging
-        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write", actions: "read" }
-        : { contents: "read", "pull-requests": "read", checks: "write", actions: "read", ...(rereview ? { issues: "write" as const } : {}) },
+        ? { contents: "write", "pull-requests": "write", issues: "write", checks: "write", actions: actionsPerm }
+        : { contents: "read", "pull-requests": "read", checks: "write", actions: actionsPerm, ...(rereview ? { issues: "write" as const } : {}) },
     timeoutMinutes: timeoutOf(node, 10),
     steps,
   };

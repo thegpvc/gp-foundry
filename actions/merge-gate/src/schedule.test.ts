@@ -886,3 +886,17 @@ describe("quiet_verdicts: a verdict delivered as a check run", () => {
     expect(w.prs.get(1)!.labels).toEqual([]);
   });
 });
+
+describe("published-prs: the PRs whose result a run changed (what dispatch= wakes targets for)", () => {
+  it("lists a PR when its result is published or changes, not when it stands", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    w.add({ number: 2, reviewed: true }); // no verdict: no result
+    const first = await tick(w);
+    expect(first.publishedPrs).toEqual([1]);
+    const again = await tick(w);
+    expect(again.publishedPrs).toEqual([]);
+    w.prs.get(1)!.verdict = "REQUEST_CHANGES";
+    expect((await tick(w, { prNumber: 1 })).publishedPrs).toEqual([1]);
+  });
+});

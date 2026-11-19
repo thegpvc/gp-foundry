@@ -270,7 +270,7 @@ jobs:
           VERDICT_CHECK: gp-foundry/verdict (approver)
           BOT_APP: agent-app
           MINTED_APP: ${{ steps.app-token.outputs.app-slug }}
-          GATE_WORKFLOWS: gate.yml
+          QUIET_GATES: gate.yml pr
           DISPATCH_TOKEN: ${{ github.token }}
           BASE_BRANCH: main
         run: |
@@ -440,6 +440,22 @@ jobs:
             URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
             if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
           }
+          # dispatch=: wake each target workflow now, rather than at its next scheduled
+          # run. One "<workflow file> <pr|->" per line; pr passes this PR as the `pr`
+          # input. Best effort: the target's own schedule still runs it.
+          dispatch_to() {
+            local WF WITH
+            while read -r WF WITH; do
+              [ -n "$WF" ] || continue
+              local ARGS=(-f ref="$BASE_BRANCH")
+              if [ "$WITH" = "pr" ]; then ARGS+=(-f "inputs[pr]=$PR"); fi
+              if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" "${ARGS[@]}" > /dev/null 2> "$ERR"; then
+                if [ "$WITH" = "pr" ]; then echo "started $WF for #$PR"; else echo "started $WF"; fi
+              else
+                echo "::warning::could not start $WF ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — its own schedule will run it"
+              fi
+            done <<< "$1"
+          }
           # Move inline findings into the body, as a list before the verdict line (on a
           # verdict lane) or at the end. $2 is a JSON array of the paths whose comments
           # stay inline, or null to move every one. Nothing to move leaves the review as it is.
@@ -484,17 +500,10 @@ jobs:
               echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
               URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
               if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \`$VERDICT_CHECK\` on $HEAD_SHA."; fi
-              # A check run starts no gate run (a review would, by its event): nudge each
-              # gate to evaluate this PR now. Best effort — the gate's scheduled pass
-              # reaches it anyway.
-              for WF in ${GATE_WORKFLOWS:-}; do
-                if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" \
-                    -f ref="$BASE_BRANCH" -f "inputs[pr]=$PR" > /dev/null 2> "$ERR"; then
-                  echo "asked $WF to evaluate #$PR now"
-                else
-                  echo "::warning::could not start $WF for #$PR ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — its scheduled pass will evaluate it"
-                fi
-              done
+              # A check run starts no gate run (a review would, by its event): nudge the
+              # gates to evaluate this PR now, and wake the dispatch= targets. Best effort.
+              dispatch_to "${QUIET_GATES:-}"
+              dispatch_to "${DISPATCH_TARGETS:-}"
               exit 0
             fi
             echo "::error::could not deliver the verdict as a check: $(why)"

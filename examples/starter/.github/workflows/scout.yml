@@ -27,7 +27,7 @@ jobs:
         uses: ./.github/agent-setup
       - name: Fetch context
         id: ctx
-        uses: thegpvc/gp-foundry/actions/agent-context@v0.5.1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.6.0
         with:
           type: issue
           number: ${{ github.event.issue.number }}
@@ -36,7 +36,7 @@ jobs:
           trusted-framing: baseline
       - name: Run agent
         timeout-minutes: 15
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.5.1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.6.0
         with:
           role-file: .github/agents/roles/scout.md
           model: claude-opus-4-8

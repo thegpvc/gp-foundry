@@ -233,3 +233,92 @@ describe("allowed-paths (a lane whose remit is narrow)", () => {
     expect(read("anywhere/file.md")).toBe("fine\n");
   });
 });
+
+describe("scratch-paths: an agent's --body-file drafts are not committed (#3)", () => {
+  /** The shipped default list. */
+  const defaults = (): string => {
+    const doc = yaml.load(readFileSync(ACTION_YML, "utf8")) as { inputs: Record<string, { default?: string }> };
+    return doc.inputs["scratch-paths"]!.default!;
+  };
+  const runWithScratch = (scratchPaths: string) => {
+    const script = join(scratch, "strip.sh");
+    writeFileSync(script, `set -e\n${stripScript()}`);
+    execFileSync("bash", [script], {
+      cwd: repo,
+      encoding: "utf8",
+      env: { ...process.env, BASE_BRANCH: "main", IMMUTABLE_PATHS: ".github/workflows/", SCRATCH_PATHS: scratchPaths },
+    });
+  };
+
+  it("drops drafts left in the worktree and drafts the agent committed, keeping its real work", () => {
+    write(".pr-body.md", "## Summary\n");
+    write("src/app.ts", "export const version = 2;\n");
+    write("issue-comment.md", "Done.\n");
+    git(["add", "src/app.ts", "issue-comment.md"]);
+    git(["commit", "-qm", "agent: feature (and a stray draft)"]);
+
+    runWithScratch(defaults());
+
+    expect(existsSync(join(repo, ".pr-body.md"))).toBe(false);
+    expect(existsSync(join(repo, "issue-comment.md"))).toBe(false);
+    expect(git(["diff", "--name-only", "origin/main...HEAD"])).toBe("src/app.ts");
+  });
+
+  it("never touches a file of that name the base branch already has, or one below the root", () => {
+    git(["checkout", "-q", "main"]);
+    write("pr-body.md", "the repo's own template\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "base: a template"]);
+    git(["push", "-q", "origin", "main"]);
+    git(["checkout", "-qb", "agent/2-change"]);
+    write("pr-body.md", "edited by the agent on purpose\n");
+    write("docs/pr-body.md", "documentation\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: real changes"]);
+
+    runWithScratch(defaults());
+
+    expect(read("pr-body.md")).toBe("edited by the agent on purpose\n");
+    expect(read("docs/pr-body.md")).toBe("documentation\n");
+  });
+
+  it("keeps a new directory whose name happens to match (`*` would cross `/`)", () => {
+    write("pr-description-generator/index.ts", "export {};\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: a new package"]);
+
+    runWithScratch(defaults());
+
+    expect(read("pr-description-generator/index.ts")).toBe("export {};\n");
+  });
+
+  it("commits the removal on top of a tip the agent already pushed, so the push stays a fast-forward", () => {
+    write(".pr-body.md", "## Summary\n");
+    write("src/app.ts", "export const version = 2;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: feature + draft"]);
+    git(["push", "-q", "origin", "agent/1-change"]);
+    const pushed = git(["rev-parse", "HEAD"]);
+
+    runWithScratch(defaults());
+
+    expect(existsSync(join(repo, ".pr-body.md"))).toBe(false);
+    expect(git(["rev-parse", "HEAD~1"])).toBe(pushed);
+    expect(git(["diff", "--name-only", "origin/main...HEAD"])).toBe("src/app.ts");
+    git(["push", "-q", "origin", "agent/1-change"]); // non-forced: would throw if rewritten
+  });
+
+  it("is off when empty", () => {
+    write(".pr-body.md", "## Summary\n");
+    runWithScratch("");
+    expect(existsSync(join(repo, ".pr-body.md"))).toBe(true);
+  });
+});
+
+describe("scratch-paths default", () => {
+  it("is the compiler's SCRATCH_GLOBS (the Fixer's list)", async () => {
+    const { SCRATCH_GLOBS } = await import("../../src/shared/scratch.js");
+    const doc = yaml.load(readFileSync(ACTION_YML, "utf8")) as { inputs: Record<string, { default?: string }> };
+    expect(doc.inputs["scratch-paths"]!.default!.trim().split("\n")).toEqual([...SCRATCH_GLOBS]);
+  });
+});

@@ -168,6 +168,7 @@ runs:
         #   1. role-file            (required — who the agent is)
         #   2. prompt-override-file (optional — the task instructions)
         #   3. conventions          (optional — repo guardrails from config)
+        #      + the communication guide, and where working files go
         #   4. scope-path           (optional — path/boundary config)
         #   5. context-file         (optional — the runtime payload)
         #   6. output-contract      (optional — how to hand back the result)
@@ -205,6 +206,13 @@ runs:
         elif [ -n "$COMMS_FILE" ]; then
           echo "::warning::comms-file '$COMMS_FILE' not found — agents will lack the communication guide"
         fi
+
+        # 3c. where working files go. Agents draft long bodies (`gh pr create
+        #     --body-file`, comment drafts) as files, and anything left in the
+        #     working tree is committed with the change — so name a place outside it.
+        SCRATCH="${RUNNER_TEMP:-/tmp}/agent-scratch"
+        printf '## Working files\n\n' >> "$PROMPT_FILE"
+        printf 'Draft working files (a PR body or a comment for `--body-file`, notes, scratch output) in `%s` (also `$AGENT_SCRATCH`), never in the repository: anything left in the working tree is committed with your change.\n\n' "$SCRATCH" >> "$PROMPT_FILE"
 
         # 4. scope
         if [ -n "$SCOPE_PATH" ] && [ -f "$SCOPE_PATH" ]; then
@@ -250,6 +258,11 @@ runs:
         STEP_SUMMARY_HEADING: ${{ inputs.step-summary-heading }}
       run: |
         set -uo pipefail
+
+        # The working-files directory the prompt names (step "Assemble prompt"),
+        # outside the repository, and writable by the agent (--add-dir below).
+        export AGENT_SCRATCH="${RUNNER_TEMP:-/tmp}/agent-scratch"
+        mkdir -p "$AGENT_SCRATCH"
 
         # Exactly one credential. Which one the CLI prefers when it sees both is
         # its business, not something a billing decision should rest on — so two
@@ -400,6 +413,7 @@ runs:
             claude -p \
               --model "$MODEL" \
               --allowedTools "$ALLOWED_TOOLS" \
+              --add-dir "$AGENT_SCRATCH" \
               ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
               $EXTRA_ARGS \
               < "$PROMPT_FILE" 2> "$STDERR_LOG"

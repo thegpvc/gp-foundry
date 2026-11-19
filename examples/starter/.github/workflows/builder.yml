@@ -48,7 +48,7 @@ jobs:
         uses: ./.github/agent-setup
       - name: Fetch context
         id: ctx
-        uses: thegpvc/gp-foundry/actions/agent-context@v0.5.1
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.6.0
         with:
           type: issue
           number: ${{ github.event.issue.number }}
@@ -56,7 +56,7 @@ jobs:
           trusted-authors: agent-bot
       - name: Run agent
         timeout-minutes: 25
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.5.1
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.6.0
         with:
           role-file: .github/agents/roles/builder.md
           model: claude-opus-4-8
@@ -67,7 +67,7 @@ jobs:
           context-file: ${{ steps.ctx.outputs.context-file }}
       - name: "Fallback: commit / push / PR"
         if: ${{ !cancelled() }}
-        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.5.1
+        uses: thegpvc/gp-foundry/actions/agent-fallback@v0.6.0
         with:
           branch: ${{ steps.branch.outputs.branch }}
           token: ${{ secrets.AGENT_PAT }}

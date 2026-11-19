@@ -250,6 +250,12 @@ review's event does, so the lane's post step dispatches the gate with the PR as 
 input (`pr-number` falls back to it). The scheduled pass covers a failed dispatch when the PR
 carries a bot review for its `reviewed-by:` search (a quiet lane with `requires_review=true`).
 
+**Waking your own workflows** (`dispatch=` on the gate). A workflow that acts on the gate's
+result — submitting a formal approval once the check passes, say — cannot rely on
+`workflow_run`: gate runs started by a dispatch raise none. With `dispatch="my-flow.yml"` on
+the gate, a final step starts that workflow, with the PR as its `pr` input, for every PR whose
+result the run published or changed (the action's `published-prs` output).
+
 **Reading a verdict yourself** (a formal-approval publisher, a dashboard). The latest
 verdict on a head is the newest of:
 
