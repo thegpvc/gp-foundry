@@ -15,6 +15,7 @@ import type {
 import type { GateSpec } from "./attrs.js";
 import { parseVerdictWords } from "../shared/verdicts.js";
 import { parseRollout } from "../shared/scope.js";
+import { SCRATCH_GLOBS } from "../shared/scratch.js";
 import type { MergeSetting } from "./attrs.js";
 import { postDispatchTargets, postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
@@ -491,7 +492,7 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
         `  echo "exhausted=true" >> "$GITHUB_OUTPUT"`,
         `  gh pr edit "$PR" --add-label "${needsHuman}" 2>/dev/null \\`,
         `    || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=${needsHuman}' >/dev/null \\`,
-        `    || echo "::warning::could not label #$PR \`${needsHuman}\` — the attempt budget is exhausted all the same"`,
+        `    || echo "::warning::could not label #$PR '${needsHuman}' — the attempt budget is exhausted all the same"`,
         `  gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (${node.id})\\n\\nExhausted (%s/%s requested-changes rounds) — labeling \`${needsHuman}\` and stopping. A human should take this over.\\n\\n%s' "$COUNT" "$MAX" "$MARKER")" >/dev/null \\`,
         `    || echo "::warning::could not post the exhaustion notice on #$PR"`,
         `else`,
@@ -520,6 +521,16 @@ function emitPrFix(ctxIn: EmitContext): WorkflowJobFragment {
       if: `${notExhausted} && !cancelled()`,
       env: { BRANCH: PR_HEAD_REF },
       run: [
+        `# An untracked scratch draft at the root (a PR body or reply written for`,
+        `# --body-file) is not part of the fix: drop it rather than commit it.`,
+        `while IFS= read -r f; do`,
+        `  case "$f" in`,
+        `    */*) ;;`,
+        `    ${SCRATCH_GLOBS.join("|")})`,
+        `      echo "::warning::'$f' looks like an agent's scratch file — not committing it"`,
+        `      rm -f -- "$f" ;;`,
+        `  esac`,
+        `done < <(git ls-files --others --exclude-standard)`,
         `# Commit anything the agent left uncommitted...`,
         `if [ -n "$(git status --porcelain)" ]; then`,
         `  git add -A`,

@@ -406,7 +406,7 @@ export function noChangesCommentOf(node: HarnessNode): { body: string; target: "
   if (raw === undefined || raw === false || raw === "false" || raw === "") return undefined;
   const body =
     raw === true || raw === "true"
-      ? `### 🛠️ ${node.id}: no changes\n\nThe \`${node.id}\` run ended without committing anything, so no branch or pull request was opened. Run: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}`
+      ? `### 🛠️ ${node.id}: no changes\n\nThe \`${node.id}\` run ended without committing anything, so no branch or pull request was opened — either there was nothing to change, or the run stopped early (its log says which). Run: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}`
       : String(raw);
   return { body, target: node.attrs.comment_target === "pr" ? "pr" : "issue" };
 }

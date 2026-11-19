@@ -282,9 +282,43 @@ describe("scratch-paths: an agent's --body-file drafts are not committed (#3)", 
     expect(read("docs/pr-body.md")).toBe("documentation\n");
   });
 
+  it("keeps a new directory whose name happens to match (`*` would cross `/`)", () => {
+    write("pr-description-generator/index.ts", "export {};\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: a new package"]);
+
+    runWithScratch(defaults());
+
+    expect(read("pr-description-generator/index.ts")).toBe("export {};\n");
+  });
+
+  it("commits the removal on top of a tip the agent already pushed, so the push stays a fast-forward", () => {
+    write(".pr-body.md", "## Summary\n");
+    write("src/app.ts", "export const version = 2;\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "agent: feature + draft"]);
+    git(["push", "-q", "origin", "agent/1-change"]);
+    const pushed = git(["rev-parse", "HEAD"]);
+
+    runWithScratch(defaults());
+
+    expect(existsSync(join(repo, ".pr-body.md"))).toBe(false);
+    expect(git(["rev-parse", "HEAD~1"])).toBe(pushed);
+    expect(git(["diff", "--name-only", "origin/main...HEAD"])).toBe("src/app.ts");
+    git(["push", "-q", "origin", "agent/1-change"]); // non-forced: would throw if rewritten
+  });
+
   it("is off when empty", () => {
     write(".pr-body.md", "## Summary\n");
     runWithScratch("");
     expect(existsSync(join(repo, ".pr-body.md"))).toBe(true);
+  });
+});
+
+describe("scratch-paths default", () => {
+  it("is the compiler's SCRATCH_GLOBS (the Fixer's list)", async () => {
+    const { SCRATCH_GLOBS } = await import("../../src/shared/scratch.js");
+    const doc = yaml.load(readFileSync(ACTION_YML, "utf8")) as { inputs: Record<string, { default?: string }> };
+    expect(doc.inputs["scratch-paths"]!.default!.trim().split("\n")).toEqual([...SCRATCH_GLOBS]);
   });
 });

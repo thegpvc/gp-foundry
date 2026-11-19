@@ -79,3 +79,41 @@ describe("the fixer's attempt budget survives a failed marker comment (#4)", () 
     expect(r.stdout).toContain("could not post the exhaustion notice");
   });
 });
+
+describe("the Fixer drops an untracked scratch draft instead of committing it (#3)", () => {
+  it("removes root drafts, keeps real work and a matching name below the root", () => {
+    const g = parseDot(DOT);
+    const config = { ...loadConfig(undefined), identity: { bot_login: "agent-bot[bot]" } } as FoundryConfig;
+    const { files } = compile({ name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" });
+    const wf = yaml.load(files.find((f) => f.path.endsWith("/fixer.yml"))!.contents) as any;
+    const step = wf.jobs.fixer.steps.find((s: any) => s.name === "Commit and push fixes");
+
+    const dir = mkdtempSync(join(tmpdir(), "gpf-fixer-scratch-"));
+    const origin = join(dir, "origin.git");
+    const repo = join(dir, "work");
+    const git = (...a: string[]) => execFileSync("git", a, { cwd: repo, encoding: "utf8" }).trim();
+    execFileSync("git", ["init", "-q", "--bare", "-b", "fix-branch", origin]);
+    execFileSync("git", ["clone", "-q", origin, repo], { stdio: "ignore" });
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "T");
+    writeFileSync(join(repo, "app.ts"), "1\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    git("push", "-q", "origin", "HEAD:fix-branch");
+
+    writeFileSync(join(repo, "app.ts"), "2\n");
+    writeFileSync(join(repo, ".review-body.md"), "reply\n");
+    writeFileSync(join(repo, "pr-body.md"), "body\n");
+    mkdirSync(join(repo, "docs"));
+    writeFileSync(join(repo, "docs", "pr-body.md"), "real doc\n");
+
+    const out = execFileSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", step.run], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME ?? dir, BRANCH: "fix-branch" },
+      encoding: "utf8",
+    });
+    expect(out).toContain("'pr-body.md' looks like an agent's scratch file");
+    expect(git("show", "--name-only", "--format=", "HEAD").split("\n").sort()).toEqual(["app.ts", "docs/pr-body.md"]);
+    expect(git("status", "--porcelain")).toBe("");
+  });
+});

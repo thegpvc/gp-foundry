@@ -122,7 +122,7 @@ jobs:
             echo "exhausted=true" >> "$GITHUB_OUTPUT"
             gh pr edit "$PR" --add-label "needs-human" 2>/dev/null \
               || gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f 'labels[]=needs-human' >/dev/null \
-              || echo "::warning::could not label #$PR `needs-human` — the attempt budget is exhausted all the same"
+              || echo "::warning::could not label #$PR 'needs-human' — the attempt budget is exhausted all the same"
             gh pr comment "$PR" --body "$(printf '## ⛔ Attempt budget (fixer)\n\nExhausted (%s/%s requested-changes rounds) — labeling `needs-human` and stopping. A human should take this over.\n\n%s' "$COUNT" "$MAX" "$MARKER")" >/dev/null \
               || echo "::warning::could not post the exhaustion notice on #$PR"
           else
@@ -161,6 +161,16 @@ jobs:
         env:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |-
+          # An untracked scratch draft at the root (a PR body or reply written for
+          # --body-file) is not part of the fix: drop it rather than commit it.
+          while IFS= read -r f; do
+            case "$f" in
+              */*) ;;
+              .pr-body*|pr-body*|.pr_body*|pr_body*|PR_BODY*|.pr-description*|pr-description*|.issue-comment*|issue-comment*|.comment-body*|.review-body*)
+                echo "::warning::'$f' looks like an agent's scratch file — not committing it"
+                rm -f -- "$f" ;;
+            esac
+          done < <(git ls-files --others --exclude-standard)
           # Commit anything the agent left uncommitted...
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
