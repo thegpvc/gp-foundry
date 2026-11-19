@@ -197,6 +197,11 @@ inputs:
     default: "false"
 
 outputs:
+  published-prs:
+    description: >
+      With `merge`: comma-separated numbers of the PRs whose result this run
+      published or changed (empty when none) — what a dispatch= on the gate
+      wakes its targets for.
   action:
     description: "Decision: merge | skip | label."
   code:

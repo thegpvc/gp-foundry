@@ -24,7 +24,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
-  "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target",
+  "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target", "dispatch",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -481,11 +481,75 @@ export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { che
  * The single gates (merge=) a quiet verdict nudges. A verdict review starts the
  * gate through its pull_request_review event; a check run created by the App
  * starts nothing, so the post step dispatches each of these for the PR instead.
- * Empty when the graph has no quiet verdicts — and then nothing about the gates changes.
+ * Empty when the graph has no quiet verdicts.
  */
-export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
+export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   if (!verdictChecksOf(nodes, cfg)) return [];
   return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined);
+}
+
+/**
+ * The single gates that take a PR as a dispatch input (`pr`): those a quiet
+ * verdict nudges, and those named by some node's dispatch=. Empty: nothing about
+ * the gates changes.
+ */
+export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
+  const named = new Set(nodes.flatMap((n) => dispatchRaw(n)));
+  const quiet = new Set(quietNudgedGatesOf(nodes, cfg).map((g) => g.id));
+  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id)));
+}
+
+// ── dispatch= ────────────────────────────────────────────────────────────────
+
+/**
+ * `dispatch="approver, formal-approval.yml"`: wake other workflows the moment
+ * this node has delivered, instead of leaving them to their cron. On a lane with
+ * post="review", after the review is posted (or the quiet verdict delivered); on
+ * a single gate (merge=), after it publishes a changed result, once per PR.
+ *
+ * A target is a node id or a workflow file:
+ *   - a sweep (select="sweep") or scheduled node: dispatched with no inputs — it
+ *     makes its own pass, which picks up whatever is now eligible;
+ *   - a single gate: dispatched with the PR (`pr`), evaluating just that PR;
+ *   - `<file>.yml` (a workflow of the repo's own): dispatched with the PR as its
+ *     `pr` input, which that workflow must declare under workflow_dispatch.
+ *
+ * Dispatched with the job's own GITHUB_TOKEN (`actions: write`): workflow_dispatch
+ * is the one event that token can start. Best effort — a failed dispatch is a
+ * warning; the target's own schedule still covers it.
+ */
+export function dispatchRaw(node: HarnessNode): string[] {
+  const raw = node.attrs.dispatch;
+  if (raw === undefined || raw === null || raw === "") return [];
+  return String(raw).split(",").map((t) => t.trim()).filter(Boolean);
+}
+
+export const WORKFLOW_FILE_RE = /^[A-Za-z0-9_.-]+\.ya?ml$/;
+
+/** Can this node be woken by dispatch, and does it take the PR? Undefined: not a target. */
+export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "pr" | undefined {
+  if (!target) return undefined;
+  if (target.type === "merge-gate" && mergeSettingOf(target) !== undefined) return "pr";
+  if (target.attrs.schedule !== undefined) return "pass";
+  return undefined;
+}
+
+/**
+ * The workflows a node dispatches, as `<file> <pr|->` lines for the shell (pr:
+ * pass the PR number as the `pr` input). Unresolvable targets are dropped here;
+ * validate() reports them.
+ */
+export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean }[] {
+  const out: { workflow: string; withPr: boolean }[] = [];
+  for (const t of dispatchRaw(node)) {
+    if (WORKFLOW_FILE_RE.test(t)) {
+      out.push({ workflow: t, withPr: true });
+      continue;
+    }
+    const kind = dispatchTargetKind(nodes.find((n) => n.id === t));
+    if (kind) out.push({ workflow: `${t}.yml`, withPr: kind === "pr" });
+  }
+  return out;
 }
 
 /** Default heading the post step puts on line 1 of the review: placeholders `<n>` and `<sha>`. */

@@ -21,6 +21,10 @@ import {
   publishesCheck,
   isSweep,
   quietVerdictsRaw,
+  dispatchRaw,
+  mergeSettingOf,
+  dispatchTargetKind,
+  WORKFLOW_FILE_RE,
   verdictCheckName,
   sweepRequiresReview,
   botAppSlug,
@@ -638,6 +642,41 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           parsePostMarker(n);
         } catch (e) {
           diags.push({ level: "error", code: "node.bad-post-marker", message: (e as Error).message, where: { node: n.id, line: n.line } });
+        }
+      }
+    }
+    if (n.attrs.dispatch !== undefined) {
+      const at = { node: n.id, line: n.line };
+      if (!(postsReview(n) || (n.type === "merge-gate" && mergeSettingOf(n) !== undefined))) {
+        diags.push({
+          level: "error",
+          code: "node.dispatch-unsupported",
+          message: `dispatch= on '${n.id}': only a lane with post="review" (after it posts) or a single gate (merge=, after it publishes) dispatches`,
+          where: at,
+        });
+      } else if (!dispatchRaw(n).length) {
+        diags.push({ level: "error", code: "node.bad-dispatch", message: `dispatch= on '${n.id}' names no target`, where: at });
+      } else {
+        for (const t of dispatchRaw(n)) {
+          if (WORKFLOW_FILE_RE.test(t)) continue;
+          const target = ir.nodes.find((m) => m.id === t);
+          if (t === n.id) {
+            diags.push({ level: "error", code: "node.bad-dispatch", message: `dispatch= on '${n.id}' names itself`, where: at });
+          } else if (!target) {
+            diags.push({
+              level: "error",
+              code: "node.bad-dispatch",
+              message: `dispatch= on '${n.id}': '${t}' is neither a node nor a workflow file (\`<name>.yml\`)`,
+              where: at,
+            });
+          } else if (!dispatchTargetKind(target)) {
+            diags.push({
+              level: "error",
+              code: "node.bad-dispatch",
+              message: `dispatch= on '${n.id}': '${t}' cannot be started by dispatch — name a sweep or scheduled node, a single gate, or a workflow file`,
+              where: at,
+            });
+          }
         }
       }
     }

@@ -132,6 +132,7 @@ jobs:
       contents: read
       pull-requests: write
       checks: read
+      actions: write
     timeout-minutes: 25
     needs:
       - reviewer_guard
@@ -241,6 +242,9 @@ jobs:
             **Verdict:** REQUEST_CHANGES
             **Verdict:** ESCALATE
           REREVIEW_LABEL: re-review
+          DISPATCH_TARGETS: approver.yml -
+          DISPATCH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: main
         run: |
           set -euo pipefail
           # post="review": the agent printed its review; this step posts it with the lane's
@@ -399,6 +403,22 @@ jobs:
             URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
             if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
           }
+          # dispatch=: wake each target workflow now, rather than at its next scheduled
+          # run. One "<workflow file> <pr|->" per line; pr passes this PR as the `pr`
+          # input. Best effort: the target's own schedule still runs it.
+          dispatch_to() {
+            local WF WITH
+            while read -r WF WITH; do
+              [ -n "$WF" ] || continue
+              local ARGS=(-f ref="$BASE_BRANCH")
+              if [ "$WITH" = "pr" ]; then ARGS+=(-f "inputs[pr]=$PR"); fi
+              if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" "${ARGS[@]}" > /dev/null 2> "$ERR"; then
+                if [ "$WITH" = "pr" ]; then echo "started $WF for #$PR"; else echo "started $WF"; fi
+              else
+                echo "::warning::could not start $WF ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — its own schedule will run it"
+              fi
+            done <<< "$1"
+          }
           # Move inline findings into the body, as a list before the verdict line (on a
           # verdict lane) or at the end. $2 is a JSON array of the paths whose comments
           # stay inline, or null to move every one. Nothing to move leaves the review as it is.
@@ -435,6 +455,7 @@ jobs:
           if post "$PAYLOAD.post"; then
             echo "posted the review on $HEAD_SHA"
             posted_note
+            dispatch_to "$DISPATCH_TARGETS"
             exit 0
           fi
 
@@ -452,6 +473,7 @@ jobs:
             if post "$PAYLOAD.flat"; then
               echo "posted the review on $HEAD_SHA, with its inline findings in the body"
               posted_note
+              dispatch_to "$DISPATCH_TARGETS"
               exit 0
             fi
           fi

@@ -34,7 +34,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'agent-app[bot]'))
     permissions:
       contents: read
-      actions: read
+      actions: write
     timeout-minutes: 10
     steps:
       - name: Mint app token
@@ -50,6 +50,7 @@ jobs:
           ref: main
           persist-credentials: false
       - name: Evaluate merge gate (publish check, merge agent-written PRs)
+        id: gate
         uses: thegpvc/gp-foundry/actions/merge-gate@fixture-ref
         with:
           merge: agent-only
@@ -68,3 +69,34 @@ jobs:
           pr-number: ${{ github.event.pull_request.number || inputs.pr }}
           rotation-period-seconds: "600"
           time-budget-seconds: "480"
+      - name: Wake downstream workflows
+        if: ${{ !cancelled() && steps.gate.outputs.published-prs != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ steps.gate.outputs.published-prs }}
+          DISPATCH_TARGETS: formal-approval.yml pr
+          BASE_BRANCH: main
+        run: |-
+          # dispatch=: start each target now rather than at its next scheduled run, with
+          # the job's own GITHUB_TOKEN (workflow_dispatch is the one event it can start).
+          # A "pr" target runs once per PR, with the PR as its `pr` input; any other once.
+          # Best effort: a failed dispatch is a warning.
+          ERR=$(mktemp)
+          start() { # <workflow> [pr]
+            local ARGS=(-f ref="$BASE_BRANCH")
+            if [ -n "${2:-}" ]; then ARGS+=(-f "inputs[pr]=$2"); fi
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$1/dispatches" "${ARGS[@]}" > /dev/null 2> "$ERR"; then
+              echo "started $1${2:+ for #$2}"
+            else
+              echo "::warning::could not start $1${2:+ for #$2} ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — its own schedule will run it"
+            fi
+          }
+          while read -r WF WITH; do
+            [ -n "$WF" ] || continue
+            if [ "$WITH" = "pr" ]; then
+              for N in ${PRS//,/ }; do start "$WF" "$N"; done
+            else
+              start "$WF"
+            fi
+          done <<< "$DISPATCH_TARGETS"

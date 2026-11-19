@@ -1,5 +1,6 @@
-# The verdict-lanes fixture with quiet_verdicts="APPROVE" on the approver: a snapshot
-# of the on-mode output, linted by CI (actionlint) like the examples.
+# The verdict-lanes fixture with its options on — quiet_verdicts="APPROVE" on the
+# approver, dispatch= on the reviewer and the gate: a snapshot of the on-mode
+# output, linted by CI (actionlint) like the examples.
 name: verdict-lanes-quiet
 identity:
   app_id_secret: AGENT_APP_ID

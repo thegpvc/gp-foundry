@@ -6,7 +6,7 @@
  * workflow and the tests run the same text.
  */
 import type { EmitContext, StepSpec } from "../ir/types.js";
-import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, nudgedGatesOf, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
+import { IS_VERDICT_JQ, POSTED_MARKER_PREFIX, dispatchTargetsOf, isSweep, postsReview, quietNudgedGatesOf, quietVerdictsOf, rereviewLabelOf, parsePostMarker, DEFAULT_POST_MARKER, verdictLinesOf } from "./attrs.js";
 import { runStep, tokenExpr } from "./steps.js";
 import { LABEL_EVENTS_JQ } from "../shared/rereview.js";
 import { QUIET_CHECK_JQ, QUIET_TITLE_PREFIX, VERDICT_PREFIX } from "../shared/verdicts.js";
@@ -170,6 +170,7 @@ posted_note() {
   URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
   if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
 }
+__DISPATCH_FN__
 # Move inline findings into the body, as a list before the verdict line (on a
 # verdict lane) or at the end. $2 is a JSON array of the paths whose comments
 # stay inline, or null to move every one. Nothing to move leaves the review as it is.
@@ -207,6 +208,7 @@ fi
 if post "$PAYLOAD.post"; then
   echo "posted the review on $HEAD_SHA"
   posted_note
+  __DISPATCH_CALL__
   exit 0
 fi
 
@@ -224,6 +226,7 @@ if grep -qs "HTTP 422" "$ERR" "$RESP" && [ "$(jq '.comments | length' "$PAYLOAD.
   if post "$PAYLOAD.flat"; then
     echo "posted the review on $HEAD_SHA, with its inline findings in the body"
     posted_note
+    __DISPATCH_CALL__
     exit 0
   fi
 fi
@@ -284,17 +287,7 @@ if [ -n "$QUIET_OK" ]; then
     echo "delivered the verdict on $HEAD_SHA as the check '$VERDICT_CHECK'"
     URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
     if [ -n "$URL" ]; then note "**Verdict delivered as a check:** $URL"; else note "**Verdict delivered** as the check \\\`$VERDICT_CHECK\\\` on $HEAD_SHA."; fi
-    # A check run starts no gate run (a review would, by its event): nudge each
-    # gate to evaluate this PR now. Best effort — the gate's scheduled pass
-    # reaches it anyway.
-    for WF in \${GATE_WORKFLOWS:-}; do
-      if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" \\
-          -f ref="$BASE_BRANCH" -f "inputs[pr]=$PR" > /dev/null 2> "$ERR"; then
-        echo "asked $WF to evaluate #$PR now"
-      else
-        echo "::warning::could not start $WF for #$PR ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — its scheduled pass will evaluate it"
-      fi
-    done
+    __QUIET_DISPATCH__
     exit 0
   fi
   echo "::error::could not deliver the verdict as a check: $(why)"
@@ -303,13 +296,55 @@ if [ -n "$QUIET_OK" ]; then
 fi
 `;
 
+/**
+ * dispatch= (and the quiet verdict's gate nudge): start each target workflow now
+ * rather than at its next scheduled run, with the job's own GITHUB_TOKEN — the one
+ * token whose workflow_dispatch starts a run. Best effort: a failed dispatch is a
+ * warning; the target's own schedule still runs it.
+ */
+const DISPATCH_FN = `# dispatch=: wake each target workflow now, rather than at its next scheduled
+# run. One "<workflow file> <pr|->" per line; pr passes this PR as the \`pr\`
+# input. Best effort: the target's own schedule still runs it.
+dispatch_to() {
+  local WF WITH
+  while read -r WF WITH; do
+    [ -n "$WF" ] || continue
+    local ARGS=(-f ref="$BASE_BRANCH")
+    if [ "$WITH" = "pr" ]; then ARGS+=(-f "inputs[pr]=$PR"); fi
+    if GH_TOKEN="$DISPATCH_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/dispatches" "\${ARGS[@]}" > /dev/null 2> "$ERR"; then
+      if [ "$WITH" = "pr" ]; then echo "started $WF for #$PR"; else echo "started $WF"; fi
+    else
+      echo "::warning::could not start $WF ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — its own schedule will run it"
+    fi
+  done <<< "$1"
+}
+`;
+
+/**
+ * The workflows a post step wakes after it delivers (dispatch=), and — for a
+ * quiet verdict only — the gates it nudges. Each as `<file> <pr|->` lines.
+ */
+export function postDispatchTargets(ctx: EmitContext): { targets: string[]; quietGates: string[] }["targets"] {
+  return postDispatch(ctx).all;
+}
+function postDispatch(ctx: EmitContext): { targets: string[]; quietGates: string[]; all: string[] } {
+  if (!postsReview(ctx.node)) return { targets: [], quietGates: [], all: [] };
+  const nodes = ctx.nodes ?? [];
+  const targets = dispatchTargetsOf(ctx.node, nodes).map((t) => `${t.workflow} ${t.withPr ? "pr" : "-"}`);
+  const quiet = isSweep(ctx.node) ? quietVerdictsOf(ctx.node, ctx.config) : undefined;
+  const named = new Set(targets.map((t) => t.split(" ")[0]));
+  const quietGates = quiet ? quietNudgedGatesOf(nodes, ctx.config).map((g) => `${g.id}.yml pr`).filter((t) => !named.has(t.split(" ")[0])) : [];
+  return { targets, quietGates, all: [...new Set([...targets, ...quietGates])] };
+}
+
 /** The post step: after run-agent (`id: agent`), only when the agent succeeded. */
 export function postReviewStep(
   ctx: EmitContext,
   opts: { prNumber: string; headSha: string; verdictLane: boolean },
 ): StepSpec {
   const quiet = opts.verdictLane ? quietVerdictsOf(ctx.node, ctx.config) : undefined;
-  const gates = quiet ? nudgedGatesOf(ctx.nodes ?? [], ctx.config) : [];
+  const dispatch = postDispatch(ctx);
+  const dispatching = dispatch.all.length > 0;
   let marker = DEFAULT_POST_MARKER;
   try {
     marker = parsePostMarker(ctx.node);
@@ -340,13 +375,25 @@ export function postReviewStep(
             ...(resolveAuth(ctx.config).mode === "app" ? { MINTED_APP: "${{ steps.app-token.outputs.app-slug }}" } : {}),
           }
         : {}),
-      ...(quiet && gates.length
-        ? { GATE_WORKFLOWS: gates.map((g) => `${g.id}.yml`).join(" "), DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: ctx.config.repo.base_branch }
-        : {}),
+      ...(dispatch.targets.length ? { DISPATCH_TARGETS: dispatch.targets.join("\n") } : {}),
+      ...(dispatch.quietGates.length ? { QUIET_GATES: dispatch.quietGates.join("\n") } : {}),
+      ...(dispatching ? { DISPATCH_TOKEN: "${{ github.token }}", BASE_BRANCH: ctx.config.repo.base_branch } : {}),
     },
     // Off, the quiet blocks vanish with their lines: the script is byte-identical.
     run: SCRIPT.replace("__QUIET_EXISTING__\n", () => (quiet ? QUIET_EXISTING : ""))
       .replace("__QUIET_POST__\n", () => (quiet ? QUIET_POST : ""))
+      .replace("__DISPATCH_FN__\n", () => (dispatching ? DISPATCH_FN : ""))
+      .replace(/^[ \t]*__QUIET_DISPATCH__\n/m, (line) =>
+        dispatching
+          ? [
+              `    # A check run starts no gate run (a review would, by its event): nudge the`,
+              `    # gates to evaluate this PR now, and wake the dispatch= targets. Best effort.`,
+              `    dispatch_to "\${QUIET_GATES:-}"`,
+              `    dispatch_to "\${DISPATCH_TARGETS:-}"`,
+              ``,
+            ].join("\n")
+          : "")
+      .replace(/^[ \t]*__DISPATCH_CALL__\n/gm, (line) => (dispatch.targets.length ? line.replace("__DISPATCH_CALL__", 'dispatch_to "$DISPATCH_TARGETS"') : ""))
       .replaceAll("__IS_QUIET_JQ__", () => IS_VERDICT_JQ.replace("env.VERDICT_LINES", "env.QUIET_LINES"))
       .replaceAll("__QUIET_CHECK_JQ__", () => QUIET_CHECK_JQ)
       .replaceAll("__QUIET_TITLE_PREFIX__", () => QUIET_TITLE_PREFIX)
