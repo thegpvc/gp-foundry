@@ -44,6 +44,9 @@ context a successor may want but a human scanning does not need up front>
 Reserve HTML comments `<!-- like this -->` for machine-only state markers (invisible even when
 expanded).
 
+Draft a long body (a PR description or a comment for `--body-file`) in `$AGENT_SCRATCH`, never
+in the repository: everything left in the working tree is committed with your change.
+
 ## Handoffs — write for the next agent, not just for humans
 
 Your note / plan / review is the **input** to the next role in your handoffs.

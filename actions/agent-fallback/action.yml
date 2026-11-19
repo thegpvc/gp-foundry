@@ -50,6 +50,25 @@ inputs:
   comment-target:
     description: "Where to post no-changes-comment: 'pr' or 'issue'."
     default: "pr"
+  scratch-paths:
+    description: >-
+      Newline-separated globs, matched from the repository root, of an agent's
+      scratch files (PR-body and comment drafts written for `--body-file`). A NEW
+      file matching one — absent from the base branch — is dropped before the
+      push, whether the agent committed it or not. A file the base branch already
+      has is never touched. Empty disables it.
+    default: |
+      .pr-body*
+      pr-body*
+      .pr_body*
+      pr_body*
+      PR_BODY*
+      .pr-description*
+      pr-description*
+      .issue-comment*
+      issue-comment*
+      .comment-body*
+      .review-body*
 
 runs:
   using: composite
@@ -99,6 +118,7 @@ runs:
         BASE_BRANCH: ${{ inputs.base-branch }}
         IMMUTABLE_PATHS: ${{ steps.immutable.outputs.paths }}
         ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+        SCRATCH_PATHS: ${{ inputs.scratch-paths }}
       run: |
         # Revert any changes to immutable paths — the restricted App token
         # typically lacks permission to push them (e.g. `workflows`), so the
@@ -166,6 +186,26 @@ runs:
               echo "::warning::Change to '$f' is outside this lane's allowed paths — reverting"
               restore_from_base "$f"
             fi
+          done <<< "$(changed_under '.')"
+        fi
+
+        # An agent's scratch files (a PR body drafted for --body-file, say) are not
+        # part of the change. Only NEW files: one the base branch has is the repo's.
+        if [ -n "$SCRATCH_PATHS" ]; then
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            git cat-file -e "${BASE_REF}:${f}" 2>/dev/null && continue
+            while IFS= read -r G; do
+              G="$(printf '%s' "$G" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              [ -z "$G" ] && continue
+              # shellcheck disable=SC2254 # G is a glob on purpose
+              case "$f" in
+                $G)
+                  echo "::warning::'$f' looks like an agent's scratch file — not committing it"
+                  restore_from_base "$f"
+                  break ;;
+              esac
+            done <<< "$SCRATCH_PATHS"
           done <<< "$(changed_under '.')"
         fi
 
