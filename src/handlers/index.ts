@@ -18,6 +18,7 @@ import { parseRollout } from "../shared/scope.js";
 import type { MergeSetting } from "./attrs.js";
 import { postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
+  noChangesCommentOf,
   nudgedGatesOf,
   quietVerdictsOf,
   verdictChecksOf,
@@ -415,6 +416,11 @@ function emitProducer(ctx: EmitContext): WorkflowJobFragment {
       // fuller body — this fires only as a safety net if it didn't.
       "pr-title": "${{ github.event.issue.title }}",
       "pr-body": `### 🛠️ Auto-created (fallback)\n\nThe agent finished but didn't open a PR itself, so one was created automatically. See the commits and the linked issue for context.\n\nCloses #${ISSUE_NUMBER}`,
+      // no_changes_comment=: a run that committed nothing says so, rather than
+      // leaving the issue without a trace.
+      ...(noChangesCommentOf(node)
+        ? { "no-changes-comment": noChangesCommentOf(node)!.body, "comment-target": noChangesCommentOf(node)!.target }
+        : {}),
     },
   });
 

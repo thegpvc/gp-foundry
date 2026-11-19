@@ -641,6 +641,21 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         }
       }
     }
+    if (n.attrs.no_changes_comment !== undefined || n.attrs.comment_target !== undefined) {
+      const at = { node: n.id, line: n.line };
+      if (n.type !== "producer") {
+        diags.push({
+          level: "error",
+          code: "node.no-changes-comment-unsupported",
+          message: `no_changes_comment= / comment_target= on '${n.id}' (type ${n.type}): only a producer lane posts a no-changes comment`,
+          where: at,
+        });
+      } else if (n.attrs.comment_target !== undefined && n.attrs.comment_target !== "issue" && n.attrs.comment_target !== "pr") {
+        diags.push({ level: "error", code: "node.bad-comment-target", message: `comment_target= on '${n.id}' must be 'issue' or 'pr'`, where: at });
+      } else if (n.attrs.no_changes_comment === undefined) {
+        diags.push({ level: "error", code: "node.comment-target-without-comment", message: `comment_target= on '${n.id}' needs no_changes_comment=`, where: at });
+      }
+    }
     if (n.attrs.quiet_verdicts !== undefined || n.attrs.verdict_check !== undefined) {
       const at = { node: n.id, line: n.line };
       const words = quietVerdictsRaw(n);

@@ -277,12 +277,17 @@ runs:
         ISSUE_NUMBER: ${{ inputs.issue-number }}
         BRANCH: ${{ steps.pushbranch.outputs.branch }}
       run: |
+        # A record of the outcome, not the outcome: a failed post is a warning.
         if [ "$COMMENT_TARGET" = "issue" ] && [ -n "$ISSUE_NUMBER" ]; then
-          gh issue comment "$ISSUE_NUMBER" --body "$COMMENT_BODY"
+          gh issue comment "$ISSUE_NUMBER" --body "$COMMENT_BODY" \
+            || echo "::warning::could not post the no-changes comment on #$ISSUE_NUMBER"
         elif [ "$COMMENT_TARGET" = "pr" ]; then
-          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')
+          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty' || true)
           if [ -n "$PR_NUM" ]; then
-            gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+            gh pr comment "$PR_NUM" --body "$COMMENT_BODY" \
+              || echo "::warning::could not post the no-changes comment on #$PR_NUM"
+          else
+            echo "::notice::no PR on $BRANCH to post the no-changes comment on (comment-target: pr)"
           fi
         fi
 

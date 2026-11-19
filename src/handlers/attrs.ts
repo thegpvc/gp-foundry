@@ -24,7 +24,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "schedule", "timeout", "environment", "paths", "commit", "secrets",
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
-  "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check",
+  "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -390,6 +390,25 @@ export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
  */
 export function postsReview(node: HarnessNode): boolean {
   return node.attrs.post === "review" && (node.type === "pr-review" || node.type === "analyst") && hasPrContext(node);
+}
+
+// ── no_changes_comment= ─────────────────────────────────────────────────────
+
+/**
+ * `no_changes_comment="…"` on a producer: when its run ends with nothing
+ * committed (no branch pushed, no PR), say so on the issue — otherwise a green
+ * run with an empty diff leaves no trace. `true` posts a default message naming
+ * the lane and linking the run. `comment_target=issue|pr` (default `issue`: on
+ * the zero-commit path there is no PR to find). Undefined: off.
+ */
+export function noChangesCommentOf(node: HarnessNode): { body: string; target: "issue" | "pr" } | undefined {
+  const raw = node.attrs.no_changes_comment;
+  if (raw === undefined || raw === false || raw === "false" || raw === "") return undefined;
+  const body =
+    raw === true || raw === "true"
+      ? `### 🛠️ ${node.id}: no changes\n\nThe \`${node.id}\` run ended without committing anything, so no branch or pull request was opened. Run: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}`
+      : String(raw);
+  return { body, target: node.attrs.comment_target === "pr" ? "pr" : "issue" };
 }
 
 // ── quiet_verdicts= ─────────────────────────────────────────────────────────
