@@ -658,7 +658,20 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         diags.push({ level: "error", code: "node.bad-dispatch", message: `dispatch= on '${n.id}' names no target`, where: at });
       } else {
         for (const t of dispatchRaw(n)) {
-          if (WORKFLOW_FILE_RE.test(t)) continue;
+          if (WORKFLOW_FILE_RE.test(t)) {
+            // One of the graph's own workflows: by file name it would skip the
+            // checks below and be sent a `pr` input it may not declare.
+            const stem = t.replace(/\.ya?ml$/, "");
+            if (ir.nodes.some((m) => m.id === stem)) {
+              diags.push({
+                level: "error",
+                code: "node.bad-dispatch",
+                message: `dispatch= on '${n.id}': '${t}' is the graph's own workflow — name the node ('${stem}'), not its file`,
+                where: at,
+              });
+            }
+            continue;
+          }
           const target = ir.nodes.find((m) => m.id === t);
           if (t === n.id) {
             diags.push({ level: "error", code: "node.bad-dispatch", message: `dispatch= on '${n.id}' names itself`, where: at });

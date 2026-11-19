@@ -127,4 +127,16 @@ describe("validation", () => {
     expect(errors(graph('dispatch="reviewer"'))).toContain("node.bad-dispatch");
     expect(errors(graph('dispatch="../x.yml"'))).toContain("node.bad-dispatch");
   });
+  it("rejects one of the graph's own workflows named by file, not node", () => {
+    expect(errors(graph('dispatch="approver.yml"'))).toContain("node.bad-dispatch");
+    expect(errors(graph('dispatch="reviewer.yml"'))).toContain("node.bad-dispatch");
+  });
+  it("rejects a gate with no schedule: its workflow has no workflow_dispatch", () => {
+    const d = graph('dispatch="gate"').replace(', schedule="*/10 * * * *"', "");
+    expect(errors(d)).toContain("node.bad-dispatch");
+  });
+  it("dispatches a target named twice once", () => {
+    const post = wf(graph('dispatch="approver, approver"'), "reviewer").jobs.reviewer.steps.find((s: any) => s.name === "Post the review");
+    expect(post.env.DISPATCH_TARGETS).toBe("approver.yml -");
+  });
 });

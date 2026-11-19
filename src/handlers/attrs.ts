@@ -485,7 +485,8 @@ export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { che
  */
 export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   if (!verdictChecksOf(nodes, cfg)) return [];
-  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined);
+  // dispatchTargetKind's rule: only a scheduled gate's workflow can be dispatched.
+  return nodes.filter((n) => dispatchTargetKind(n) === "pr");
 }
 
 /**
@@ -528,10 +529,9 @@ export const WORKFLOW_FILE_RE = /^[A-Za-z0-9_.-]+\.ya?ml$/;
 
 /** Can this node be woken by dispatch, and does it take the PR? Undefined: not a target. */
 export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "pr" | undefined {
-  if (!target) return undefined;
-  if (target.type === "merge-gate" && mergeSettingOf(target) !== undefined) return "pr";
-  if (target.attrs.schedule !== undefined) return "pass";
-  return undefined;
+  // Only a scheduled node's workflow has a workflow_dispatch trigger at all.
+  if (!target || target.attrs.schedule === undefined) return undefined;
+  return target.type === "merge-gate" && mergeSettingOf(target) !== undefined ? "pr" : "pass";
 }
 
 /**
@@ -541,7 +541,7 @@ export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "p
  */
 export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean }[] {
   const out: { workflow: string; withPr: boolean }[] = [];
-  for (const t of dispatchRaw(node)) {
+  for (const t of new Set(dispatchRaw(node))) {
     if (WORKFLOW_FILE_RE.test(t)) {
       out.push({ workflow: t, withPr: true });
       continue;
