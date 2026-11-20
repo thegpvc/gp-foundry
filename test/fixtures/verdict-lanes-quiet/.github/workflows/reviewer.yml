@@ -242,7 +242,7 @@ jobs:
             **Verdict:** REQUEST_CHANGES
             **Verdict:** ESCALATE
           REREVIEW_LABEL: re-review
-          DISPATCH_TARGETS: approver.yml -
+          DISPATCH_TARGETS: approver.yml pr
           DISPATCH_TOKEN: ${{ github.token }}
           BASE_BRANCH: main
         run: |

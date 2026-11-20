@@ -789,6 +789,23 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         });
       }
     }
+    if (n.attrs.hold_on_review_requests !== undefined) {
+      if (typeof n.attrs.hold_on_review_requests !== "boolean") {
+        diags.push({
+          level: "error",
+          code: "node.bad-hold-on-review-requests",
+          message: `hold_on_review_requests= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.hold_on_review_requests)}`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (!isSweep(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.hold-on-review-requests-unsupported",
+          message: `hold_on_review_requests= on '${n.id}' is not supported here — it is a select="sweep" lane's rule for which heads it picks`,
+          where: { node: n.id, line: n.line },
+        });
+      }
+    }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({
         level: "error",

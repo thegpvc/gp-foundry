@@ -4,9 +4,14 @@ name: approver
 "on":
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Consider just this PR (an upstream lane's dispatch); empty: the full sweep"
+        required: false
+        type: string
 concurrency:
-  group: approver
+  group: ${{ inputs.pr && format('approver-pr-{0}', inputs.pr) || 'approver' }}
   cancel-in-progress: false
 permissions:
   contents: read
@@ -33,6 +38,7 @@ jobs:
           base-branch: main
           reviewed-by: agent-app[bot]
           rereview-label: re-review
+          only: ${{ inputs.pr }}
           bot-login: agent-app[bot]
       - name: Select pull requests ready for a decision
         id: select
@@ -58,6 +64,7 @@ jobs:
           MAX_FAILURES: "3"
           SETTLE_SECONDS: "600"
           GATE_CHECKS: gp-foundry/approval (gate)
+          ONLY_PR: ${{ inputs.pr }}
           VERDICT_CHECK: gp-foundry/verdict (approver)
           BOT_APP: agent-app
         run: |-
@@ -84,6 +91,13 @@ jobs:
             exit 0
           fi
           LIST=$(jq -r '.[] | "\(.number) \(.sha) \(.requested) \(.quiet) \(.base) \(.since // "-")"' <<< "$SCOPED")
+          # Started for one PR (an upstream lane's dispatch): that PR alone, under the
+          # same rules. A scheduled run (no pr) walks every candidate.
+          if [ -n "${ONLY_PR:-}" ]; then
+            case "$ONLY_PR" in *[!0-9]*) echo "::error::the pr input must be a PR number, got '$ONLY_PR'"; exit 1 ;; esac
+            LIST=$(awk -v n="$ONLY_PR" '$1 == n' <<< "$LIST")
+            [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"
+          fi
           SELECTED='[]'
           while read -r NUM SHA REQUESTED QUIET BASE SINCE; do
             [ -n "$NUM" ] || continue

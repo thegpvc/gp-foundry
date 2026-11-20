@@ -25,6 +25,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
   "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target", "dispatch",
+  "hold_on_review_requests",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -376,6 +377,16 @@ export function sweepRequiresReview(node: HarnessNode): boolean {
   return isSweep(node) && node.attrs.requires_review === true;
 }
 
+/**
+ * Does the sweep pass over a head while a review request is pending? Yes by
+ * default; `hold_on_review_requests=false` lets it decide anyway (many requests
+ * are FYIs — the role's context still lists them). The gate's own clause is
+ * the policy's `require_no_review_requests`.
+ */
+export function sweepHoldsOnReviewRequests(node: HarnessNode): boolean {
+  return node.attrs.hold_on_review_requests !== false;
+}
+
 /** The also-head marker for any node, as a regex prefix: a sweep does not know which lane wrote it. */
 export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
 
@@ -486,7 +497,7 @@ export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { che
 export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   if (!verdictChecksOf(nodes, cfg)) return [];
   // dispatchTargetKind's rule: only a scheduled gate's workflow can be dispatched.
-  return nodes.filter((n) => dispatchTargetKind(n) === "pr");
+  return nodes.filter((n) => n.type === "merge-gate" && dispatchTargetKind(n) === "pr");
 }
 
 /**
@@ -500,6 +511,16 @@ export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): Harness
   return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id)));
 }
 
+/**
+ * The sweeps some node's dispatch= names: each takes the PR as a `pr` dispatch
+ * input and evaluates just that PR, in a concurrency slot of its own (#51).
+ * Empty: nothing about the sweeps changes.
+ */
+export function dispatchedSweepsOf(nodes: HarnessNode[]): HarnessNode[] {
+  const named = new Set(nodes.flatMap((n) => dispatchRaw(n)));
+  return nodes.filter((n) => isSweep(n) && named.has(n.id));
+}
+
 // ── dispatch= ────────────────────────────────────────────────────────────────
 
 /**
@@ -509,9 +530,10 @@ export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): Harness
  * a single gate (merge=), after it publishes a changed result, once per PR.
  *
  * A target is a node id or a workflow file:
- *   - a sweep (select="sweep") or scheduled node: dispatched with no inputs — it
- *     makes its own pass, which picks up whatever is now eligible;
- *   - a single gate: dispatched with the PR (`pr`), evaluating just that PR;
+ *   - a scheduled node: dispatched with no inputs — it makes its own pass, which
+ *     picks up whatever is now eligible;
+ *   - a sweep (select="sweep") or a single gate: dispatched with the PR (`pr`),
+ *     evaluating just that PR under the same rules, in a slot of its own;
  *   - `<file>.yml` (a workflow of the repo's own): dispatched with the PR as its
  *     `pr` input, which that workflow must declare under workflow_dispatch.
  *
@@ -531,7 +553,8 @@ export const WORKFLOW_FILE_RE = /^[A-Za-z0-9_.-]+\.ya?ml$/;
 export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "pr" | undefined {
   // Only a scheduled node's workflow has a workflow_dispatch trigger at all.
   if (!target || target.attrs.schedule === undefined) return undefined;
-  return target.type === "merge-gate" && mergeSettingOf(target) !== undefined ? "pr" : "pass";
+  // A single gate and a sweep evaluate just the PR they are started for.
+  return (target.type === "merge-gate" && mergeSettingOf(target) !== undefined) || isSweep(target) ? "pr" : "pass";
 }
 
 /**

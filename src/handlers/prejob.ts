@@ -34,6 +34,8 @@ import {
   sweepFailedCheckName,
   sweepIdleCheckName,
   sweepRequiresReview,
+  sweepHoldsOnReviewRequests,
+  dispatchedSweepsOf,
   sweepJobNamePrefix,
   sweptCheckName,
   verdictLinesOf,
@@ -450,6 +452,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `}`,
   ];
   const hybrid = isHybrid(ctx.config);
+  // Some node's dispatch= names this sweep: a run may be started for one PR.
+  const only = dispatchedSweepsOf(ctx.nodes ?? []).some((s) => s.id === node.id);
   // The checks a merge gate publishes. One left in progress on a head (a withdrawn
   // result waits for a verdict) is waiting on THIS sweep: counted as running, it
   // would hold the head back from the verdict it waits for.
@@ -516,6 +520,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
             // has reviewed: one search, instead of reading every open PR's head.
             ...(sweepRequiresReview(node) && ctx.config.identity?.bot_login ? { "reviewed-by": ctx.config.identity.bot_login } : {}),
             ...(rereviewLabelOf(ctx.config) ? { "rereview-label": rereviewLabelOf(ctx.config)! } : {}),
+            // Started for one PR: read that PR, not the search (whose index lags a
+            // review that has only just been posted).
+            ...(only ? { only: "${{ inputs.pr }}" } : {}),
             ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
             ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
           },
@@ -533,7 +540,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     ...(skipBots || Object.keys(skipLabels).length
       ? [`#   not skipped ${[skipBots ? "not opened by a bot (the harness's own is exempt)" : "", Object.keys(skipLabels).length ? "no skip= label" : ""].filter(Boolean).join(", ")}`]
       : []),
-    `#   reviews in  no review is still being waited on (no pending review request)`,
+    ...(sweepHoldsOnReviewRequests(node)
+      ? [`#   reviews in  no review is still being waited on (no pending review request)`]
+      : []),
     `#   checks in   every check-run on the head is completed (the gate's own result`,
     `#               aside: it waits on this lane's verdict), no commit status`,
     `#               pending — and at least one check-run exists, unless the PR has`,
@@ -546,6 +555,17 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head, and fewer`,
     `#               than $MAX_IDLE runs that succeeded without leaving a verdict`,
     ...listing,
+    ...(only
+      ? [
+          `# Started for one PR (an upstream lane's dispatch): that PR alone, under the`,
+          `# same rules. A scheduled run (no pr) walks every candidate.`,
+          `if [ -n "\${ONLY_PR:-}" ]; then`,
+          `  case "$ONLY_PR" in *[!0-9]*) echo "::error::the pr input must be a PR number, got '$ONLY_PR'"; exit 1 ;; esac`,
+          `  LIST=$(awk -v n="$ONLY_PR" '$1 == n' <<< "$LIST")`,
+          `  [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"`,
+          `fi`,
+        ]
+      : []),
     `SELECTED='[]'`,
     `while read -r NUM SHA REQUESTED QUIET BASE SINCE; do`,
     `  [ -n "$NUM" ] || continue`,
@@ -553,7 +573,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  # before it — verdicts, reviews, the sweep's own check-runs — do not count.`,
     `  [ "\${SINCE:-}" = "-" ] && SINCE=""`,
     `  export SINCE="\${SINCE:-}"`,
-    `  if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`,
+    ...(sweepHoldsOnReviewRequests(node)
+      ? [`  if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`]
+      : []),
     `  # One read of the head's check-runs answers four questions: how many exist,`,
     `  # how many are still running, has the lane already run here, how often has it failed.`,
     `  # filter=all: the default (latest) keeps only the newest run per check name, which`,
@@ -645,6 +667,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(gateChecks.length ? { GATE_CHECKS: gateChecks.join("\n") } : {}),
+          ...(only ? { ONLY_PR: "${{ inputs.pr }}" } : {}),
           ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),

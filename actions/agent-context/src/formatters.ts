@@ -47,6 +47,9 @@ export interface PullRequestData {
   base?: { ref?: string } | null;
   /** The PR's current head. Reviews and check runs are compared against its SHA. */
   head?: { sha?: string } | null;
+  /** Pending review requests: the people and teams asked to review and not yet answered. */
+  requested_reviewers?: { login?: string | null }[] | null;
+  requested_teams?: { slug?: string | null }[] | null;
 }
 
 /** One entry of `pulls.listFiles`. */
@@ -344,6 +347,12 @@ function formatPRHeader(pr: PullRequestData, number: number, opts: FormatOptions
   ];
   // A SHA comes from GitHub, not from the author; it needs no scrubbing.
   if (pr.head?.sha) lines.push(`Head: ${pr.head.sha}`);
+  // Logins and team slugs are GitHub identifiers, not free text.
+  const requested = [
+    ...(pr.requested_reviewers ?? []).map((u) => u.login).filter(Boolean).map((l) => `@${l}`),
+    ...(pr.requested_teams ?? []).map((t) => t.slug).filter(Boolean).map((t) => `team ${t}`),
+  ];
+  if (requested.length) lines.push(`Review requested from (pending): ${requested.join(", ")}`);
   lines.push(
     `Files: ${pr.changed_files} changed, +${pr.additions} -${pr.deletions}`,
     "Body:",
