@@ -101,7 +101,7 @@ export interface ScopedPr {
  */
 export async function listInScope(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number },
 ): Promise<ScopedPr[] | undefined> {
   const out = await listCandidates(octokit, opts);
   if (!out || !opts.rereviewLabel) return out?.map(({ labels: _l, ...p }) => p);
@@ -130,7 +130,7 @@ export async function listInScope(
 
 async function listCandidates(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number },
 ): Promise<(ScopedPr & { labels: string[] })[] | undefined> {
   const { owner, repo } = opts;
   const now = opts.nowMs ?? Date.now();
@@ -147,6 +147,27 @@ async function listCandidates(
     if (!scope.inScope) core.info(`#${c.number}: out of scope — ${scope.detail}`);
     return scope.inScope;
   };
+
+  // One PR (a sweep started for it): read it directly, under the same scope rule.
+  // Not through the search, whose index lags a review that was only just posted.
+  if (opts.only !== undefined) {
+    let p;
+    try {
+      p = (await octokit.rest.pulls.get({ owner, repo, pull_number: opts.only })).data;
+    } catch (e) {
+      core.warning(`could not read #${opts.only}: ${(e as Error).message}`);
+      return undefined;
+    }
+    if (p.state !== "open") {
+      core.info(`#${p.number}: ${p.state} — not a candidate`);
+      return [];
+    }
+    if (opts.baseBranch && p.base.ref !== opts.baseBranch) {
+      core.info(`#${p.number}: targets ${p.base.ref}, not ${opts.baseBranch} — not a candidate`);
+      return [];
+    }
+    return [candidateOf(p)].filter(keep).map(toScoped);
+  }
 
   // Only PRs the bot has reviewed: one search, retried once.
   if (opts.reviewedBy) {
@@ -197,19 +218,41 @@ async function listCandidates(
       return undefined;
     }
   }
-  const cands: Candidate[] = prs.map((p) => ({
+  // Without the reviewed-by search: oldest first, as before.
+  return prs.map(candidateOf).filter(keep).map(toScoped);
+}
+
+type PullLike = {
+  number: number;
+  head: { sha: string };
+  base: { ref: string };
+  user?: { login?: string; type?: string } | null;
+  draft?: boolean | null;
+  labels: { name?: string | null }[];
+  requested_reviewers?: unknown[] | null;
+  requested_teams?: unknown[] | null;
+  updated_at: string;
+};
+function candidateOf(p: PullLike): Candidate {
+  return {
     number: p.number,
     sha: p.head.sha,
     base: p.base.ref,
     author: p.user?.login ?? "",
     authorType: p.user?.type ?? "",
     draft: !!p.draft,
-    labels: p.labels.map((l) => l.name ?? "").filter(Boolean),
+    labels: p.labels.map((l) => l.name ?? "").filter((l): l is string => !!l),
     requested: (p.requested_reviewers?.length ?? 0) + (p.requested_teams?.length ?? 0),
     updatedAt: Date.parse(p.updated_at) || 0,
-  }));
-  // Without the reviewed-by search: oldest first, as before.
-  return cands.filter(keep).map(toScoped);
+  };
+}
+
+/** The `only` input: empty, or a PR number (a malformed one is a build problem). */
+function onlyInput(raw: string): number | undefined {
+  const t = raw.trim();
+  if (!t) return undefined;
+  if (!/^[0-9]+$/.test(t)) throw new Error(`only must be a PR number, got "${t}"`);
+  return parseInt(t, 10);
 }
 
 export async function run(): Promise<void> {
@@ -233,6 +276,7 @@ export async function run(): Promise<void> {
         botLogin: core.getInput("bot-login").trim() || undefined,
         reviewedBy: core.getInput("reviewed-by").trim() || undefined,
         rereviewLabel: core.getInput("rereview-label").trim() || undefined,
+        only: onlyInput(core.getInput("only")),
       });
       core.setOutput("listed", String(prs !== undefined));
       core.setOutput("prs", JSON.stringify(prs ?? []));

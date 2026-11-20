@@ -25,6 +25,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
   "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target", "dispatch",
+  "hold_on_review_requests", "explain_on",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -376,6 +377,16 @@ export function sweepRequiresReview(node: HarnessNode): boolean {
   return isSweep(node) && node.attrs.requires_review === true;
 }
 
+/**
+ * Does the sweep pass over a head while a review request is pending? Yes by
+ * default; `hold_on_review_requests=false` lets it decide anyway (many requests
+ * are FYIs — the role's context still lists them). The gate's own clause is
+ * the policy's `require_no_review_requests`.
+ */
+export function sweepHoldsOnReviewRequests(node: HarnessNode): boolean {
+  return node.attrs.hold_on_review_requests !== false;
+}
+
 /** The also-head marker for any node, as a regex prefix: a sweep does not know which lane wrote it. */
 export const ALSO_HEAD_ANY_NODE_PATTERN = "<!-- gp-foundry:also-head:[^:\\s]+:";
 
@@ -486,7 +497,7 @@ export function verdictChecksOf(nodes: HarnessNode[], cfg: FoundryConfig): { che
 export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   if (!verdictChecksOf(nodes, cfg)) return [];
   // dispatchTargetKind's rule: only a scheduled gate's workflow can be dispatched.
-  return nodes.filter((n) => dispatchTargetKind(n) === "pr");
+  return nodes.filter((n) => n.type === "merge-gate" && dispatchTargetKind(n) === "pr");
 }
 
 /**
@@ -497,7 +508,39 @@ export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): Ha
 export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   const named = new Set(nodes.flatMap((n) => dispatchRaw(n)));
   const quiet = new Set(quietNudgedGatesOf(nodes, cfg).map((g) => g.id));
-  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id)));
+  const explained = new Set(explainedGatesOf(nodes).map((g) => g.id));
+  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id) || explained.has(n.id)));
+}
+
+/**
+ * `explain_on="<gate>"` on a sweep (#52): while a head has no verdict, the
+ * gate's check on it is held in progress with the reason the sweep's select job
+ * gave for it ("approver is deciding", "Waiting: 2 check(s) still running") —
+ * the reasons come from the sweep's own selection, so the two cannot disagree.
+ * The sweep hands a changed reason to the gate by dispatch; the gate writes it,
+ * and only on a head with no verdict. Undefined: off (or invalid: validate()).
+ */
+export function explainGateOf(node: HarnessNode, nodes: HarnessNode[]): HarnessNode | undefined {
+  const id = node.attrs.explain_on;
+  if (typeof id !== "string" || !isSweep(node)) return undefined;
+  const gate = nodes.find((n) => n.id === id);
+  return gate && gate.type === "merge-gate" && dispatchTargetKind(gate) === "pr" ? gate : undefined;
+}
+
+/** The single gates some sweep explains on: each takes a `reason` with its `pr`. */
+export function explainedGatesOf(nodes: HarnessNode[]): HarnessNode[] {
+  const ids = new Set(nodes.map((n) => explainGateOf(n, nodes)?.id).filter(Boolean));
+  return nodes.filter((n) => ids.has(n.id));
+}
+
+/**
+ * The sweeps some node's dispatch= names: each takes the PR as a `pr` dispatch
+ * input and evaluates just that PR, in a concurrency slot of its own (#51).
+ * Empty: nothing about the sweeps changes.
+ */
+export function dispatchedSweepsOf(nodes: HarnessNode[]): HarnessNode[] {
+  const named = new Set(nodes.flatMap((n) => dispatchRaw(n)));
+  return nodes.filter((n) => isSweep(n) && named.has(n.id));
 }
 
 // ── dispatch= ────────────────────────────────────────────────────────────────
@@ -509,9 +552,10 @@ export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): Harness
  * a single gate (merge=), after it publishes a changed result, once per PR.
  *
  * A target is a node id or a workflow file:
- *   - a sweep (select="sweep") or scheduled node: dispatched with no inputs — it
- *     makes its own pass, which picks up whatever is now eligible;
- *   - a single gate: dispatched with the PR (`pr`), evaluating just that PR;
+ *   - a scheduled node: dispatched with no inputs — it makes its own pass, which
+ *     picks up whatever is now eligible;
+ *   - a sweep (select="sweep") or a single gate: dispatched with the PR (`pr`),
+ *     evaluating just that PR under the same rules, in a slot of its own;
  *   - `<file>.yml` (a workflow of the repo's own): dispatched with the PR as its
  *     `pr` input, which that workflow must declare under workflow_dispatch.
  *
@@ -531,7 +575,8 @@ export const WORKFLOW_FILE_RE = /^[A-Za-z0-9_.-]+\.ya?ml$/;
 export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "pr" | undefined {
   // Only a scheduled node's workflow has a workflow_dispatch trigger at all.
   if (!target || target.attrs.schedule === undefined) return undefined;
-  return target.type === "merge-gate" && mergeSettingOf(target) !== undefined ? "pr" : "pass";
+  // A single gate and a sweep evaluate just the PR they are started for.
+  return (target.type === "merge-gate" && mergeSettingOf(target) !== undefined) || isSweep(target) ? "pr" : "pass";
 }
 
 /**
@@ -539,15 +584,16 @@ export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "p
  * pass the PR number as the `pr` input). Unresolvable targets are dropped here;
  * validate() reports them.
  */
-export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean }[] {
-  const out: { workflow: string; withPr: boolean }[] = [];
+export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean; sweep?: boolean }[] {
+  const out: { workflow: string; withPr: boolean; sweep?: boolean }[] = [];
   for (const t of new Set(dispatchRaw(node))) {
     if (WORKFLOW_FILE_RE.test(t)) {
       out.push({ workflow: t, withPr: true });
       continue;
     }
-    const kind = dispatchTargetKind(nodes.find((n) => n.id === t));
-    if (kind) out.push({ workflow: `${t}.yml`, withPr: kind === "pr" });
+    const target = nodes.find((n) => n.id === t);
+    const kind = dispatchTargetKind(target);
+    if (kind) out.push({ workflow: `${t}.yml`, withPr: kind === "pr", ...(target && isSweep(target) ? { sweep: true } : {}) });
   }
   return out;
 }

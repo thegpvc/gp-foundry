@@ -789,6 +789,52 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
         });
       }
     }
+    if (n.attrs.explain_on !== undefined) {
+      const at = { node: n.id, line: n.line };
+      const target = typeof n.attrs.explain_on === "string" ? ir.nodes.find((m) => m.id === n.attrs.explain_on) : undefined;
+      if (!isSweep(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.explain-on-unsupported",
+          message: `explain_on= on '${n.id}' is not supported here — it is a select="sweep" lane's reasons for the heads it is not deciding yet`,
+          where: at,
+        });
+      } else if (!target || target.type !== "merge-gate" || mergeSettingOf(target) === undefined || dispatchTargetKind(target) !== "pr") {
+        diags.push({
+          level: "error",
+          code: "node.bad-explain-on",
+          message: `explain_on= on '${n.id}' must name a single gate (a merge-gate with merge= and a schedule=), got ${JSON.stringify(n.attrs.explain_on)}`,
+          where: at,
+        });
+      } else {
+        const others = ir.nodes.filter((m) => m !== n && m.attrs.explain_on === n.attrs.explain_on && isSweep(m));
+        if (others.length) {
+          diags.push({
+            level: "error",
+            code: "node.duplicate-explain-on",
+            message: `explain_on= on '${n.id}': '${target.id}' is already explained on by ${others.map((m) => `'${m.id}'`).join(", ")} — one sweep per gate, or their reasons would overwrite each other`,
+            where: at,
+          });
+        }
+      }
+    }
+    if (n.attrs.hold_on_review_requests !== undefined) {
+      if (typeof n.attrs.hold_on_review_requests !== "boolean") {
+        diags.push({
+          level: "error",
+          code: "node.bad-hold-on-review-requests",
+          message: `hold_on_review_requests= on '${n.id}' must be true or false, got ${JSON.stringify(n.attrs.hold_on_review_requests)}`,
+          where: { node: n.id, line: n.line },
+        });
+      } else if (!isSweep(n) || diamondMembers.has(n.id)) {
+        diags.push({
+          level: "error",
+          code: "node.hold-on-review-requests-unsupported",
+          message: `hold_on_review_requests= on '${n.id}' is not supported here — it is a select="sweep" lane's rule for which heads it picks`,
+          where: { node: n.id, line: n.line },
+        });
+      }
+    }
     if (n.type === "human-gate" && n.attrs.environment === undefined) {
       diags.push({
         level: "error",

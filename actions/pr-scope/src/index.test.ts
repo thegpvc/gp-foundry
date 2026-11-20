@@ -168,6 +168,34 @@ describe("pr-scope: listing for a sweep", () => {
     expect(await listInScope(o, opts)).toBeUndefined();
     expect(o.seen).toHaveLength(2);
   });
+
+  describe("only: one PR, read directly (#51)", () => {
+    const getter = (pr: unknown) => {
+      const o = lister([[]]) as any;
+      o.rest.pulls.get = async (params: unknown) => {
+        o.seen.push(params);
+        if (pr instanceof Error) throw pr;
+        return { data: pr };
+      };
+      o.graphql = async () => {
+        throw new Error("the search must not be used");
+      };
+      return o as Parameters<typeof listInScope>[0] & { seen: any[] };
+    };
+    it("lists that PR alone, without the search, even with reviewed-by", async () => {
+      const o = getter({ ...open(7, "alice", { requested_reviewers: [{ login: "x" }] }), state: "open" });
+      expect(await listInScope(o, { ...opts, reviewedBy: BOT, only: 7 })).toEqual([{ number: 7, sha: "sha7", base: "main", requested: 1, quiet: 60 }]);
+      expect(o.seen).toEqual([{ owner: "o", repo: "r", pull_number: 7 }]);
+    });
+    it("is empty for a closed PR, another base, or one out of scope", async () => {
+      expect(await listInScope(getter({ ...open(7, "alice"), state: "closed" }), { ...opts, only: 7 })).toEqual([]);
+      expect(await listInScope(getter({ ...open(7, "alice", { base: { ref: "release" } }), state: "open" }), { ...opts, only: 7 })).toEqual([]);
+      expect(await listInScope(getter({ ...open(7, "mallory"), state: "open" }), { ...opts, rollout: { authors: ["alice"] }, only: 7 })).toEqual([]);
+    });
+    it("an unreadable PR is a quiet tick", async () => {
+      expect(await listInScope(getter(new Error("502")), { ...opts, only: 7 })).toBeUndefined();
+    });
+  });
 });
 
 describe("pr-scope: the wrong-bot-login hint", () => {

@@ -16,12 +16,13 @@ import { compile } from "../src/index.js";
 import { validate } from "../src/validate/validate.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
 
-const graph = (reviewer = 'dispatch="approver, formal-approval.yml"', gate = "") => `digraph t {
+const graph = (reviewer = 'dispatch="approver, janitor, formal-approval.yml"', gate = "") => `digraph t {
   start    [type=start]
   reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", post="review"${reviewer ? ", " + reviewer : ""}]
   approver [type=pr-review, role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/5 * * * *", requires_review=true, post="review"]
   gate     [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="off"${gate ? ", " + gate : ""}]
   builder  [type=producer, role="agents/roles/builder.md", context=issue]
+  janitor  [type=scheduled-agent, role="agents/roles/janitor.md", schedule="0 * * * *"]
   start -> reviewer [on="pull_request.opened, pull_request.synchronize"]
   start -> builder  [on="issues.labeled", when="label=build"]
 }`;
@@ -38,8 +39,8 @@ describe("dispatch= on a posting lane", () => {
   it("the post step wakes each target after it posts, with the job's own token", () => {
     const job = wf(graph(), "reviewer").jobs.reviewer;
     const post = job.steps.find((s: any) => s.name === "Post the review");
-    // A sweep makes its own pass (no inputs); a workflow file gets the PR.
-    expect(post.env.DISPATCH_TARGETS).toBe("approver.yml -\nformal-approval.yml pr");
+    // A sweep and a workflow file get the PR (#51); a scheduled node makes its own pass.
+    expect(post.env.DISPATCH_TARGETS).toBe("approver.yml pr\njanitor.yml -\nformal-approval.yml pr");
     expect(post.env.DISPATCH_TOKEN).toBe("${{ github.token }}");
     expect(post.run).toContain('dispatch_to "$DISPATCH_TARGETS"');
     expect(job.permissions.actions).toBe("write");
@@ -63,7 +64,7 @@ describe("dispatch= on a posting lane", () => {
 });
 
 describe("dispatch= on the gate", () => {
-  const d = graph("", 'dispatch="formal-approval.yml, approver"');
+  const d = graph("", 'dispatch="formal-approval.yml, janitor"');
 
   it("wakes each target after it publishes, once per PR whose result changed", () => {
     const job = wf(d, "gate").jobs.gate;
@@ -71,7 +72,7 @@ describe("dispatch= on the gate", () => {
     expect(gateStep.id).toBe("gate");
     const wake = job.steps.find((s: any) => s.name === "Wake downstream workflows");
     expect(wake.if).toBe("${{ !cancelled() && steps.gate.outputs.published-prs != '' }}");
-    expect(wake.env).toMatchObject({ PRS: "${{ steps.gate.outputs.published-prs }}", DISPATCH_TARGETS: "formal-approval.yml pr\napprover.yml -", BASE_BRANCH: "main" });
+    expect(wake.env).toMatchObject({ PRS: "${{ steps.gate.outputs.published-prs }}", DISPATCH_TARGETS: "formal-approval.yml pr\njanitor.yml -", BASE_BRANCH: "main" });
     expect(job.permissions.actions).toBe("write");
   });
 
@@ -84,7 +85,7 @@ describe("dispatch= on the gate", () => {
       join(bin, "gh"),
       `#!/usr/bin/env bash
 echo "$*" >> "$LOG"
-[[ "$*" == *approver.yml* ]] && { echo "HTTP 403" >&2; exit 1; }
+[[ "$*" == *janitor.yml* ]] && { echo "HTTP 403" >&2; exit 1; }
 exit 0
 `,
     );
@@ -100,9 +101,9 @@ exit 0
     expect(calls).toEqual([
       "api --method POST repos/o/r/actions/workflows/formal-approval.yml/dispatches -f ref=main -f inputs[pr]=3",
       "api --method POST repos/o/r/actions/workflows/formal-approval.yml/dispatches -f ref=main -f inputs[pr]=5",
-      "api --method POST repos/o/r/actions/workflows/approver.yml/dispatches -f ref=main",
+      "api --method POST repos/o/r/actions/workflows/janitor.yml/dispatches -f ref=main",
     ]);
-    expect(out).toContain("::warning::could not start approver.yml");
+    expect(out).toContain("::warning::could not start janitor.yml");
     expect(existsSync(join(process.cwd(), "err.txt"))).toBe(false);
   });
 
@@ -137,6 +138,6 @@ describe("validation", () => {
   });
   it("dispatches a target named twice once", () => {
     const post = wf(graph('dispatch="approver, approver"'), "reviewer").jobs.reviewer.steps.find((s: any) => s.name === "Post the review");
-    expect(post.env.DISPATCH_TARGETS).toBe("approver.yml -");
+    expect(post.env.DISPATCH_TARGETS).toBe("approver.yml pr");
   });
 });

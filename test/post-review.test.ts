@@ -782,7 +782,7 @@ describe("dispatch=: the post step wakes its targets once the review is posted (
   };
   const calls = (r: Ran) => r.writes.map((w) => w.call);
 
-  it("after posting: the sweep with no inputs, the workflow file with the PR", () => {
+  it("after posting: the sweep and the workflow file, each with the PR", () => {
     const r = runPost(step(), fence(REVIEW), [], { DISPATCH_TOKEN: "gt" });
     expect(r.status).toBe(0);
     expect(calls(r)).toEqual([
@@ -790,7 +790,7 @@ describe("dispatch=: the post step wakes its targets once the review is posted (
       "POST repos/o/r/actions/workflows/approver.yml/dispatches",
       "POST repos/o/r/actions/workflows/formal-approval.yml/dispatches",
     ]);
-    expect(r.writes[1]!.body).toEqual({ ref: "main" });
+    expect(r.writes[1]!.body).toEqual({ ref: "main", "inputs[pr]": "7" });
     expect(r.writes[2]!.body).toEqual({ ref: "main", "inputs[pr]": "7" });
   });
 

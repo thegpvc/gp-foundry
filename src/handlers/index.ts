@@ -20,6 +20,7 @@ import type { MergeSetting } from "./attrs.js";
 import { postDispatchTargets, postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
   dispatchTargetsOf,
+  explainedGatesOf,
   noChangesCommentOf,
   nudgedGatesOf,
   quietVerdictsOf,
@@ -771,6 +772,10 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).some((g) => g.id === node.id)
         ? "${{ github.event.pull_request.number || inputs.pr }}"
         : "${{ github.event.pull_request.number }}",
+      // explain_on= (#52): a sweep's reason for a head it is not deciding yet.
+      ...(explainedGatesOf(ctx.nodes ?? []).some((g) => g.id === node.id)
+        ? { "waiting-title": "${{ inputs.reason }}", "waiting-sha": "${{ inputs.reason_sha }}" }
+        : {}),
       // The schedule's period: the pass's window moves once per period.
       "rotation-period-seconds": String(cronPeriodSeconds(String(node.attrs.schedule ?? ""))),
       // Leave the job two minutes to finish the PR it is on and exit cleanly.
@@ -786,13 +791,15 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
         env: {
           GH_TOKEN: "${{ github.token }}",
           PRS: "${{ steps.gate.outputs.published-prs }}",
-          DISPATCH_TARGETS: targets.map((t) => `${t.workflow} ${t.withPr ? "pr" : "-"}`).join("\n"),
+          DISPATCH_TARGETS: targets.map((t) => `${t.workflow} ${t.sweep ? "sweep" : t.withPr ? "pr" : "-"}`).join("\n"),
           BASE_BRANCH: ctx.config.repo.base_branch,
         },
         run: [
           `# dispatch=: start each target now rather than at its next scheduled run, with`,
           `# the job's own GITHUB_TOKEN (workflow_dispatch is the one event it can start).`,
           `# A "pr" target runs once per PR, with the PR as its \`pr\` input; any other once.`,
+          `# A sweep runs for the PR when one changed, and as one full sweep when several`,
+          `# did (a scheduled pass): one run of its own LIMIT, not a run per PR.`,
           `# Best effort: a failed dispatch is a warning.`,
           `ERR=$(mktemp)`,
           `start() { # <workflow> [pr]`,
@@ -806,11 +813,12 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
           `}`,
           `while read -r WF WITH; do`,
           `  [ -n "$WF" ] || continue`,
-          `  if [ "$WITH" = "pr" ]; then`,
-          `    for N in \${PRS//,/ }; do start "$WF" "$N"; done`,
-          `  else`,
-          `    start "$WF"`,
-          `  fi`,
+          `  read -r -a CHANGED <<< "\${PRS//,/ }"`,
+          `  case "$WITH" in`,
+          `    pr) for N in "\${CHANGED[@]}"; do start "$WF" "$N"; done ;;`,
+          `    sweep) if [ "\${#CHANGED[@]}" -eq 1 ]; then start "$WF" "\${CHANGED[0]}"; else start "$WF"; fi ;;`,
+          `    *) start "$WF" ;;`,
+          `  esac`,
           `done <<< "$DISPATCH_TARGETS"`,
         ].join("\n"),
       }),

@@ -10,6 +10,8 @@ import type { FoundryConfig, Harness, HarnessEdge, HarnessNode, NodeWiring, Wiri
 import { AGENT_TYPES } from "../ir/types.js";
 import {
   nudgedGatesOf,
+  dispatchedSweepsOf,
+  explainedGatesOf,
   rereviewLabelOf,
   mergeSettingOf,
   isReadingPrLane,
@@ -335,6 +337,10 @@ export function wire(ir: Harness): WiringPlan {
   // The single gates that take a PR by dispatch (quiet verdicts in the graph, or
   // named by some node's dispatch=).
   const prGates = new Set(nudgedGatesOf(ir.nodes, ir.config).map((g) => g.id));
+  // The sweeps some dispatch= names: started for one PR, they take it as `pr`.
+  const prSweeps = new Set(dispatchedSweepsOf(ir.nodes).map((s) => s.id));
+  // The single gates a sweep explains its waits on (explain_on=).
+  const explainedGates = new Set(explainedGatesOf(ir.nodes).map((g) => g.id));
   for (const node of ir.nodes) {
     if (node.type === "start" || node.type === "exit") continue;
     if (diamonds.memberIds.has(node.id)) continue;
@@ -398,9 +404,23 @@ export function wire(ir: Harness): WiringPlan {
       triggers.schedule = [{ cron: String(node.attrs.schedule) }];
       // A gate nudged by quiet verdicts takes the PR to evaluate as a dispatch input.
       const nudged = singleGate && prGates.has(node.id);
+      const explained = singleGate && explainedGates.has(node.id);
       triggers.workflow_dispatch = nudged
-        ? { inputs: { pr: { description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass", required: false, type: "string" } } }
-        : {};
+        ? {
+            inputs: {
+              pr: { description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass", required: false, type: "string" },
+              // explain_on= (#52): why the sweep is not deciding this head yet.
+              ...(explained
+                ? {
+                    reason: { description: "With pr: why the approver has no verdict yet, shown on a head that has none", required: false, type: "string" },
+                    reason_sha: { description: "With reason: the head it was given for", required: false, type: "string" },
+                  }
+                : {}),
+            },
+          }
+        : prSweeps.has(node.id)
+          ? { inputs: { pr: { description: "Consider just this PR (an upstream lane's dispatch); empty: the full sweep", required: false, type: "string" } } }
+          : {};
       if (singleGate) {
         // The single gate also evaluates ONE PR the moment something that decides
         // it changes: a review, a label, a review request, a new commit. CI
@@ -479,6 +499,17 @@ export function wire(ir: Harness): WiringPlan {
     };
     if (guard) nw.guard = guard;
     if (Object.keys(triggers).length) nw.concurrency = concurrencyKey(node, gateLabelEvents ? admitLabels : undefined);
+    // A sweep started for one PR gets that PR's own slot: it does not queue behind
+    // the full sweep (or another PR's run). The scheduled sweep keeps the shared
+    // slot. The two can overlap on one PR; the post step posts once per head, and
+    // the select job passes over a head that is already decided.
+    if (prSweeps.has(node.id) && nw.concurrency) {
+      nw.concurrency = {
+        group: `\${{ inputs.pr && format('${node.id}-pr-{0}', inputs.pr) || '${node.id}' }}`,
+        // A run for one PR is never cancelled mid-agent by the next dispatch for it.
+        "cancel-in-progress": nw.concurrency["cancel-in-progress"] === true ? "${{ !inputs.pr }}" : false,
+      };
+    }
     if (singleGate) {
       nw.guard = singleGateGuard(ir.config.repo.base_branch, rollout ?? {}, botLogin);
       // One slot per PR for event runs, newest wins: a burst of events on a PR

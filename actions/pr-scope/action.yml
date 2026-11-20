@@ -33,6 +33,14 @@ inputs:
       and its own records from after it.
     required: false
     default: ""
+  only:
+    description: >-
+      With `list`: a PR number. List just that PR, if it is open, on
+      `base-branch` and in scope, read directly (not through the `reviewed-by`
+      search, whose index lags a review that was only just posted). For a sweep
+      started for one PR. Empty: every candidate.
+    required: false
+    default: ""
   base-branch:
     description: "With `list`: only PRs targeting this branch."
     required: false

@@ -12,6 +12,7 @@
  * Untrusted values never reach the script text — everything arrives via `env:`.
  */
 import { QUIET_CHECK_JQ } from "../shared/verdicts.js";
+import { WAITING_ON_CI, WAITING_TITLE_MAX } from "../shared/explain.js";
 import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
   quietVerdictsOf,
@@ -34,11 +35,17 @@ import {
   sweepFailedCheckName,
   sweepIdleCheckName,
   sweepRequiresReview,
+  sweepHoldsOnReviewRequests,
+  dispatchedSweepsOf,
+  explainGateOf,
+  dispatchRaw,
+  botAppSlug,
   sweepJobNamePrefix,
   sweptCheckName,
   verdictLinesOf,
 } from "./attrs.js";
 import { appTokenStep, runStep, tokenExpr } from "./steps.js";
+import { resolveAuth } from "../auth/auth.js";
 
 const PR_NUMBER = "${{ github.event.pull_request.number }}";
 
@@ -71,9 +78,86 @@ export function emitPreJob(ctx: EmitContext): WorkflowJobFragment | null {
   return null;
 }
 
-/** The job that runs AFTER the node's own: a sweep's record of the heads it covered. */
-export function emitPostJob(ctx: EmitContext): WorkflowJobFragment | null {
-  return isSweep(ctx.node) ? emitSweepMark(ctx) : null;
+/**
+ * The jobs that run beside or AFTER the node's own: a sweep's record of the
+ * heads it covered, and (explain_on=) its reasons handed to the gate.
+ */
+export function emitPostJobs(ctx: EmitContext): WorkflowJobFragment[] {
+  if (!isSweep(ctx.node)) return [];
+  const explain = emitSweepExplain(ctx);
+  return [emitSweepMark(ctx), ...(explain ? [explain] : [])];
+}
+
+/**
+ * `<node>_explain` (explain_on=, #52): hand the gate each waiting head's reason,
+ * when it differs from what the gate's check on that head already says. The
+ * gate writes it — only on a head with no verdict, held in progress — so the
+ * gate stays the one writer of its check. A separate job from the select job,
+ * which stays read-only: this one needs `actions: write` to dispatch, and reads
+ * the gate's check with `checks: read`. Best effort: the next sweep tries again.
+ */
+function emitSweepExplain(ctx: EmitContext): WorkflowJobFragment | undefined {
+  const node = ctx.node;
+  const gate = explainGateOf(node, ctx.nodes ?? []);
+  if (!gate) return undefined;
+  let gateCheck: string;
+  try {
+    gateCheck = parseEvaluateCheckName(gate);
+  } catch {
+    gateCheck = `gp-foundry/approval (${gate.id})`;
+  }
+  // The gate's check is App-owned under App auth (its runs are adopted by app),
+  // GITHUB_TOKEN's otherwise. Unknown: any app's newest run of that name.
+  const gateApp = resolveAuth(ctx.config).mode === "app" ? (botAppSlug(ctx.config) ?? "") : "github-actions";
+  const select = preJobId(node);
+  return {
+    jobId: `${node.id}_explain`,
+    name: `${node.id} sweep explain`,
+    displayName: `${node.id} explain`,
+    needs: [select],
+    if: `\${{ needs.${select}.result == 'success' && needs.${select}.outputs.waiting != '' && needs.${select}.outputs.waiting != '[]' }}`,
+    permissions: { checks: "read", actions: "write" },
+    timeoutMinutes: 5,
+    steps: [
+      runStep({
+        name: `Show on ${gate.id}'s check why each head is waiting`,
+        env: {
+          GH_TOKEN: "${{ github.token }}",
+          WAITING: `\${{ needs.${select}.outputs.waiting }}`,
+          GATE_WORKFLOW: `${gate.id}.yml`,
+          GATE_CHECK: gateCheck,
+          GATE_APP: gateApp,
+          BASE_BRANCH: ctx.config.repo.base_branch,
+        },
+        run: [
+          `# Only a changed reason starts a gate run: the check already saying it, or a`,
+          `# result already on the head (the gate decides that), and nothing is sent.`,
+          `# (A head held for a re-review gets no reason from the select job.)`,
+          `ERR=$(mktemp)`,
+          `CHECK_Q=$(jq -rn --arg n "$GATE_CHECK" '$n | @uri')`,
+          `while IFS=$'\\t' read -r NUM SHA TITLE; do`,
+          `  [ -n "$NUM" ] || continue`,
+          `  CUR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$CHECK_Q&filter=all&per_page=100" --jq '`,
+          `    [.check_runs[] | select(env.GATE_APP == "" or .app.slug == env.GATE_APP)] | sort_by(.id) | last`,
+          `    | if . == null then "none\\t" else "\\(.status)\\t\\(.output.title // "")" end') || {`,
+          `    echo "::warning::#$NUM: could not read $GATE_CHECK on $SHA — left for the next sweep"`,
+          `    continue`,
+          `  }`,
+          `  STATE=\${CUR%%$'\\t'*}`,
+          `  SHOWN=\${CUR#*$'\\t'}`,
+          `  if [ "$STATE" = "completed" ]; then echo "#$NUM: $GATE_CHECK has a result on $SHA — the gate's to change"; continue; fi`,
+          `  if [ "$SHOWN" = "$TITLE" ]; then echo "#$NUM: already shows: $TITLE"; continue; fi`,
+          `  if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$GATE_WORKFLOW/dispatches" \\`,
+          `      -f ref="$BASE_BRANCH" -f "inputs[pr]=$NUM" -f "inputs[reason]=$TITLE" -f "inputs[reason_sha]=$SHA" > /dev/null 2> "$ERR"; then`,
+          `    echo "#$NUM: $TITLE"`,
+          `  else`,
+          `    echo "::warning::#$NUM: could not start $GATE_WORKFLOW ($(head -c 200 "$ERR" | tr '\\n\\r' '  ')) — the next sweep tries again"`,
+          `  fi`,
+          `done < <(jq -r '.[] | [.number, .sha, .title] | @tsv' <<< "$WAITING")`,
+        ].join("\n"),
+      }),
+    ],
+  };
 }
 
 /**
@@ -450,6 +534,13 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `}`,
   ];
   const hybrid = isHybrid(ctx.config);
+  // Some node's dispatch= names this sweep: a run may be started for one PR.
+  const only = dispatchedSweepsOf(ctx.nodes ?? []).some((s) => s.id === node.id);
+  // explain_on= (#52): each head left waiting carries the reason, for the gate's check.
+  const explain = explainGateOf(node, ctx.nodes ?? []) !== undefined;
+  const w = (title: string) => (explain ? `wait_for "${title}"; ` : "");
+  // The jobs of the lanes whose dispatch= names this sweep: each is named after its node.
+  const dispatcherJobs = only ? (ctx.nodes ?? []).filter((n) => !isSweep(n) && dispatchRaw(n).includes(node.id)).map((n) => n.id) : [];
   // The checks a merge gate publishes. One left in progress on a head (a withdrawn
   // result waits for a verdict) is waiting on THIS sweep: counted as running, it
   // would hold the head back from the verdict it waits for.
@@ -516,6 +607,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
             // has reviewed: one search, instead of reading every open PR's head.
             ...(sweepRequiresReview(node) && ctx.config.identity?.bot_login ? { "reviewed-by": ctx.config.identity.bot_login } : {}),
             ...(rereviewLabelOf(ctx.config) ? { "rereview-label": rereviewLabelOf(ctx.config)! } : {}),
+            // Started for one PR: read that PR, not the search (whose index lags a
+            // review that has only just been posted).
+            ...(only ? { only: "${{ inputs.pr }}" } : {}),
             ...(rollout && Object.keys(rollout).length ? { rollout: JSON.stringify(rollout) } : {}),
             ...(ctx.config.identity?.bot_login ? { "bot-login": ctx.config.identity.bot_login } : {}),
           },
@@ -533,7 +627,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     ...(skipBots || Object.keys(skipLabels).length
       ? [`#   not skipped ${[skipBots ? "not opened by a bot (the harness's own is exempt)" : "", Object.keys(skipLabels).length ? "no skip= label" : ""].filter(Boolean).join(", ")}`]
       : []),
-    `#   reviews in  no review is still being waited on (no pending review request)`,
+    ...(sweepHoldsOnReviewRequests(node)
+      ? [`#   reviews in  no review is still being waited on (no pending review request)`]
+      : []),
     `#   checks in   every check-run on the head is completed (the gate's own result`,
     `#               aside: it waits on this lane's verdict), no commit status`,
     `#               pending — and at least one check-run exists, unless the PR has`,
@@ -546,22 +642,74 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `#   not spent   fewer than $MAX_FAILURES failed lane runs on this head, and fewer`,
     `#               than $MAX_IDLE runs that succeeded without leaving a verdict`,
     ...listing,
+    ...(only
+      ? [
+          `# Started for one PR (an upstream lane's dispatch): that PR alone, under the`,
+          `# same rules. A scheduled run (no pr) walks every candidate.`,
+          `ONLY_PR="\${ONLY_PR//[[:space:]]/}"`,
+          `if [ -n "$ONLY_PR" ]; then`,
+          `  case "$ONLY_PR" in *[!0-9]*) echo "::error::the pr input must be a PR number, got '$ONLY_PR'"; exit 1 ;; esac`,
+          `  ONLY_PR=$((10#$ONLY_PR))`,
+          `  LIST=$(awk -v n="$ONLY_PR" '$1 == n' <<< "$LIST")`,
+          `  [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"`,
+          `fi`,
+        ]
+      : []),
+    ...(only
+      ? [
+          `# A run started for one PR and the scheduled sweep can overlap. A head whose`,
+          `# lane job in ANOTHER run of this workflow has not finished is being decided`,
+          `# there: left alone, so it is not decided twice (twice the agent, twice the`,
+          `# idle or failure count). Unreadable: nothing is left out, as before.`,
+          `INFLIGHT=""`,
+          `if RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?status=in_progress&per_page=50" --jq '.workflow_runs[] | select((.id | tostring) != env.GITHUB_RUN_ID) | .id' 2>/dev/null); then`,
+          `  for RID in $RUNS; do`,
+          `    INFLIGHT+=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RID/jobs?per_page=100" --jq '.jobs[] | select(.status != "completed") | .name' 2>/dev/null || true)$'\\n'`,
+          `  done`,
+          `fi`,
+        ]
+      : []),
     `SELECTED='[]'`,
+    ...(explain
+      ? [
+          `# explain_on: why each head is not being decided (or that it is), for the`,
+          `# gate's check while the head has no verdict. A head whose state could not be`,
+          `# read, or that is already decided, gets none.`,
+          `WAITING='[]'`,
+          `# None while a re-review is requested (SINCE): the gate holds the check for that`,
+          `# itself. A title is at most $WAITING_TITLE_MAX characters, as the gate writes it.`,
+          `wait_for() {`,
+          `  [ -z "\${SINCE:-}" ] || return 0`,
+          `  WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "\${1:0:$WAITING_TITLE_MAX}" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING")`,
+          `}`,
+        ]
+      : []),
     `while read -r NUM SHA REQUESTED QUIET BASE SINCE; do`,
     `  [ -n "$NUM" ] || continue`,
     `  # SINCE: when a re-review was requested on this PR ("-": none). Records from`,
     `  # before it — verdicts, reviews, the sweep's own check-runs — do not count.`,
     `  [ "\${SINCE:-}" = "-" ] && SINCE=""`,
     `  export SINCE="\${SINCE:-}"`,
-    `  if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`,
+    ...(only
+      ? [`  if grep -qxF "$JOB_PREFIX$NUM" <<< "$INFLIGHT"; then echo "#$NUM: being decided by another run of this sweep right now"; continue; fi`]
+      : []),
+    ...(sweepHoldsOnReviewRequests(node)
+      ? [`  if [ "$REQUESTED" != "0" ]; then ${w("Waiting: $REQUESTED review request(s) outstanding")}echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`]
+      : []),
     `  # One read of the head's check-runs answers four questions: how many exist,`,
     `  # how many are still running, has the lane already run here, how often has it failed.`,
     `  # filter=all: the default (latest) keeps only the newest run per check name, which`,
     `  # hides all but one sweep-failed record and lets a newer skipped run of a job mask`,
     `  # an older one still in progress.`,
     `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-    `    .check_runs | [ length,`,
-    `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
+    explain
+      ? // The gate's own check is not CI registering: explain_on= puts it on a head before CI may have.
+        `    .check_runs | [ ([.[] | select(.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not)] | length),`
+      : `    .check_runs | [ length,`,
+    only
+      ? // In a run a lane dispatched for this PR, that lane's own job is still finishing on the head.
+        `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not) and (.name as $n | (env.ONLY_PR // "") != "" and ((env.DISPATCHER_JOBS // "") | split("\\n") | index($n)) | not))] | length),`
+      : `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
     `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
     `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length)${quiet ? "," : " ] | @tsv' \\"}`,
@@ -578,8 +726,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
           `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
         ]),
-    `  if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
+    `  if [ "$RUNNING" != "0" ]; then ${w(WAITING_ON_CI)}echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
     `  if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then`,
+    ...(explain ? [`    ${w("Waiting: CI has not started on this head")}`] : []),
     `    echo "#$NUM: no check-run on $SHA yet and the PR changed \${QUIET}s ago — waiting for CI to register"`,
     `    continue`,
     `  fi`,
@@ -588,19 +737,20 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  # it still holds if the verdict review's body is later edited.`,
     `  if [ "$SWEPT" != "0" ]; then echo "#$NUM: already swept at $SHA"; continue; fi`,
     `  # …and a lane that keeps FAILING on a head is not retried forever either.`,
-    `  if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi`,
+    `  if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then ${w(`Waiting: ${node.id} gave up after $FAILURES failed runs — push to retry`)}echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi`,
     `  # …nor is one that keeps succeeding without ever leaving a verdict.`,
-    `  if [ "$IDLE" -ge "$MAX_IDLE" ]; then echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi`,
+    `  if [ "$IDLE" -ge "$MAX_IDLE" ]; then ${w(`Waiting: ${node.id} gave up after $IDLE runs without a verdict — push to retry`)}echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi`,
     `  STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" --jq '`,
     `    if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }`,
-    `  if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi`,
+    `  if [ "$STATUS" = "pending" ]; then ${w("Waiting: a commit status is pending")}echo "#$NUM: a commit status is pending"; continue; fi`,
     `  REVIEWS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
     ...SELECT_REVIEWS_JQ.map((l) => `    ${l}`),
     `  ' | awk '{d+=$1; r+=$2} END {print d+0, r+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
     `  read -r DECIDED REVIEWED <<< "$REVIEWS"`,
     `  if [ "$DECIDED" != "0" ]; then echo "#$NUM: already decided at $SHA"; continue; fi`,
     `  # requires_review: the lane acts on an upstream review, so a head no review covers is still waiting.`,
-    `  if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi`,
+    `  if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then ${w("Waiting: the upstream review of this head")}echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi`,
+    ...(explain ? [`  ${w(`${node.id} is deciding`)}`] : []),
     `  echo "#$NUM: selected at $SHA"`,
     `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE" '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")`,
     `  if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then`,
@@ -609,17 +759,20 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  fi`,
     `done <<< "$LIST"`,
     `{ echo "prs=$SELECTED"; echo "count=$(jq 'length' <<< "$SELECTED")"; } >> "$GITHUB_OUTPUT"`,
+    ...(explain ? [`echo "waiting=$WAITING" >> "$GITHUB_OUTPUT"`] : []),
   ].join("\n");
 
   return {
     jobId: preJobId(node),
     name: `${node.id} sweep select`,
     displayName: `${node.id} select`,
-    permissions: { contents: "read", "pull-requests": "read", checks: "read", statuses: "read" },
+    // actions: read — a dispatched sweep reads which heads its other runs are deciding.
+    permissions: { contents: "read", "pull-requests": "read", checks: "read", statuses: "read", ...(only ? { actions: "read" as const } : {}) },
     timeoutMinutes: 10,
     outputs: {
       prs: "${{ steps.select.outputs.prs }}",
       count: "${{ steps.select.outputs.count }}",
+      ...(explain ? { waiting: "${{ steps.select.outputs.waiting }}" } : {}),
     },
     steps: [
       ...scopeListSteps,
@@ -645,6 +798,15 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(gateChecks.length ? { GATE_CHECKS: gateChecks.join("\n") } : {}),
+          ...(only
+            ? {
+                ONLY_PR: "${{ inputs.pr }}",
+                WORKFLOW_FILE: `${node.id}.yml`,
+                JOB_PREFIX: sweepJobNamePrefix(node),
+                ...(dispatcherJobs.length ? { DISPATCHER_JOBS: dispatcherJobs.join("\n") } : {}),
+              }
+            : {}),
+          ...(explain ? { WAITING_TITLE_MAX: String(WAITING_TITLE_MAX) } : {}),
           ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),

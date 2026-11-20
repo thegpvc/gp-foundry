@@ -94,6 +94,12 @@ describe("formatContext - pr-review", () => {
     expect(result).toContain("-10");
   });
 
+  it("lists pending review requests, people and teams, and nothing when there are none", () => {
+    const pr = { ...prData.pr!, requested_reviewers: [{ login: "alice" }], requested_teams: [{ slug: "platform" }] };
+    expect(formatContext({ ...prData, pr }, { type: "pr-review", number: 10 })).toContain("Review requested from (pending): alice, team platform");
+    expect(formatContext(prData, { type: "pr-review", number: 10 })).not.toContain("Review requested from");
+  });
+
   it("includes comments, reviews, inline comments, and diff sections", () => {
     const result = formatContext(prData, { type: "pr-review", number: 10 });
     expect(result).toContain("=== COMMENTS (1) ===");
