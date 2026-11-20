@@ -96,7 +96,7 @@ describe("formatContext - pr-review", () => {
 
   it("lists pending review requests, people and teams, and nothing when there are none", () => {
     const pr = { ...prData.pr!, requested_reviewers: [{ login: "alice" }], requested_teams: [{ slug: "platform" }] };
-    expect(formatContext({ ...prData, pr }, { type: "pr-review", number: 10 })).toContain("Review requested from (pending): @alice, team platform");
+    expect(formatContext({ ...prData, pr }, { type: "pr-review", number: 10 })).toContain("Review requested from (pending): alice, team platform");
     expect(formatContext(prData, { type: "pr-review", number: 10 })).not.toContain("Review requested from");
   });
 

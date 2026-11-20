@@ -954,3 +954,27 @@ describe("explain_on: a sweep's reason on a head with no verdict (#52)", () => {
     expect(waitingFromInputs("y".repeat(300), s40)!.title).toHaveLength(120);
   });
 });
+
+describe("explain_on: the verdict is in but CI is still running (#52 review)", () => {
+  it("a check held from before the verdict says it is waiting on CI, not that the approver is deciding", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    await tick(w, { prNumber: 1, waiting: { title: "approver is deciding", sha: w.headSha(1) } });
+    Object.assign(w.prs.get(1)!, { verdict: "APPROVE", ci: "in_progress" });
+    await tick(w, { prNumber: 1 });
+    expect(w.result(1)).toMatchObject({ status: "in_progress", output: { title: "Waiting: checks still running" } });
+    // The sweep's own reason for that wait is the same title: nothing more to send.
+    await tick(w, { prNumber: 1, waiting: { title: "Waiting: checks still running", sha: w.headSha(1) } });
+    expect(w.checks.filter((c) => c.name === CHECK)).toHaveLength(1);
+  });
+
+  it("a completed result is left as it is", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, verdict: "APPROVE" });
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+    w.prs.get(1)!.ci = "in_progress";
+    await tick(w, { prNumber: 1 });
+    expect(current(w, 1, "success")).toBe(true);
+  });
+});

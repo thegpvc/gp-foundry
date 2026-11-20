@@ -12,6 +12,7 @@
  * No gp-dixie hardcodes live here: everything comes from the policy file / inputs.
  */
 
+import { WAITING_ON_CI, WAITING_TITLE_MAX } from "../../../src/shared/explain.js";
 import { existsSync, readFileSync } from "node:fs";
 import * as core from "@actions/core";
 import * as github from "@actions/github";
@@ -1004,9 +1005,12 @@ export async function pendCheck(
   name: string,
   app: string,
   output: { title: string; summary: string },
+  /** Only retitle a run already held in progress; never create one or supersede a result. */
+  onlyIfHeld = false,
 ): Promise<boolean> {
   const runs = await checksOctokit.paginate(checksOctokit.rest.checks.listForRef, { owner, repo, ref: headSha, check_name: name, filter: "all", per_page: 100 });
   const mine = runs.filter((r) => r.name === name && r.app?.slug === app).sort((a, b) => b.id - a.id)[0];
+  if (onlyIfHeld && (!mine || mine.status === "completed")) return false;
   if (mine && mine.status !== "completed") {
     if ((mine.output?.title ?? "") === output.title && (mine.output?.summary ?? "") === output.summary) return false;
     await checksOctokit.rest.checks.update({ owner, repo, check_run_id: mine.id, status: "in_progress", output });
@@ -1262,6 +1266,13 @@ export async function runHybridGate(opts: {
       core.info(`PR #${n}: ${out.conclusion} (${decision.code}) — ${decision.reason}`);
       if (ciPendingOnly && !verdictless) {
         core.info(`PR #${n}: CI is still running on ${(facts.headSha ?? "").slice(0, 8)} — no result from an event run; the scheduled pass settles it`);
+        // A check held in progress from before the verdict ("approver is deciding")
+        // would otherwise go on saying so: say what it now waits for instead. Still
+        // in progress; a completed result is left alone. The title is the sweep's
+        // own for this wait (explain_on=), so its next tick sends nothing new.
+        if (!opts.dryRun && facts.headSha) {
+          await pendCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp, { title: WAITING_ON_CI, summary: `The approver's verdict on \`${facts.headSha.slice(0, 7)}\` is in; checks are still running on it. This check stays in progress until they finish, then the gate publishes its result.` }, true);
+        }
       } else if (!opts.dryRun && facts.headSha && !verdictless) {
         const result = await publishCheck(checksOctokit, owner, repo, facts.headSha, checkName, out, opts.checkApp);
         if (result !== "unchanged") {
@@ -1320,7 +1331,7 @@ export interface Waiting {
  * of at most 120 characters (it is a check title), the sha a full commit SHA.
  */
 export function waitingFromInputs(rawTitle: string, rawSha: string): Waiting | undefined {
-  const title = rawTitle.replace(/[\r\n]+/g, " ").trim().slice(0, 120);
+  const title = rawTitle.replace(/[\r\n]+/g, " ").trim().slice(0, WAITING_TITLE_MAX);
   const sha = rawSha.trim();
   if (!title || !sha) return undefined;
   if (!/^[0-9a-f]{40}$/i.test(sha)) {

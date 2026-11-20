@@ -12,6 +12,7 @@
  * Untrusted values never reach the script text — everything arrives via `env:`.
  */
 import { QUIET_CHECK_JQ } from "../shared/verdicts.js";
+import { WAITING_ON_CI, WAITING_TITLE_MAX } from "../shared/explain.js";
 import type { EmitContext, StepSpec, WorkflowJobFragment } from "../ir/types.js";
 import {
   quietVerdictsOf,
@@ -37,6 +38,7 @@ import {
   sweepHoldsOnReviewRequests,
   dispatchedSweepsOf,
   explainGateOf,
+  dispatchRaw,
   botAppSlug,
   sweepJobNamePrefix,
   sweptCheckName,
@@ -128,9 +130,9 @@ function emitSweepExplain(ctx: EmitContext): WorkflowJobFragment | undefined {
           BASE_BRANCH: ctx.config.repo.base_branch,
         },
         run: [
-          `# Only a changed reason starts a gate run: the check already saying it, a`,
-          `# result already on the head (the gate decides that), or the gate's own hold`,
-          `# for a re-review, and nothing is sent.`,
+          `# Only a changed reason starts a gate run: the check already saying it, or a`,
+          `# result already on the head (the gate decides that), and nothing is sent.`,
+          `# (A head held for a re-review gets no reason from the select job.)`,
           `ERR=$(mktemp)`,
           `CHECK_Q=$(jq -rn --arg n "$GATE_CHECK" '$n | @uri')`,
           `while IFS=$'\\t' read -r NUM SHA TITLE; do`,
@@ -145,7 +147,6 @@ function emitSweepExplain(ctx: EmitContext): WorkflowJobFragment | undefined {
           `  SHOWN=\${CUR#*$'\\t'}`,
           `  if [ "$STATE" = "completed" ]; then echo "#$NUM: $GATE_CHECK has a result on $SHA — the gate's to change"; continue; fi`,
           `  if [ "$SHOWN" = "$TITLE" ]; then echo "#$NUM: already shows: $TITLE"; continue; fi`,
-          `  if [ "$SHOWN" = "Re-review requested" ]; then echo "#$NUM: held for a re-review by the gate"; continue; fi`,
           `  if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$GATE_WORKFLOW/dispatches" \\`,
           `      -f ref="$BASE_BRANCH" -f "inputs[pr]=$NUM" -f "inputs[reason]=$TITLE" -f "inputs[reason_sha]=$SHA" > /dev/null 2> "$ERR"; then`,
           `    echo "#$NUM: $TITLE"`,
@@ -538,6 +539,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
   // explain_on= (#52): each head left waiting carries the reason, for the gate's check.
   const explain = explainGateOf(node, ctx.nodes ?? []) !== undefined;
   const w = (title: string) => (explain ? `wait_for "${title}"; ` : "");
+  // The jobs of the lanes whose dispatch= names this sweep: each is named after its node.
+  const dispatcherJobs = only ? (ctx.nodes ?? []).filter((n) => !isSweep(n) && dispatchRaw(n).includes(node.id)).map((n) => n.id) : [];
   // The checks a merge gate publishes. One left in progress on a head (a withdrawn
   // result waits for a verdict) is waiting on THIS sweep: counted as running, it
   // would hold the head back from the verdict it waits for.
@@ -643,10 +646,26 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
       ? [
           `# Started for one PR (an upstream lane's dispatch): that PR alone, under the`,
           `# same rules. A scheduled run (no pr) walks every candidate.`,
-          `if [ -n "\${ONLY_PR:-}" ]; then`,
+          `ONLY_PR="\${ONLY_PR//[[:space:]]/}"`,
+          `if [ -n "$ONLY_PR" ]; then`,
           `  case "$ONLY_PR" in *[!0-9]*) echo "::error::the pr input must be a PR number, got '$ONLY_PR'"; exit 1 ;; esac`,
+          `  ONLY_PR=$((10#$ONLY_PR))`,
           `  LIST=$(awk -v n="$ONLY_PR" '$1 == n' <<< "$LIST")`,
           `  [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"`,
+          `fi`,
+        ]
+      : []),
+    ...(only
+      ? [
+          `# A run started for one PR and the scheduled sweep can overlap. A head whose`,
+          `# lane job in ANOTHER run of this workflow has not finished is being decided`,
+          `# there: left alone, so it is not decided twice (twice the agent, twice the`,
+          `# idle or failure count). Unreadable: nothing is left out, as before.`,
+          `INFLIGHT=""`,
+          `if RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?status=in_progress&per_page=50" --jq '.workflow_runs[] | select((.id | tostring) != env.GITHUB_RUN_ID) | .id' 2>/dev/null); then`,
+          `  for RID in $RUNS; do`,
+          `    INFLIGHT+=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RID/jobs?per_page=100" --jq '.jobs[] | select(.status != "completed") | .name' 2>/dev/null || true)$'\\n'`,
+          `  done`,
           `fi`,
         ]
       : []),
@@ -657,7 +676,12 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           `# gate's check while the head has no verdict. A head whose state could not be`,
           `# read, or that is already decided, gets none.`,
           `WAITING='[]'`,
-          `wait_for() { WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "$1" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING"); }`,
+          `# None while a re-review is requested (SINCE): the gate holds the check for that`,
+          `# itself. A title is at most $WAITING_TITLE_MAX characters, as the gate writes it.`,
+          `wait_for() {`,
+          `  [ -z "\${SINCE:-}" ] || return 0`,
+          `  WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "\${1:0:$WAITING_TITLE_MAX}" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING")`,
+          `}`,
         ]
       : []),
     `while read -r NUM SHA REQUESTED QUIET BASE SINCE; do`,
@@ -666,6 +690,9 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  # before it — verdicts, reviews, the sweep's own check-runs — do not count.`,
     `  [ "\${SINCE:-}" = "-" ] && SINCE=""`,
     `  export SINCE="\${SINCE:-}"`,
+    ...(only
+      ? [`  if grep -qxF "$JOB_PREFIX$NUM" <<< "$INFLIGHT"; then echo "#$NUM: being decided by another run of this sweep right now"; continue; fi`]
+      : []),
     ...(sweepHoldsOnReviewRequests(node)
       ? [`  if [ "$REQUESTED" != "0" ]; then ${w("Waiting: $REQUESTED review request(s) outstanding")}echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi`]
       : []),
@@ -675,8 +702,14 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  # hides all but one sweep-failed record and lets a newer skipped run of a job mask`,
     `  # an older one still in progress.`,
     `  CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-    `    .check_runs | [ length,`,
-    `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
+    explain
+      ? // The gate's own check is not CI registering: explain_on= puts it on a head before CI may have.
+        `    .check_runs | [ ([.[] | select(.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not)] | length),`
+      : `    .check_runs | [ length,`,
+    only
+      ? // In a run a lane dispatched for this PR, that lane's own job is still finishing on the head.
+        `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not) and (.name as $n | (env.ONLY_PR // "") != "" and ((env.DISPATCHER_JOBS // "") | split("\\n") | index($n)) | not))] | length),`
+      : `      ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\\n") | index($n) | not))] | length),`,
     `      ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
     `      ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),`,
     `      ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length)${quiet ? "," : " ] | @tsv' \\"}`,
@@ -693,7 +726,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           `    | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }`,
           `  read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"`,
         ]),
-    `  if [ "$RUNNING" != "0" ]; then ${w("Waiting: $RUNNING check(s) still running")}echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
+    `  if [ "$RUNNING" != "0" ]; then ${w(WAITING_ON_CI)}echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi`,
     `  if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then`,
     ...(explain ? [`    ${w("Waiting: CI has not started on this head")}`] : []),
     `    echo "#$NUM: no check-run on $SHA yet and the PR changed \${QUIET}s ago — waiting for CI to register"`,
@@ -733,7 +766,8 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     jobId: preJobId(node),
     name: `${node.id} sweep select`,
     displayName: `${node.id} select`,
-    permissions: { contents: "read", "pull-requests": "read", checks: "read", statuses: "read" },
+    // actions: read — a dispatched sweep reads which heads its other runs are deciding.
+    permissions: { contents: "read", "pull-requests": "read", checks: "read", statuses: "read", ...(only ? { actions: "read" as const } : {}) },
     timeoutMinutes: 10,
     outputs: {
       prs: "${{ steps.select.outputs.prs }}",
@@ -764,7 +798,15 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           SETTLE_SECONDS: String(SWEEP_SETTLE_SECONDS),
           ...(gateChecks.length ? { GATE_CHECKS: gateChecks.join("\n") } : {}),
-          ...(only ? { ONLY_PR: "${{ inputs.pr }}" } : {}),
+          ...(only
+            ? {
+                ONLY_PR: "${{ inputs.pr }}",
+                WORKFLOW_FILE: `${node.id}.yml`,
+                JOB_PREFIX: sweepJobNamePrefix(node),
+                ...(dispatcherJobs.length ? { DISPATCHER_JOBS: dispatcherJobs.join("\n") } : {}),
+              }
+            : {}),
+          ...(explain ? { WAITING_TITLE_MAX: String(WAITING_TITLE_MAX) } : {}),
           ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
           ...(authors ? { AUTHORS: authors.join(",") } : {}),
           ...(optIn ? { OPT_IN_LABEL: optIn } : {}),

@@ -24,6 +24,7 @@ jobs:
       pull-requests: read
       checks: read
       statuses: read
+      actions: read
     timeout-minutes: 10
     outputs:
       prs: ${{ steps.select.outputs.prs }}
@@ -66,6 +67,10 @@ jobs:
           SETTLE_SECONDS: "600"
           GATE_CHECKS: gp-foundry/approval (gate)
           ONLY_PR: ${{ inputs.pr }}
+          WORKFLOW_FILE: approver.yml
+          JOB_PREFIX: "approver #"
+          DISPATCHER_JOBS: reviewer
+          WAITING_TITLE_MAX: "120"
           VERDICT_CHECK: gp-foundry/verdict (approver)
           BOT_APP: agent-app
         run: |-
@@ -94,23 +99,41 @@ jobs:
           LIST=$(jq -r '.[] | "\(.number) \(.sha) \(.requested) \(.quiet) \(.base) \(.since // "-")"' <<< "$SCOPED")
           # Started for one PR (an upstream lane's dispatch): that PR alone, under the
           # same rules. A scheduled run (no pr) walks every candidate.
-          if [ -n "${ONLY_PR:-}" ]; then
+          ONLY_PR="${ONLY_PR//[[:space:]]/}"
+          if [ -n "$ONLY_PR" ]; then
             case "$ONLY_PR" in *[!0-9]*) echo "::error::the pr input must be a PR number, got '$ONLY_PR'"; exit 1 ;; esac
+            ONLY_PR=$((10#$ONLY_PR))
             LIST=$(awk -v n="$ONLY_PR" '$1 == n' <<< "$LIST")
             [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"
+          fi
+          # A run started for one PR and the scheduled sweep can overlap. A head whose
+          # lane job in ANOTHER run of this workflow has not finished is being decided
+          # there: left alone, so it is not decided twice (twice the agent, twice the
+          # idle or failure count). Unreadable: nothing is left out, as before.
+          INFLIGHT=""
+          if RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?status=in_progress&per_page=50" --jq '.workflow_runs[] | select((.id | tostring) != env.GITHUB_RUN_ID) | .id' 2>/dev/null); then
+            for RID in $RUNS; do
+              INFLIGHT+=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RID/jobs?per_page=100" --jq '.jobs[] | select(.status != "completed") | .name' 2>/dev/null || true)$'\n'
+            done
           fi
           SELECTED='[]'
           # explain_on: why each head is not being decided (or that it is), for the
           # gate's check while the head has no verdict. A head whose state could not be
           # read, or that is already decided, gets none.
           WAITING='[]'
-          wait_for() { WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "$1" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING"); }
+          # None while a re-review is requested (SINCE): the gate holds the check for that
+          # itself. A title is at most $WAITING_TITLE_MAX characters, as the gate writes it.
+          wait_for() {
+            [ -z "${SINCE:-}" ] || return 0
+            WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "${1:0:$WAITING_TITLE_MAX}" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING")
+          }
           while read -r NUM SHA REQUESTED QUIET BASE SINCE; do
             [ -n "$NUM" ] || continue
             # SINCE: when a re-review was requested on this PR ("-": none). Records from
             # before it — verdicts, reviews, the sweep's own check-runs — do not count.
             [ "${SINCE:-}" = "-" ] && SINCE=""
             export SINCE="${SINCE:-}"
+            if grep -qxF "$JOB_PREFIX$NUM" <<< "$INFLIGHT"; then echo "#$NUM: being decided by another run of this sweep right now"; continue; fi
             if [ "$REQUESTED" != "0" ]; then wait_for "Waiting: $REQUESTED review request(s) outstanding"; echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi
             # One read of the head's check-runs answers four questions: how many exist,
             # how many are still running, has the lane already run here, how often has it failed.
@@ -118,8 +141,8 @@ jobs:
             # hides all but one sweep-failed record and lets a newer skipped run of a job mask
             # an older one still in progress.
             CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '
-              .check_runs | [ length,
-                ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\n") | index($n) | not))] | length),
+              .check_runs | [ ([.[] | select(.name as $n | (env.GATE_CHECKS // "") | split("\n") | index($n) | not)] | length),
+                ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\n") | index($n) | not) and (.name as $n | (env.ONLY_PR // "") != "" and ((env.DISPATCHER_JOBS // "") | split("\n") | index($n)) | not))] | length),
                 ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
                 ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
                 ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
@@ -129,7 +152,7 @@ jobs:
             read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET_VERDICTS <<< "$CHECKS"
             # quiet_verdicts: a verdict delivered as a check run by the harness App decides the head too.
             if [ "$QUIET_VERDICTS" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi
-            if [ "$RUNNING" != "0" ]; then wait_for "Waiting: $RUNNING check(s) still running"; echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
+            if [ "$RUNNING" != "0" ]; then wait_for "Waiting: checks still running"; echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
             if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then
               wait_for "Waiting: CI has not started on this head"; 
               echo "#$NUM: no check-run on $SHA yet and the PR changed ${QUIET}s ago — waiting for CI to register"
@@ -723,9 +746,9 @@ jobs:
           GATE_APP: agent-app
           BASE_BRANCH: main
         run: |-
-          # Only a changed reason starts a gate run: the check already saying it, a
-          # result already on the head (the gate decides that), or the gate's own hold
-          # for a re-review, and nothing is sent.
+          # Only a changed reason starts a gate run: the check already saying it, or a
+          # result already on the head (the gate decides that), and nothing is sent.
+          # (A head held for a re-review gets no reason from the select job.)
           ERR=$(mktemp)
           CHECK_Q=$(jq -rn --arg n "$GATE_CHECK" '$n | @uri')
           while IFS=$'\t' read -r NUM SHA TITLE; do
@@ -740,7 +763,6 @@ jobs:
             SHOWN=${CUR#*$'\t'}
             if [ "$STATE" = "completed" ]; then echo "#$NUM: $GATE_CHECK has a result on $SHA — the gate's to change"; continue; fi
             if [ "$SHOWN" = "$TITLE" ]; then echo "#$NUM: already shows: $TITLE"; continue; fi
-            if [ "$SHOWN" = "Re-review requested" ]; then echo "#$NUM: held for a re-review by the gate"; continue; fi
             if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$GATE_WORKFLOW/dispatches" \
                 -f ref="$BASE_BRANCH" -f "inputs[pr]=$NUM" -f "inputs[reason]=$TITLE" -f "inputs[reason_sha]=$SHA" > /dev/null 2> "$ERR"; then
               echo "#$NUM: $TITLE"

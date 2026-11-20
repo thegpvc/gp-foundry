@@ -177,10 +177,30 @@ describe("explain_on: why an undecided head is waiting, on the gate's check (#52
     expect(r.prs.map((p: any) => p.number)).toEqual([5]);
     expect(JSON.parse(r.get("waiting")!)).toEqual([
       { number: 1, sha: "sha1", title: "Waiting: 1 review request(s) outstanding" },
-      { number: 2, sha: "sha2", title: "Waiting: 1 check(s) still running" },
+      { number: 2, sha: "sha2", title: "Waiting: checks still running" },
       { number: 3, sha: "sha3", title: "Waiting: the upstream review of this head" },
       { number: 5, sha: "sha5", title: "approver is deciding" },
     ]);
+  });
+
+  it("no reason while a re-review is requested: the gate holds the check for that itself", () => {
+    const r = runSelect(selectStep(D), [{ ...pr(1, 1), since: "2026-11-20T09:00:00Z" }], ready(1));
+    expect(JSON.parse(r.get("waiting")!)).toEqual([]);
+  });
+
+  it("the gate's own held check is not CI registering: a head with only that still settles", () => {
+    const held = { ...ready(1), "repos/o/r/commits/sha1/check-runs?per_page=100&filter=all": { check_runs: [{ name: "gp-foundry/approval (gate)", status: "in_progress", app: { slug: "github-actions" } }] } };
+    const r = runSelect(selectStep(D), [{ ...pr(1), quiet: 30 }], held);
+    expect(r.prs).toEqual([]);
+    expect(JSON.parse(r.get("waiting")!)).toEqual([{ number: 1, sha: "sha1", title: "Waiting: CI has not started on this head" }]);
+  });
+
+  it("a title is cut to the gate's limit, so the explain job's comparison holds", () => {
+    const long = "x".repeat(130);
+    const d = dot({ approver: 'explain_on="gate"' }).replaceAll("approver", long);
+    const step = wf(d, long).jobs[`${long}_select`].steps.find((s: any) => s.id === "select");
+    const r = runSelect(step, [pr(1)], ready(1));
+    expect(JSON.parse(r.get("waiting")!)[0].title).toHaveLength(120);
   });
 
   it("a head that gave up says so, and how to retry", () => {
@@ -209,7 +229,7 @@ describe("explain_on: why an undecided head is waiting, on the gate's check (#52
     mkdirSync(bin);
     const log = join(dir, "log");
     // The gate's check per head: #1 already says it, #2 says something else, #3 has a
-    // result, #4 none yet, #5 the gate's own re-review hold, #6 unreadable.
+    // result, #4 none yet (another app's run aside), #5 a re-review hold since lifted, #6 unreadable.
     writeFileSync(
       join(bin, "gh"),
       `#!/usr/bin/env bash
@@ -238,10 +258,10 @@ jq -r "$jqe" <<< "$body"
     expect(sent).toEqual([
       "api --method POST repos/o/r/actions/workflows/gate.yml/dispatches -f ref=main -f inputs[pr]=2 -f inputs[reason]=approver is deciding -f inputs[reason_sha]=sha2",
       "api --method POST repos/o/r/actions/workflows/gate.yml/dispatches -f ref=main -f inputs[pr]=4 -f inputs[reason]=approver is deciding -f inputs[reason_sha]=sha4",
+      "api --method POST repos/o/r/actions/workflows/gate.yml/dispatches -f ref=main -f inputs[pr]=5 -f inputs[reason]=approver is deciding -f inputs[reason_sha]=sha5",
     ]);
     expect(out).toContain("#1: already shows");
     expect(out).toContain("#3: gp-foundry/approval (gate) has a result");
-    expect(out).toContain("#5: held for a re-review");
     expect(out).toContain("::warning::#6: could not read");
   });
 
@@ -260,5 +280,66 @@ jq -r "$jqe" <<< "$body"
     expect(w.jobs.approver_select.outputs.waiting).toBeUndefined();
     expect(w.jobs.approver_select.steps.find((s: any) => s.id === "select").run).not.toContain("wait_for");
     expect(wf(dot(), "gate").on.workflow_dispatch).toEqual({});
+  });
+});
+
+describe("review fixes: a dispatched sweep (#51)", () => {
+  const D = dot({ reviewer: 'dispatch="approver"' });
+
+  it("a head another run of the sweep is deciding right now is left to it", () => {
+    const step = selectStep(D);
+    expect(step.env).toMatchObject({ WORKFLOW_FILE: "approver.yml", JOB_PREFIX: "approver #" });
+    expect(wf(D, "approver").jobs.approver_select.permissions.actions).toBe("read");
+    const fx = {
+      ...ready(1),
+      ...ready(2),
+      "repos/o/r/actions/workflows/approver.yml/runs?status=in_progress&per_page=50": { workflow_runs: [{ id: 41 }, { id: 42 }] },
+      "repos/o/r/actions/runs/41/jobs?per_page=100": { jobs: [{ name: "approver #1", status: "in_progress" }, { name: "approver #2", status: "completed" }] },
+      "repos/o/r/actions/runs/42/jobs?per_page=100": { jobs: [{ name: "approver select", status: "in_progress" }] },
+    };
+    const r = runSelect(step, [pr(1), pr(2)], fx, { GITHUB_RUN_ID: "42" });
+    expect(r.stdout).toContain("#1: being decided by another run");
+    expect(r.prs.map((p: any) => p.number)).toEqual([2]);
+    // Unreadable runs: nothing is left out.
+    expect(runSelect(step, [pr(1), pr(2)], { ...ready(1), ...ready(2) }).prs.map((p: any) => p.number)).toEqual([1, 2]);
+  });
+
+  it("in a run the reviewer dispatched, the reviewer's own finishing job is not CI still running", () => {
+    const step = selectStep(D);
+    expect(step.env.DISPATCHER_JOBS).toBe("reviewer");
+    const fx = { ...ready(7), "repos/o/r/commits/sha7/check-runs?per_page=100&filter=all": { check_runs: [{ name: "ci", status: "completed", app: { slug: "github-actions" } }, { name: "reviewer", status: "in_progress", app: { slug: "github-actions" } }] } };
+    expect(runSelect(step, [pr(7)], fx, { ONLY_PR: "7" }).prs.map((p: any) => p.number)).toEqual([7]);
+    // The scheduled sweep still waits for it.
+    expect(runSelect(step, [pr(7)], fx, { ONLY_PR: "" }).prs).toEqual([]);
+  });
+
+  it("the pr input: surrounding whitespace and leading zeros are fine", () => {
+    const step = selectStep(D);
+    expect(runSelect(step, [pr(7)], ready(7), { ONLY_PR: " 07 " }).prs.map((p: any) => p.number)).toEqual([7]);
+  });
+
+  it("cancel_in_progress=true never cancels a run for one PR", () => {
+    const w = wf(dot({ reviewer: 'dispatch="approver"', approver: "cancel_in_progress=true" }), "approver");
+    expect(w.concurrency["cancel-in-progress"]).toBe("${{ !inputs.pr }}");
+  });
+
+  it("a gate that changed several PRs starts one full sweep; one PR, a run for it", () => {
+    const wake = wf(dot({ gate: 'dispatch="approver"' }), "gate").jobs.gate.steps.find((s: any) => s.name === "Wake downstream workflows");
+    expect(wake.env.DISPATCH_TARGETS).toBe("approver.yml sweep");
+    const run = (prs: string) => {
+      const dir = mkdtempSync(join(tmpdir(), "gpf-wake-"));
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      writeFileSync(join(bin, "gh"), '#!/usr/bin/env bash\necho "$*" >> "$LOG"\n');
+      chmodSync(join(bin, "gh"), 0o755);
+      const log = join(dir, "log");
+      execFileSync("bash", ["-eo", "pipefail", "-c", wake.run], {
+        env: { PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: "o/r", LOG: log, DISPATCH_TARGETS: wake.env.DISPATCH_TARGETS, BASE_BRANCH: "main", PRS: prs },
+        encoding: "utf8",
+      });
+      return readFileSync(log, "utf8").trim().split("\n");
+    };
+    expect(run("3,5,8")).toEqual(["api --method POST repos/o/r/actions/workflows/approver.yml/dispatches -f ref=main"]);
+    expect(run("3")).toEqual(["api --method POST repos/o/r/actions/workflows/approver.yml/dispatches -f ref=main -f inputs[pr]=3"]);
   });
 });

@@ -347,9 +347,10 @@ function formatPRHeader(pr: PullRequestData, number: number, opts: FormatOptions
   ];
   // A SHA comes from GitHub, not from the author; it needs no scrubbing.
   if (pr.head?.sha) lines.push(`Head: ${pr.head.sha}`);
-  // Logins and team slugs are GitHub identifiers, not free text.
+  // Logins and team slugs are GitHub identifiers, not free text. No "@": a role
+  // that quotes the line must not ping a reviewer who was only copied in.
   const requested = [
-    ...(pr.requested_reviewers ?? []).map((u) => u.login).filter(Boolean).map((l) => `@${l}`),
+    ...(pr.requested_reviewers ?? []).map((u) => u.login).filter(Boolean).map((l) => `${l}`),
     ...(pr.requested_teams ?? []).map((t) => t.slug).filter(Boolean).map((t) => `team ${t}`),
   ];
   if (requested.length) lines.push(`Review requested from (pending): ${requested.join(", ")}`);

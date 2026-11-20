@@ -506,7 +506,8 @@ export function wire(ir: Harness): WiringPlan {
     if (prSweeps.has(node.id) && nw.concurrency) {
       nw.concurrency = {
         group: `\${{ inputs.pr && format('${node.id}-pr-{0}', inputs.pr) || '${node.id}' }}`,
-        "cancel-in-progress": nw.concurrency["cancel-in-progress"],
+        // A run for one PR is never cancelled mid-agent by the next dispatch for it.
+        "cancel-in-progress": nw.concurrency["cancel-in-progress"] === true ? "${{ !inputs.pr }}" : false,
       };
     }
     if (singleGate) {

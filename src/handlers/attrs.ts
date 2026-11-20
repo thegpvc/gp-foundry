@@ -584,15 +584,16 @@ export function dispatchTargetKind(target: HarnessNode | undefined): "pass" | "p
  * pass the PR number as the `pr` input). Unresolvable targets are dropped here;
  * validate() reports them.
  */
-export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean }[] {
-  const out: { workflow: string; withPr: boolean }[] = [];
+export function dispatchTargetsOf(node: HarnessNode, nodes: HarnessNode[]): { workflow: string; withPr: boolean; sweep?: boolean }[] {
+  const out: { workflow: string; withPr: boolean; sweep?: boolean }[] = [];
   for (const t of new Set(dispatchRaw(node))) {
     if (WORKFLOW_FILE_RE.test(t)) {
       out.push({ workflow: t, withPr: true });
       continue;
     }
-    const kind = dispatchTargetKind(nodes.find((n) => n.id === t));
-    if (kind) out.push({ workflow: `${t}.yml`, withPr: kind === "pr" });
+    const target = nodes.find((n) => n.id === t);
+    const kind = dispatchTargetKind(target);
+    if (kind) out.push({ workflow: `${t}.yml`, withPr: kind === "pr", ...(target && isSweep(target) ? { sweep: true } : {}) });
   }
   return out;
 }
