@@ -25,7 +25,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
   "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target", "dispatch",
-  "hold_on_review_requests",
+  "hold_on_review_requests", "explain_on",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -508,7 +508,29 @@ export function quietNudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): Ha
 export function nudgedGatesOf(nodes: HarnessNode[], cfg: FoundryConfig): HarnessNode[] {
   const named = new Set(nodes.flatMap((n) => dispatchRaw(n)));
   const quiet = new Set(quietNudgedGatesOf(nodes, cfg).map((g) => g.id));
-  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id)));
+  const explained = new Set(explainedGatesOf(nodes).map((g) => g.id));
+  return nodes.filter((n) => n.type === "merge-gate" && mergeSettingOf(n) !== undefined && (quiet.has(n.id) || named.has(n.id) || explained.has(n.id)));
+}
+
+/**
+ * `explain_on="<gate>"` on a sweep (#52): while a head has no verdict, the
+ * gate's check on it is held in progress with the reason the sweep's select job
+ * gave for it ("approver is deciding", "Waiting: 2 check(s) still running") —
+ * the reasons come from the sweep's own selection, so the two cannot disagree.
+ * The sweep hands a changed reason to the gate by dispatch; the gate writes it,
+ * and only on a head with no verdict. Undefined: off (or invalid: validate()).
+ */
+export function explainGateOf(node: HarnessNode, nodes: HarnessNode[]): HarnessNode | undefined {
+  const id = node.attrs.explain_on;
+  if (typeof id !== "string" || !isSweep(node)) return undefined;
+  const gate = nodes.find((n) => n.id === id);
+  return gate && gate.type === "merge-gate" && dispatchTargetKind(gate) === "pr" ? gate : undefined;
+}
+
+/** The single gates some sweep explains on: each takes a `reason` with its `pr`. */
+export function explainedGatesOf(nodes: HarnessNode[]): HarnessNode[] {
+  const ids = new Set(nodes.map((n) => explainGateOf(n, nodes)?.id).filter(Boolean));
+  return nodes.filter((n) => ids.has(n.id));
 }
 
 /**

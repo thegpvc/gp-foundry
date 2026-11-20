@@ -155,6 +155,19 @@ inputs:
       merged. Once one exists the gate removes the label. Empty: off.
     required: false
     default: ""
+  waiting-title:
+    description: >
+      With `merge` and `pr-number`: why the approver has no verdict on the PR's
+      head yet, as its sweep put it (explain_on=). When the head is `waiting-sha`
+      and still has no verdict, the gate holds its check there in progress with
+      this title — never a passing state — instead of publishing nothing. Written
+      only when it changed. Empty: off.
+    required: false
+    default: ""
+  waiting-sha:
+    description: "With `waiting-title`: the head SHA the reason was given for. Another head ignores it."
+    required: false
+    default: ""
   rotation-period-seconds:
     description: >
       With `merge` and no `pr-number`: the schedule's period. The pass's window

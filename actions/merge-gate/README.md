@@ -320,6 +320,7 @@ one identity. A rejection counts from anyone, including the author.
 | `check-name`  | evaluate | The check run evaluate mode publishes. |
 | `authors`, `opt-in-label`, `skip-labels`, `skip-bot-authors` | no | Evaluate-mode PR selection (comma-separated logins / labels; `"true"`). |
 | `rereview-label` | no   | With `merge`: the re-review label (see above). Empty: off. |
+| `waiting-title` / `waiting-sha` | no | With `merge` and `pr-number`: why the approver has no verdict on that head yet, from its sweep (`explain_on=`). On that head, while it has no verdict, the check is held in progress with this title instead of left absent; written only when it changed. Empty: off. |
 | `dry-run`     | no       | `"true"` to evaluate + emit outputs without mutating. |
 
 ## Outputs

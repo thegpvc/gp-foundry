@@ -18,7 +18,7 @@ import type {
 } from "../ir/types.js";
 import { isUsesStep } from "../ir/types.js";
 import { emitFanIn, emitNode } from "../handlers/index.js";
-import { emitPostJob, emitPreJob } from "../handlers/prejob.js";
+import { emitPostJobs, emitPreJob } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
 import { releaseTag } from "../shared/version.js";
@@ -269,8 +269,7 @@ export function assemble(
     const jobs: Record<string, unknown> = pre
       ? { [pre.jobId]: fragmentToJob(pre, node, nw.guard), [fragment.jobId]: fragmentToJob(fragment, node) }
       : { [fragment.jobId]: fragmentToJob(fragment, node, nw.guard) };
-    const post = emitPostJob(mkCtx(node));
-    if (post) jobs[post.jobId] = fragmentToJob(post, node);
+    for (const post of emitPostJobs(mkCtx(node))) jobs[post.jobId] = fragmentToJob(post, node);
     emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,

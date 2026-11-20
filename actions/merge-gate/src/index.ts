@@ -1053,6 +1053,12 @@ export async function runHybridGate(opts: {
   self?: GateRun;
   /** The re-review label, when the harness has one (the policy carries it too). */
   rereviewLabel?: string;
+  /**
+   * explain_on= (#52): why the approver has no verdict on this PR's head yet, as
+   * its sweep's select job put it. Shown on the check, in progress, only on that
+   * head and only while it has no verdict.
+   */
+  waiting?: Waiting;
 }): Promise<{ evaluated: number; written: number; mergedPr: string; publishedPrs?: number[] }> {
   const { octokit, checksOctokit, owner, repo, checkName, rollout } = opts;
   if (opts.policy.noVerdictConclusion !== undefined && opts.policy.noVerdictConclusion !== "failure" && opts.policy.noVerdictConclusion !== "neutral") {
@@ -1197,7 +1203,16 @@ export async function runHybridGate(opts: {
         removeRereviewLabel = true;
       }
       const verdictless = !facts.headVerdict && !onDependabotLane;
-      if (verdictless) {
+      const waiting = opts.waiting;
+      if (verdictless && waiting && opts.prNumber === n && facts.headSha === waiting.sha) {
+        // The sweep's reason, for the head it was given for. In progress, which
+        // never passes a required check; written only when it changed.
+        const short = waiting.sha.slice(0, 7);
+        const summary = `${waiting.title}.\n\nThere is no verdict from the approver on \`${short}\` yet, so this check stays in progress — it never passes — until there is one. The reason is the approver's own: its sweep selects the heads it decides. Once the verdict is in, the gate publishes its result here.`;
+        if (!opts.dryRun && (await pendCheck(checksOctokit, owner, repo, waiting.sha, checkName, opts.checkApp, { title: waiting.title, summary }))) {
+          core.info(`PR #${n}: no verdict yet — check held in progress: ${waiting.title}`);
+        }
+      } else if (verdictless) {
         const mine = (facts.checkRuns ?? []).find((c) => c.name === checkName && c.appSlug === opts.checkApp);
         if (mine && !opts.dryRun && facts.headSha && (await withdrawCheck(checksOctokit, owner, repo, facts.headSha, checkName, opts.checkApp))) {
           core.info(`PR #${n}: verdict gone from ${facts.headSha.slice(0, 8)} — result withdrawn`);
@@ -1292,6 +1307,27 @@ function gateRunFromEnv(): GateRun {
     ...(workflowPath ? { workflowPath } : {}),
     ...(workflowPath && actionsToken ? { actionsOctokit: github.getOctokit(actionsToken) } : {}),
   };
+}
+
+/** explain_on=: the reason a sweep gave for a head, and that head. */
+export interface Waiting {
+  title: string;
+  sha: string;
+}
+
+/**
+ * The waiting-title / waiting-sha inputs. Both or nothing; the title is one line
+ * of at most 120 characters (it is a check title), the sha a full commit SHA.
+ */
+export function waitingFromInputs(rawTitle: string, rawSha: string): Waiting | undefined {
+  const title = rawTitle.replace(/[\r\n]+/g, " ").trim().slice(0, 120);
+  const sha = rawSha.trim();
+  if (!title || !sha) return undefined;
+  if (!/^[0-9a-f]{40}$/i.test(sha)) {
+    core.warning(`waiting-sha is not a commit SHA (${JSON.stringify(sha.slice(0, 50))}) — the reason is ignored`);
+    return undefined;
+  }
+  return { title, sha };
 }
 
 export async function run(): Promise<void> {
@@ -1391,6 +1427,7 @@ export async function run(): Promise<void> {
         rereviewLabel: policy.rereviewLabel,
         rotation: Math.floor(Date.now() / (1000 * (parseInt(core.getInput("rotation-period-seconds"), 10) || 300))),
         self: gateRunFromEnv(),
+        waiting: waitingFromInputs(core.getInput("waiting-title"), core.getInput("waiting-sha")),
       });
       core.setOutput("evaluated", String(r.evaluated));
       core.setOutput("checks-written", String(r.written));

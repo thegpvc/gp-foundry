@@ -11,6 +11,7 @@ import { AGENT_TYPES } from "../ir/types.js";
 import {
   nudgedGatesOf,
   dispatchedSweepsOf,
+  explainedGatesOf,
   rereviewLabelOf,
   mergeSettingOf,
   isReadingPrLane,
@@ -338,6 +339,8 @@ export function wire(ir: Harness): WiringPlan {
   const prGates = new Set(nudgedGatesOf(ir.nodes, ir.config).map((g) => g.id));
   // The sweeps some dispatch= names: started for one PR, they take it as `pr`.
   const prSweeps = new Set(dispatchedSweepsOf(ir.nodes).map((s) => s.id));
+  // The single gates a sweep explains its waits on (explain_on=).
+  const explainedGates = new Set(explainedGatesOf(ir.nodes).map((g) => g.id));
   for (const node of ir.nodes) {
     if (node.type === "start" || node.type === "exit") continue;
     if (diamonds.memberIds.has(node.id)) continue;
@@ -401,8 +404,20 @@ export function wire(ir: Harness): WiringPlan {
       triggers.schedule = [{ cron: String(node.attrs.schedule) }];
       // A gate nudged by quiet verdicts takes the PR to evaluate as a dispatch input.
       const nudged = singleGate && prGates.has(node.id);
+      const explained = singleGate && explainedGates.has(node.id);
       triggers.workflow_dispatch = nudged
-        ? { inputs: { pr: { description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass", required: false, type: "string" } } }
+        ? {
+            inputs: {
+              pr: { description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass", required: false, type: "string" },
+              // explain_on= (#52): why the sweep is not deciding this head yet.
+              ...(explained
+                ? {
+                    reason: { description: "With pr: why the approver has no verdict yet, shown on a head that has none", required: false, type: "string" },
+                    reason_sha: { description: "With reason: the head it was given for", required: false, type: "string" },
+                  }
+                : {}),
+            },
+          }
         : prSweeps.has(node.id)
           ? { inputs: { pr: { description: "Consider just this PR (an upstream lane's dispatch); empty: the full sweep", required: false, type: "string" } } }
           : {};

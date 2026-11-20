@@ -20,6 +20,7 @@ import type { MergeSetting } from "./attrs.js";
 import { postDispatchTargets, postReviewStep, reviewOutputContract } from "./post-review.js";
 import {
   dispatchTargetsOf,
+  explainedGatesOf,
   noChangesCommentOf,
   nudgedGatesOf,
   quietVerdictsOf,
@@ -771,6 +772,10 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
       "pr-number": nudgedGatesOf(ctx.nodes ?? [], ctx.config).some((g) => g.id === node.id)
         ? "${{ github.event.pull_request.number || inputs.pr }}"
         : "${{ github.event.pull_request.number }}",
+      // explain_on= (#52): a sweep's reason for a head it is not deciding yet.
+      ...(explainedGatesOf(ctx.nodes ?? []).some((g) => g.id === node.id)
+        ? { "waiting-title": "${{ inputs.reason }}", "waiting-sha": "${{ inputs.reason_sha }}" }
+        : {}),
       // The schedule's period: the pass's window moves once per period.
       "rotation-period-seconds": String(cronPeriodSeconds(String(node.attrs.schedule ?? ""))),
       // Leave the job two minutes to finish the PR it is on and exit cleanly.

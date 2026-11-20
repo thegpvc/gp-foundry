@@ -246,7 +246,7 @@ const POLICY = {
 let run = 0;
 function tick(
   w: World,
-  opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rollout?: { skipLabel?: string; authors?: string[] }; rereview?: boolean; quiet?: boolean; self?: { runId?: string; jobCheckName?: string } } = {},
+  opts: { prNumber?: number; budgetSeconds?: number; merge?: "off" | "agent-only"; rotation?: number; rollout?: { skipLabel?: string; authors?: string[] }; rereview?: boolean; quiet?: boolean; self?: { runId?: string; jobCheckName?: string }; waiting?: { title: string; sha: string } } = {},
 ) {
   const o = w.octokit();
   const before = w.total();
@@ -268,6 +268,7 @@ function tick(
     self: opts.self ?? SELF,
     rotation: opts.rotation ?? run++,
     now: () => w.clock,
+    ...(opts.waiting ? { waiting: opts.waiting } : {}),
   }).then((r) => ({ ...r, calls: w.total() - before }));
 }
 
@@ -898,5 +899,58 @@ describe("published-prs: the PRs whose result a run changed (what dispatch= wake
     expect(again.publishedPrs).toEqual([]);
     w.prs.get(1)!.verdict = "REQUEST_CHANGES";
     expect((await tick(w, { prNumber: 1 })).publishedPrs).toEqual([1]);
+  });
+});
+
+describe("explain_on: a sweep's reason on a head with no verdict (#52)", () => {
+  it("holds the check in progress with the reason, on that head only, and rewrites it only when it changes", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    const waiting = { title: "Waiting: 2 check(s) still running", sha: w.headSha(1) };
+    await tick(w, { prNumber: 1, waiting });
+    expect(w.result(1)).toMatchObject({ status: "in_progress", output: { title: "Waiting: 2 check(s) still running" } });
+    expect(w.result(1)!.output.summary).toContain("never passes");
+    const n = w.checks.length;
+    const r = await tick(w, { prNumber: 1, waiting });
+    expect(w.checks.length).toBe(n);
+    expect(r.publishedPrs ?? []).toEqual([]);
+    await tick(w, { prNumber: 1, waiting: { ...waiting, title: "approver is deciding" } });
+    expect(w.result(1)!.output.title).toBe("approver is deciding");
+    expect(w.checks.filter((c) => c.name === CHECK)).toHaveLength(1); // updated in place
+  });
+
+  it("a reason for another head (the PR moved on) is ignored", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true, head: 2 });
+    await tick(w, { prNumber: 1, waiting: { title: "approver is deciding", sha: sha(1, 1) } });
+    expect(w.result(1)).toBeUndefined();
+  });
+
+  it("once there is a verdict the reason is ignored and the result is published over it", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    await tick(w, { prNumber: 1, waiting: { title: "approver is deciding", sha: w.headSha(1) } });
+    w.prs.get(1)!.verdict = "APPROVE";
+    await tick(w, { prNumber: 1, waiting: { title: "approver is deciding", sha: w.headSha(1) } });
+    expect(current(w, 1, "success")).toBe(true);
+    expect(w.checks.filter((c) => c.name === CHECK)).toHaveLength(1); // the held run, completed
+  });
+
+  it("a scheduled pass leaves a held reason standing", async () => {
+    const w = new World();
+    w.add({ number: 1, reviewed: true });
+    await tick(w, { prNumber: 1, waiting: { title: "approver is deciding", sha: w.headSha(1) } });
+    await tick(w);
+    expect(w.result(1)).toMatchObject({ status: "in_progress", output: { title: "approver is deciding" } });
+  });
+
+  it("waitingFromInputs: both or nothing, one line, a real SHA", async () => {
+    const { waitingFromInputs } = await import("./index.js");
+    const s40 = "a".repeat(40);
+    expect(waitingFromInputs("x", "")).toBeUndefined();
+    expect(waitingFromInputs("", s40)).toBeUndefined();
+    expect(waitingFromInputs("x", "not-a-sha")).toBeUndefined();
+    expect(waitingFromInputs("a\nb", s40)).toEqual({ title: "a b", sha: s40 });
+    expect(waitingFromInputs("y".repeat(300), s40)!.title).toHaveLength(120);
   });
 });

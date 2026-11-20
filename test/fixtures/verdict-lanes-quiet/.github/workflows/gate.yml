@@ -10,6 +10,14 @@ name: gate
         description: "Evaluate just this PR (a quiet verdict's nudge); empty: the full pass"
         required: false
         type: string
+      reason:
+        description: "With pr: why the approver has no verdict yet, shown on a head that has none"
+        required: false
+        type: string
+      reason_sha:
+        description: "With reason: the head it was given for"
+        required: false
+        type: string
   pull_request:
     types:
       - synchronize
@@ -67,6 +75,8 @@ jobs:
           bot-login: agent-app[bot]
           rereview-label: re-review
           pr-number: ${{ github.event.pull_request.number || inputs.pr }}
+          waiting-title: ${{ inputs.reason }}
+          waiting-sha: ${{ inputs.reason_sha }}
           rotation-period-seconds: "600"
           time-budget-seconds: "480"
       - name: Wake downstream workflows

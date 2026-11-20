@@ -28,6 +28,7 @@ jobs:
     outputs:
       prs: ${{ steps.select.outputs.prs }}
       count: ${{ steps.select.outputs.count }}
+      waiting: ${{ steps.select.outputs.waiting }}
     steps:
       - name: List the pull requests in scope
         id: scope
@@ -99,13 +100,18 @@ jobs:
             [ -n "$LIST" ] || echo "#$ONLY_PR: not a candidate (closed, a draft, or out of scope)"
           fi
           SELECTED='[]'
+          # explain_on: why each head is not being decided (or that it is), for the
+          # gate's check while the head has no verdict. A head whose state could not be
+          # read, or that is already decided, gets none.
+          WAITING='[]'
+          wait_for() { WAITING=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg t "$1" '. + [{number: $n, sha: $s, title: $t}]' <<< "$WAITING"); }
           while read -r NUM SHA REQUESTED QUIET BASE SINCE; do
             [ -n "$NUM" ] || continue
             # SINCE: when a re-review was requested on this PR ("-": none). Records from
             # before it — verdicts, reviews, the sweep's own check-runs — do not count.
             [ "${SINCE:-}" = "-" ] && SINCE=""
             export SINCE="${SINCE:-}"
-            if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi
+            if [ "$REQUESTED" != "0" ]; then wait_for "Waiting: $REQUESTED review request(s) outstanding"; echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi
             # One read of the head's check-runs answers four questions: how many exist,
             # how many are still running, has the lane already run here, how often has it failed.
             # filter=all: the default (latest) keeps only the newest run per check name, which
@@ -123,8 +129,9 @@ jobs:
             read -r TOTAL RUNNING SWEPT FAILURES IDLE QUIET_VERDICTS <<< "$CHECKS"
             # quiet_verdicts: a verdict delivered as a check run by the harness App decides the head too.
             if [ "$QUIET_VERDICTS" != "0" ]; then echo "#$NUM: already decided at $SHA (a quiet verdict)"; continue; fi
-            if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
+            if [ "$RUNNING" != "0" ]; then wait_for "Waiting: $RUNNING check(s) still running"; echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
             if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then
+              wait_for "Waiting: CI has not started on this head"; 
               echo "#$NUM: no check-run on $SHA yet and the PR changed ${QUIET}s ago — waiting for CI to register"
               continue
             fi
@@ -133,12 +140,12 @@ jobs:
             # it still holds if the verdict review's body is later edited.
             if [ "$SWEPT" != "0" ]; then echo "#$NUM: already swept at $SHA"; continue; fi
             # …and a lane that keeps FAILING on a head is not retried forever either.
-            if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi
+            if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then wait_for "Waiting: approver gave up after $FAILURES failed runs — push to retry"; echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi
             # …nor is one that keeps succeeding without ever leaving a verdict.
-            if [ "$IDLE" -ge "$MAX_IDLE" ]; then echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi
+            if [ "$IDLE" -ge "$MAX_IDLE" ]; then wait_for "Waiting: approver gave up after $IDLE runs without a verdict — push to retry"; echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi
             STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" --jq '
               if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }
-            if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi
+            if [ "$STATUS" = "pending" ]; then wait_for "Waiting: a commit status is pending"; echo "#$NUM: a commit status is pending"; continue; fi
             REVIEWS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '
               [ .[] | select((env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE) | (((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.VERDICT_LINES | split("\n") | any(.[]; . == $line)) as $verdict
                 | { decided: (.commit_id == env.SHA and $verdict),
@@ -148,7 +155,8 @@ jobs:
             read -r DECIDED REVIEWED <<< "$REVIEWS"
             if [ "$DECIDED" != "0" ]; then echo "#$NUM: already decided at $SHA"; continue; fi
             # requires_review: the lane acts on an upstream review, so a head no review covers is still waiting.
-            if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi
+            if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then wait_for "Waiting: the upstream review of this head"; echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi
+            wait_for "approver is deciding"; 
             echo "#$NUM: selected at $SHA"
             SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE" '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")
             if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then
@@ -157,6 +165,7 @@ jobs:
             fi
           done <<< "$LIST"
           { echo "prs=$SELECTED"; echo "count=$(jq 'length' <<< "$SELECTED")"; } >> "$GITHUB_OUTPUT"
+          echo "waiting=$WAITING" >> "$GITHUB_OUTPUT"
   approver:
     name: "approver #${{ matrix.pr.number }}"
     runs-on: ubuntu-latest
@@ -693,3 +702,49 @@ jobs:
             esac
           done < <(jq -r '.[] | "\(.number) \(.sha) \(.since // "")"' <<< "$PRS")
           exit "$FAILED"
+  approver_explain:
+    name: approver explain
+    runs-on: ubuntu-latest
+    if: ${{ needs.approver_select.result == 'success' && needs.approver_select.outputs.waiting != '' && needs.approver_select.outputs.waiting != '[]' }}
+    permissions:
+      checks: read
+      actions: write
+    timeout-minutes: 5
+    needs:
+      - approver_select
+    steps:
+      - name: Show on gate's check why each head is waiting
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAITING: ${{ needs.approver_select.outputs.waiting }}
+          GATE_WORKFLOW: gate.yml
+          GATE_CHECK: gp-foundry/approval (gate)
+          GATE_APP: agent-app
+          BASE_BRANCH: main
+        run: |-
+          # Only a changed reason starts a gate run: the check already saying it, a
+          # result already on the head (the gate decides that), or the gate's own hold
+          # for a re-review, and nothing is sent.
+          ERR=$(mktemp)
+          CHECK_Q=$(jq -rn --arg n "$GATE_CHECK" '$n | @uri')
+          while IFS=$'\t' read -r NUM SHA TITLE; do
+            [ -n "$NUM" ] || continue
+            CUR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$CHECK_Q&filter=all&per_page=100" --jq '
+              [.check_runs[] | select(env.GATE_APP == "" or .app.slug == env.GATE_APP)] | sort_by(.id) | last
+              | if . == null then "none\t" else "\(.status)\t\(.output.title // "")" end') || {
+              echo "::warning::#$NUM: could not read $GATE_CHECK on $SHA — left for the next sweep"
+              continue
+            }
+            STATE=${CUR%%$'\t'*}
+            SHOWN=${CUR#*$'\t'}
+            if [ "$STATE" = "completed" ]; then echo "#$NUM: $GATE_CHECK has a result on $SHA — the gate's to change"; continue; fi
+            if [ "$SHOWN" = "$TITLE" ]; then echo "#$NUM: already shows: $TITLE"; continue; fi
+            if [ "$SHOWN" = "Re-review requested" ]; then echo "#$NUM: held for a re-review by the gate"; continue; fi
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/$GATE_WORKFLOW/dispatches" \
+                -f ref="$BASE_BRANCH" -f "inputs[pr]=$NUM" -f "inputs[reason]=$TITLE" -f "inputs[reason_sha]=$SHA" > /dev/null 2> "$ERR"; then
+              echo "#$NUM: $TITLE"
+            else
+              echo "::warning::#$NUM: could not start $GATE_WORKFLOW ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — the next sweep tries again"
+            fi
+          done < <(jq -r '.[] | [.number, .sha, .title] | @tsv' <<< "$WAITING")
