@@ -106,8 +106,9 @@ outputs:
   prs:
     description: >-
       With `list`: a JSON array of {number, sha, base, requested, quiet}, plus
-      `bump` (the update's semver level) for a PR admitted through botAuthors,
-      when it can be told from its commits and title. A botAuthors PR is listed
+      `bump` (the update's semver level) and `updates` (each dependency as
+      `name>from>to`, comma-separated) for a PR admitted through botAuthors,
+      when they can be told from its commits and title. A botAuthors PR is listed
       only while every commit on it is its
       author's, committed and signed by GitHub. With
       `reviewed-by`: round-robin by author (each author's oldest PR, then each

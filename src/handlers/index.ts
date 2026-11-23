@@ -328,20 +328,35 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
 }
 
 /**
- * rollout.bot_authors: the update's semver level (patch, minor or major; the
- * select job's, from the commits' `updated-dependencies` block or the title),
- * appended to the agent's context. Nothing when the level is unknown.
+ * rollout.bot_authors: what the select job read from the bot's commits and the
+ * title, appended to the agent's context — the update's semver level (patch,
+ * minor or major) and each dependency's versions. Either may be missing: no
+ * level when a dependency could not be classified, no list when a version is
+ * not named. Nothing at all when both are.
  */
 function bumpContextStep(): StepSpec {
   return runStep({
     name: "Note the dependency update's level",
-    env: { CONTEXT_FILE: "${{ steps.ctx.outputs.context-file }}", BUMP: "${{ matrix.pr.bump }}" },
+    env: { CONTEXT_FILE: "${{ steps.ctx.outputs.context-file }}", BUMP: "${{ matrix.pr.bump }}", UPDATES: "${{ matrix.pr.updates }}" },
     run: [
-      `case "$BUMP" in patch|minor|major) ;; *) exit 0 ;; esac`,
+      `case "$BUMP" in patch|minor|major) ;; *) BUMP="" ;; esac`,
+      `[ -n "$BUMP$UPDATES" ] || exit 0`,
       `[ -n "$CONTEXT_FILE" ] || exit 0`,
       `{`,
       `  printf '\\n## Dependency update\\n\\n'`,
-      `  printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\\n' "$BUMP"`,
+      `  if [ -n "$BUMP" ]; then`,
+      `    printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\\n' "$BUMP"`,
+      `  else`,
+      `    printf 'The semver level of this update could not be determined: at least one dependency has no readable MAJOR.MINOR.PATCH versions.\\n'`,
+      `  fi`,
+      `  if [ -n "$UPDATES" ]; then`,
+      `    printf '\\nDependencies updated (from the commit messages):\\n\\n'`,
+      `    IFS=',' read -ra ALL <<< "$UPDATES"`,
+      `    for U in "\${ALL[@]}"; do`,
+      `      IFS='>' read -r NAME FROM TO <<< "$U"`,
+      `      printf -- '- %s: %s → %s\\n' "$NAME" "$FROM" "$TO"`,
+      `    done`,
+      `  fi`,
       `} >> "$CONTEXT_FILE"`,
     ].join("\n"),
   });

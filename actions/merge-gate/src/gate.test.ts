@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { encodeDependabotUpdates } from "../../../src/shared/dependabot.js";
 import {
   evaluateMergeGate,
   checkVerdict,
@@ -21,6 +22,7 @@ import {
   latestValidApproval,
   parseDependabotBump,
   parseDependabotUpdateType,
+  parseDependabotUpdates,
   DEPENDABOT_LOGIN,
   type PullRequestFacts,
   type MergePolicy,
@@ -784,6 +786,88 @@ describe("parseDependabotBump", () => {
     expect(parseDependabotBump("Bump the babel group with 5 updates")).toBe("unknown");
     expect(parseDependabotBump("Bump pkg from latest to newest")).toBe("unknown");
     expect(parseDependabotBump(undefined)).toBe("unknown");
+  });
+});
+
+describe("a block without update-type: dependabot's security updates (#57)", () => {
+  // A security update's entries carry no `update-type` line; the versions are in the body.
+  const entry = (name: string, to = "1.4.6") => [`- dependency-name: ${name}`, `  dependency-version: ${to}`, "  dependency-type: direct:production"];
+  const typed = (name: string, level: string) => [...entry(name), `  update-type: version-update:semver-${level}`];
+  const commit = (title: string, body: string[], entries: string[][]) =>
+    [title, "", ...body, "", "---", "updated-dependencies:", ...entries.flat(), "...", "", "Signed-off-by: dependabot[bot] <support@github.com>"].join("\n");
+  const single = (from: string, to: string, title = `Bump x from ${from} to ${to}`) =>
+    commit(title, [`Bumps [x](https://github.com/o/x) from ${from} to ${to}.`, "- [Release notes](https://github.com/o/x/releases)"], [entry("x", to)]);
+
+  it("one entry, the title names the versions: the title's level, as in 0.7.0", () => {
+    const bare = (t: string) => commit(t, ["Bumps x."], [entry("x")]);
+    expect(parseDependabotUpdateType([bare("Bump x from 1.4.1 to 1.4.6")], "Bump x from 1.4.1 to 1.4.6")).toBe("patch");
+    expect(parseDependabotUpdateType([bare("Bump x from 9.3.1 to 11.1.0")], "Bump x from 9.3.1 to 11.1.0")).toBe("major");
+  });
+
+  it("one entry, a title without versions: the body's", () => {
+    expect(parseDependabotUpdateType([single("9.3.1", "11.1.0", "Bump x in /dir")], "Bump x in /dir")).toBe("major");
+    expect(parseDependabotUpdateType([single("1.4.1", "1.4.6", "Bump x in /dir")], "Bump x in /dir")).toBe("patch");
+    // The link is optional.
+    expect(parseDependabotUpdateType([commit("Bump x in /dir", ["Bumps x from 1.4.1 to 1.5.0."], [entry("x")])], "Bump x in /dir")).toBe("minor");
+  });
+
+  it("grouped, no update-type on any entry: the highest level among the body's versions", () => {
+    const m = commit("Bump the npm group with 2 updates", ["Bumps the npm group with 2 updates: [a](u) and [b](u).", "", "Updates `a` from 1.2.0 to 1.2.3", "- [Commits](u)", "", "Updates `b` from 2.0.0 to 3.0.0"], [entry("a", "1.2.3"), entry("b", "3.0.0")]);
+    expect(parseDependabotUpdateType([m], "Bump the npm group with 2 updates")).toBe("major");
+    expect(parseDependabotUpdates([m]).updates).toEqual([
+      { name: "a", from: "1.2.0", to: "1.2.3" },
+      { name: "b", from: "2.0.0", to: "3.0.0" },
+    ]);
+  });
+
+  it("grouped, one entry's versions missing from the body: unknown", () => {
+    const m = commit("Bump the npm group with 2 updates", ["Updates `a` from 1.2.0 to 1.2.3"], [entry("a"), entry("b")]);
+    expect(parseDependabotUpdateType([m], "Bump the npm group with 2 updates")).toBe("unknown");
+    // …and the title of a grouped update is no answer for the entry it does not name.
+    expect(parseDependabotUpdateType([m], "Bump a from 1.2.0 to 1.2.3")).toBe("unknown");
+  });
+
+  it("a version that is not MAJOR.MINOR.PATCH (a date, a commit SHA, two parts): unknown", () => {
+    for (const [from, to] of [["1.4.1", "20240115"], ["a1b2c3d", "e4f5a6b"], ["1.4", "1.5"], ["latest", "1.0.0"]]) {
+      expect(parseDependabotUpdateType([single(from!, to!, "Bump x in /dir")], "Bump x in /dir")).toBe("unknown");
+    }
+  });
+
+  it("a version update, typed on every entry, is classified as before — the body's versions do not override the type", () => {
+    const m = commit("Bump x from 1.4.1 to 1.4.6", ["Bumps [x](u) from 1.4.1 to 1.4.6."], [typed("x", "minor")]);
+    expect(parseDependabotUpdateType([m], "Bump the npm group with 1 update")).toBe("minor");
+  });
+
+  it("mixed: some entries typed, the others readable from the body — the highest of all", () => {
+    const body = ["Updates `a` from 1.2.0 to 1.2.3", "Updates `b` from 2.0.0 to 2.1.0"];
+    expect(parseDependabotUpdateType([commit("Bump the g group", body, [typed("a", "patch"), entry("b")])])).toBe("minor");
+    expect(parseDependabotUpdateType([commit("Bump the g group", body, [typed("a", "major"), entry("b")])])).toBe("major");
+    expect(parseDependabotUpdateType([commit("Bump the g group", body, [typed("a", "patch"), entry("c")])])).toBe("unknown");
+  });
+
+  it("a dependency named in several directories: its highest level", () => {
+    const m = commit("Bump x in /a and /b", ["Updates `x` from 1.2.0 to 1.2.3", "Updates `x` from 0.9.0 to 1.2.3"], [entry("x", "1.2.3"), entry("x", "1.2.3")]);
+    expect(parseDependabotUpdateType([m])).toBe("major");
+  });
+
+  it("a quoted, scoped name is read as its name", () => {
+    const m = commit("Bump @s/x in /dir", ["Bumps [@s/x](u) from 1.0.0 to 1.0.1."], [['- dependency-name: "@s/x"', "  dependency-version: 1.0.1"]]);
+    expect(parseDependabotUpdates([m])).toEqual({ level: "patch", updates: [{ name: "@s/x", from: "1.0.0", to: "1.0.1" }] });
+  });
+});
+
+describe("encodeDependabotUpdates: the versions as one word for a workflow matrix", () => {
+  it("name>from>to, comma-separated", () => {
+    expect(encodeDependabotUpdates([{ name: "@s/a", from: "1.2.0", to: "1.2.3" }, { name: "github.com/o/b", from: "v2.0.0", to: "v3.0.0+build.1" }])).toBe("@s/a>1.2.0>1.2.3,github.com/o/b>v2.0.0>v3.0.0+build.1");
+  });
+
+  it("no list rather than half of one, or one a script could misread", () => {
+    expect(encodeDependabotUpdates([])).toBeUndefined();
+    expect(encodeDependabotUpdates([{ name: "a", from: "1.0.0", to: "1.0.1" }, { name: "b" }])).toBeUndefined();
+    for (const name of ["a b", "a,b", "a>b", "a$(id)", "a`id`", "a\nb", ""]) {
+      expect(encodeDependabotUpdates([{ name, from: "1.0.0", to: "1.0.1" }])).toBeUndefined();
+    }
+    expect(encodeDependabotUpdates(Array.from({ length: 51 }, (_, i) => ({ name: `p${i}`, from: "1.0.0", to: "1.0.1" })))).toBeUndefined();
   });
 });
 

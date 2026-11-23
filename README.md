@@ -217,7 +217,8 @@ out, and the skip label and drafts still win.
 - **Judged like anyone's PR.** The reviewer and approver use the same role files for a bot's
   PR as for a person's, so the approve or escalate verdict on a dependency update does not
   depend on who opened it. For a bot's own PR the agent's context states the update's semver
-  level; a person's PR gets none, whatever its title says.
+  level and each dependency's versions (`name: from → to`), so a role can apply a rule to a
+  single package; a person's PR gets neither, whatever its title says.
 - **Reviewed on a schedule.** A bot's own PR events carry none of the repo's secrets, so an
   event-driven reviewer's guard hands those PRs over (no token minted, the reason in the log)
   to the lane's **bot pass**: jobs in the same workflow that run on `bot_schedule=` (default
@@ -253,9 +254,11 @@ out, and the skip label and drafts still win.
 - **The verdict outranks the dependabot lane.** For a PR admitted through `bot_authors` the
   gate takes the approver's verdict, never the policy's `dependabot:` lane. That lane still
   judges dependabot's PRs that `bot_authors` does not admit, as before. Its update level now
-  comes from the `updated-dependencies` block in dependabot's own commits (the highest level
-  present; `unknown` if any entry has none) and from the title, whichever is higher, so a
-  grouped update is no longer always `unknown`.
+  comes from the `updated-dependencies` block in dependabot's own commits and from the title,
+  whichever is higher, so a grouped update is no longer always `unknown`. Each dependency in
+  the block is classified by its `update-type` line, or, where it has none (a security
+  update never does), by the versions the commit body names for it; the highest level wins,
+  and a dependency with neither makes the update `unknown`.
 
 Set `identity.bot_login` to the account the pipeline actually posts as (under PAT auth, the
 PAT's owner). It is how the pipeline recognizes its own PRs; if it is wrong, the guard job's

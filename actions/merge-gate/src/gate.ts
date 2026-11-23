@@ -304,7 +304,7 @@ export function latestAttemptPerCheck<T extends { id?: number | null; name?: str
   return [...latest.values()];
 }
 
-export { DEPENDABOT_LOGIN, parseDependabotBump, parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
+export { DEPENDABOT_LOGIN, parseDependabotBump, parseDependabotUpdateType, parseDependabotUpdates, type DependabotBump } from "../../../src/shared/dependabot.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Output

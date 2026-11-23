@@ -463,6 +463,44 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
     expect(evalGuard(cond, prEvent("alice", "User"))).toBe(true);
   });
 
+  describe("the context step, run as Actions runs it (#57)", () => {
+    const step = () => compiled().jobs.reviewer_bots.steps.find((st: any) => st.name === "Note the dependency update's level");
+    const note = (env: Record<string, string>) => {
+      const dir = mkdtempSync(join(tmpdir(), "gpf-ctx-"));
+      const file = join(dir, "context.md");
+      writeFileSync(file, "");
+      execFileSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", step().run], { env: { PATH: process.env.PATH!, CONTEXT_FILE: file, BUMP: "", UPDATES: "", ...env }, encoding: "utf8" });
+      return readFileSync(file, "utf8");
+    };
+
+    it("reads the level and the versions from the matrix entry", () => {
+      expect(step().env).toMatchObject({ BUMP: "${{ matrix.pr.bump }}", UPDATES: "${{ matrix.pr.updates }}" });
+    });
+
+    it("states the level and each dependency's versions", () => {
+      const out = note({ BUMP: "major", UPDATES: "@s/a>1.2.0>1.2.3,b>2.0.0>3.0.0" });
+      expect(out).toContain("**major**");
+      expect(out).toContain("- @s/a: 1.2.0 → 1.2.3\n- b: 2.0.0 → 3.0.0\n");
+    });
+
+    it("the level alone, when the versions are not all named", () => {
+      const out = note({ BUMP: "patch" });
+      expect(out).toContain("**patch**");
+      expect(out).not.toContain("Dependencies updated");
+    });
+
+    it("the versions without a level, said plainly, when one of them is not semver", () => {
+      const out = note({ UPDATES: "a>1.2.0>20240115" });
+      expect(out).toContain("could not be determined");
+      expect(out).toContain("- a: 1.2.0 → 20240115");
+    });
+
+    it("neither: nothing is added", () => {
+      expect(note({})).toBe("");
+      expect(note({ BUMP: "unknown" })).toBe("");
+    });
+  });
+
   describe("the mark job, run as Actions runs it", () => {
     const JOBS = "repos/o/r/actions/runs/1/attempts/1/jobs?per_page=100";
     const REVIEWS = "repos/o/r/pulls/9/reviews?per_page=100";
@@ -512,7 +550,7 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
   describe("the select job, run as Actions runs it", () => {
     const select = () => compiled().jobs.reviewer_bots_select;
     const listed = (prs: unknown[]) => ({ run: "true" as const, reason: "", listed: "true", prs: JSON.stringify(prs) }) as any;
-    const head = (sha: string) => ({ number: 9, sha, base: "main", requested: 0, quiet: 900, bot: true, bump: "minor" });
+    const head = (sha: string) => ({ number: 9, sha, base: "main", requested: 0, quiet: 900, bot: true, bump: "minor", updates: "@s/a>1.2.0>1.3.0,b>2.0.0>2.0.1" });
     const checks = (runs: unknown[] = []) => ({ check_runs: runs });
     const base9 = { "repos/o/r/pulls/9": { base: { sha: "base9" } } };
     const run = (sha: string, fixtures: Record<string, unknown>, env?: Record<string, string>) =>
@@ -523,7 +561,7 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
       const r = run("s1", { "repos/o/r/commits/s1/check-runs?per_page=100&filter=all": checks(), "repos/o/r/pulls/9/reviews?per_page=100": [], "repos/o/r/compare/base9...s1": DIFF, "repos/o/r/pulls/9/reviews": [] });
       expect(r.conclusion).toBe("success");
       const [p] = selected(r);
-      expect(p).toMatchObject({ number: 9, sha: "s1", base: "main", bump: "minor" });
+      expect(p).toMatchObject({ number: 9, sha: "s1", base: "main", bump: "minor", updates: "@s/a>1.2.0>1.3.0,b>2.0.0>2.0.1" });
       expect(p.diff_hash).toMatch(/^[0-9a-f]{64}$/);
       expect(r.outputs.count).toBe("1");
     });
@@ -604,6 +642,7 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
       expect(wf.jobs.approver.steps.some((st: any) => st.name === "Note the dependency update's level")).toBe(true);
       const select = wf.jobs.approver_select.steps.find((st: any) => st.id === "select").run;
       expect(select).toContain("{bump: $bump}");
+      expect(select).toContain("{updates: $updates}");
       // The approver sweep is already scheduled: it gets no bot pass of its own.
       expect(wf.jobs.approver_bots_select).toBeUndefined();
     });

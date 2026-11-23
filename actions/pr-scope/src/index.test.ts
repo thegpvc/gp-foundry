@@ -419,6 +419,12 @@ describe("pr-scope: rollout.bot_authors", () => {
       });
     });
 
+    it("a security update (no update-type in its commit): the level and versions from the commit body (#57)", async () => {
+      const SECURITY = ["Bump x from 1.4.1 to 1.4.6", "", "Bumps [x](https://github.com/o/x) from 1.4.1 to 1.4.6.", "", "---", "updated-dependencies:", "- dependency-name: x", "  dependency-version: 1.4.6", "  dependency-type: direct:production", "...", ""].join("\n");
+      const o = lister([open(2, DEP, { title: "Bump x from 1.4.1 to 1.4.6" })], { 2: [{ login: DEP, message: SECURITY }] });
+      expect(await listInScope(o, opts)).toMatchObject([{ number: 2, bump: "patch", updates: "x>1.4.1>1.4.6" }]);
+    });
+
     it("bot-authors-only lists just the bot's own PRs, for the bot pass", async () => {
       const got = await listInScope(lister(prs, commits), { ...opts, botAuthorsOnly: true });
       expect(got?.map((p) => p.number)).toEqual([2]);
