@@ -216,14 +216,15 @@ out, and the skip label and drafts still win.
 
 - **Judged like anyone's PR.** The reviewer and approver use the same role files for a bot's
   PR as for a person's, so the approve or escalate verdict on a dependency update does not
-  depend on who opened it. The agent's context states the update's semver level where it is
-  cheap to tell.
+  depend on who opened it. For a bot's own PR the agent's context states the update's semver
+  level; a person's PR gets none, whatever its title says.
 - **Reviewed on a schedule.** A bot's own PR events carry none of the repo's secrets, so an
   event-driven reviewer's guard hands those PRs over (no token minted, the reason in the log)
   to the lane's **bot pass**: jobs in the same workflow that run on `bot_schedule=` (default
   every 15 minutes) or on dispatch with a `pr` input. They select the bot's PRs whose head the
-  lane has not reviewed, review each, and record the head. A head already reviewed is not
-  reviewed again; with `skip="unchanged-diff"`, a rebase that leaves the diff unchanged is
+  lane has not reviewed, review each, and record the head. A run whose agent printed no
+  usable review counts as a failed run and is retried, not recorded as a review. A head
+  already reviewed is not reviewed again; with `skip="unchanged-diff"`, a rebase that leaves the diff unchanged is
   covered by the earlier review, as on a push. Only lanes entered when a PR opens or its head
   moves get a bot pass.
 - **Who may merge.** Two separate grants on the gate. `merge="agent-only"` merges the PRs the
@@ -239,6 +240,16 @@ out, and the skip label and drafts still win.
   push, so it is not enough. One commit that fails this, a commit list at the API's limit of
   250, or commits that cannot be read take the PR off the bot path: it is out of scope, or on
   the policy's dependabot lane if that is on, and it is never merged as the bot's.
+- **The bot pass runs with your secrets on code a third party published.** GitHub keeps
+  secrets away from Dependabot's own events because a bumped package may be hostile. The bot
+  pass is the deliberate way around that: it checks out the bot's head and runs the lane's
+  agent with the agent's credentials and the harness token. Anything the lane **executes**
+  from that checkout runs with them: a package's install script, a build step, the test
+  suite. So a lane with a bot pass should read the update, not run it: keep installs and
+  builds of the PR's dependencies out of `.github/agent-setup/action.yml` and out of the
+  reviewer's and approver's roles (or pass `--ignore-scripts` and the like), and leave
+  running the new version to CI, which runs without these secrets on the bot's events. This
+  matters most with `merge_bots=`, where the same agent's verdict is what merges the update.
 - **The verdict outranks the dependabot lane.** For a PR admitted through `bot_authors` the
   gate takes the approver's verdict, never the policy's `dependabot:` lane. That lane still
   judges dependabot's PRs that `bot_authors` does not admit, as before. Its update level now

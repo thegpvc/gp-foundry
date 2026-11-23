@@ -398,7 +398,12 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
     const stamp = lane.steps.find((st: any) => st.name === "Stamp the review with the diff hash");
     expect(stamp.env).toMatchObject({ HEAD_SHA: "${{ matrix.pr.sha }}", DIFF_HASH: "${{ matrix.pr.diff_hash }}" });
     expect(wf.jobs.reviewer_bots_mark.needs).toEqual(["reviewer_bots_select", "reviewer_bots"]);
-    expect(wf.jobs.reviewer_bots_mark.permissions).toEqual({ checks: "write", actions: "read" });
+    // It reads the reviews: a head is recorded only once this lane's review is on it.
+    expect(wf.jobs.reviewer_bots_mark.permissions).toEqual({ checks: "write", actions: "read", "pull-requests": "read" });
+    // A lane that posts for itself leaves no marker to look for: its success is the record.
+    const own = compiled(BOTS, 'skip="unchanged-diff"').jobs.reviewer_bots_mark;
+    expect(own.permissions).toEqual({ checks: "write", actions: "read" });
+    expect(own.steps[0].run).not.toContain("POSTED");
     // Its failure count reads only its own records, as the select job's does.
     expect(wf.jobs.reviewer_bots_mark.steps[0].run).toContain("select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP");
     expect(wf.jobs.reviewer_bots_mark.steps[0].env.MARK_APP).toBe("github-actions");
@@ -456,6 +461,52 @@ describe("rollout.bot_authors: the reviewer's bot pass", () => {
     const cond = String(wire({ name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" }).perNode.join!.guard);
     expect(evalGuard(cond, prEvent(DEP))).toBe(false);
     expect(evalGuard(cond, prEvent("alice", "User"))).toBe(true);
+  });
+
+  describe("the mark job, run as Actions runs it", () => {
+    const JOBS = "repos/o/r/actions/runs/1/attempts/1/jobs?per_page=100";
+    const REVIEWS = "repos/o/r/pulls/9/reviews?per_page=100";
+    const CHECKS = "repos/o/r/commits/s1/check-runs?per_page=100&filter=all";
+    const succeeded = { jobs: [{ conclusion: "success", name: "reviewer bots #9" }] };
+    const mark = (fixtures: Record<string, unknown>) =>
+      runGuard(compiled().jobs.reviewer_bots_mark, {
+        scope: { run: "true", reason: "" },
+        fixtures,
+        env: { PRS: JSON.stringify([{ number: 9, sha: "s1", base: "main" }]), RUN_ID: "1", RUN_ATTEMPT: "1" },
+      });
+
+    it("a lane job that succeeded and left its review: the head is recorded as reviewed", () => {
+      const review = { user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: "ok\n\n<!-- gp-foundry:posted:reviewer:s1 -->" };
+      const r = mark({ [JOBS]: succeeded, [REVIEWS]: [review] });
+      expect(r.conclusion).toBe("success");
+      expect(r.writes).toContain("name=gp-foundry/swept (reviewer)");
+      expect(r.writes).not.toContain("sweep-failed");
+    });
+
+    it("a lane job that succeeded but posted nothing (the agent printed no usable review): a failed run, not a review", () => {
+      const r = mark({ [JOBS]: succeeded, [REVIEWS]: [], [CHECKS]: { check_runs: [] } });
+      expect(r.conclusion).toBe("success");
+      expect(r.writes).not.toContain("name=gp-foundry/swept (reviewer)");
+      expect(r.writes).toContain("name=gp-foundry/sweep-failed (reviewer)");
+      expect(r.log).toContain("#9: the lane succeeded but left no review on s1");
+    });
+
+    it("a review of another head, or another lane's, does not count", () => {
+      const other = [
+        { user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: "ok\n\n<!-- gp-foundry:posted:reviewer:s0 -->" },
+        { user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: "ok\n\n<!-- gp-foundry:posted:approver:s1 -->" },
+        { user: { login: "mallory" }, submitted_at: "2026-01-01T00:00:00Z", body: "<!-- gp-foundry:posted:reviewer:s1 -->" },
+      ];
+      const r = mark({ [JOBS]: succeeded, [REVIEWS]: other, [CHECKS]: { check_runs: [] } });
+      expect(r.writes).not.toContain("name=gp-foundry/swept (reviewer)");
+    });
+
+    it("reviews that cannot be read: nothing recorded either way, the next run looks again", () => {
+      const r = mark({ [JOBS]: succeeded });
+      expect(r.conclusion).toBe("success");
+      expect(r.writes).toBe("");
+      expect(r.log).toContain("its reviews could not be read");
+    });
   });
 
   describe("the select job, run as Actions runs it", () => {

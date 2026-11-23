@@ -515,6 +515,7 @@ jobs:
           token: ${{ github.token }}
           base-branch: main
           bot-authors-only: "true"
+          reviewed-check: gp-foundry/swept (reviewer)
           rereview-label: re-review
           only: ${{ inputs.pr }}
           rollout: "{\"botAuthors\":[\"dependabot[bot]\"],\"skipLabel\":\"no-agent-review\"}"
@@ -1023,6 +1024,7 @@ jobs:
     permissions:
       checks: write
       actions: read
+      pull-requests: read
     timeout-minutes: 5
     needs:
       - reviewer_bots_select
@@ -1038,6 +1040,9 @@ jobs:
           SWEPT_CHECK: gp-foundry/swept (reviewer)
           FAILED_CHECK: gp-foundry/sweep-failed (reviewer)
           MARK_APP: github-actions
+          BOT_LOGIN: agent-app[bot]
+          POSTED_PREFIX: "<!-- gp-foundry:posted:"
+          ALSO_HEAD_PREFIX: "<!-- gp-foundry:also-head:reviewer:"
           MAX_FAILURES: "3"
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -1057,6 +1062,20 @@ jobs:
             export SINCE="${SINCE:-}"
             [ -n "$NUM" ] || continue
             RESULT=$(awk -F'\t' -v n="$JOB_PREFIX$NUM" '$2 == n {print $1}' <<< "$JOBS" | tail -n 1)
+            # A lane job succeeds even when its post step found no usable review in the
+            # agent's output. Such a head is not reviewed: count the run as a failed one.
+            if [ "$RESULT" = "success" ]; then
+              POSTED=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '
+                [ .[] | select(.user.login == env.BOT_LOGIN) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE)
+                  | (.body // "") | select(contains(env.POSTED_PREFIX + env.NODE + ":" + env.SHA + " -->") or contains(env.ALSO_HEAD_PREFIX + env.SHA + " -->")) ] | length' \
+                | awk '{s+=$1} END {print s+0}') || POSTED=""
+              if [ -z "$POSTED" ]; then
+                RESULT="its reviews could not be read"
+              elif [ "$POSTED" = "0" ]; then
+                echo "::warning::#$NUM: the lane succeeded but left no review on $SHA — counted as a failed run"
+                RESULT=failure
+              fi
+            fi
             case "$RESULT" in
               success)
                 if publish "$SWEPT_CHECK" "$SHA" "Reviewed by $NODE" "The $NODE lane's bot pass reviewed $SHA."; then

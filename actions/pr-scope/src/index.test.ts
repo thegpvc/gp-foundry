@@ -331,12 +331,19 @@ describe("pr-scope: rollout.bot_authors", () => {
     });
     const GROUPED_MAJOR = ["Bump the npm group with 2 updates", "", "---", "updated-dependencies:", "- dependency-name: a", "  update-type: version-update:semver-patch", "- dependency-name: b", "  update-type: version-update:semver-major", "...", ""].join("\n");
     type C = { login: string | null; message?: string; signed?: boolean; sha?: string };
-    function lister(prs: unknown[], commits: Record<number, C[] | Error>) {
+    function lister(prs: unknown[], commits: Record<number, C[] | Error>, checkRuns: Record<string, unknown[] | Error> = {}) {
       const reads: number[] = [];
       const o = {
         reads,
         paginate: async (fn: (p: unknown) => Promise<{ data: unknown }>, params: unknown) => (await fn(params)).data,
         rest: {
+          checks: {
+            listForRef: async ({ ref }: { ref: string }) => {
+              const c = checkRuns[ref] ?? [];
+              if (c instanceof Error) throw c;
+              return { data: c };
+            },
+          },
           pulls: {
             list: async () => ({ data: prs }),
             listCommits: async ({ pull_number }: { pull_number: number }) => {
@@ -382,6 +389,34 @@ describe("pr-scope: rollout.bot_authors", () => {
       expect(got?.[1]).toMatchObject({ number: 2, bump: "major" });
       // Commits are read only for the bot's PRs in scope.
       expect(o.reads.sort()).toEqual([2, 3, 4]);
+    });
+
+    describe("reviewed-check: a head the bot pass has recorded", () => {
+      const pass = { ...opts, botAuthorsOnly: true, reviewedCheck: "gp-foundry/swept (reviewer)", rereviewLabel: "re-review" };
+      const mark = (slug = "github-actions") => [{ name: "gp-foundry/swept (reviewer)", app: { slug } }];
+
+      it("is left out before its commits are read", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: mark() });
+        expect(await listInScope(o, pass)).toEqual([]);
+        expect(o.reads).toEqual([]);
+      });
+
+      it("only on the mark job's own check: another App's of that name changes nothing", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: mark("some-app") });
+        expect((await listInScope(o, pass))?.map((p) => p.number)).toEqual([2]);
+        expect(o.reads).toEqual([2]);
+      });
+
+      it("checks that cannot be read: the commits are read, as without it", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: new Error("HTTP 502") });
+        expect((await listInScope(o, pass))?.map((p) => p.number)).toEqual([2]);
+      });
+
+      it("not while a re-review is requested: the select job says which records still count", async () => {
+        const o = lister([open(2, DEP, { labels: [{ name: "re-review" }] })], { 2: [{ login: DEP }] }, { sha2: mark() });
+        await listInScope(o, pass).catch(() => undefined);
+        expect(o.reads).toEqual([2]);
+      });
     });
 
     it("bot-authors-only lists just the bot's own PRs, for the bot pass", async () => {

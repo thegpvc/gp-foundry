@@ -128,8 +128,14 @@ rollout:                       # `rollout: {}` = every PR
   `workflow_dispatch` (input `pr`), added to the lane's own triggers. The scheduled pass
   shares one concurrency slot; a dispatch for one PR gets its own. The lane's guard hands a
   listed bot's PR to it without minting a token (the bot's own PR events carry no secrets).
+  The lane's jobs run the agent with the repo's secrets on the bot's head, so nothing from
+  that checkout should be executed there (no installs, builds or tests of the bumped
+  dependencies in `agent-setup` or the roles): CI does that without the secrets. The mark job
+  records a head only once the lane's review is on it (`post="review"`); a run that posted
+  none counts as a failed run.
   The select job lists the bot's PRs that pass the test above (`pr-scope`,
-  `bot-authors-only`), skips a head the pass recorded (`gp-foundry/swept (<node>)`) or that
+  `bot-authors-only`; a head carrying the pass's record is dropped before its commits are
+  read, `reviewed-check`), skips a head the pass recorded (`gp-foundry/swept (<node>)`) or that
   this lane posted a review on or marked as covered, applies `skip="unchanged-diff"` with the
   guard's own script, gives up on a head after 3 failed runs (retry with the re-review label,
   or by asking the bot for a new head), and honours the re-review label. A lane also entered

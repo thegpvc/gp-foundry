@@ -47,8 +47,10 @@ import {
   botPassJobNamePrefix,
   listensToDispatch,
   POSTED_MARKER_PREFIX,
+  postsReview,
 } from "./attrs.js";
 import { appTokenStep, runStep, tokenExpr } from "./steps.js";
+import { MARK_APP } from "../shared/candidates.js";
 import { resolveAuth } from "../auth/auth.js";
 
 const PR_NUMBER = "${{ github.event.pull_request.number }}";
@@ -206,8 +208,15 @@ const SELECT_REVIEWS_JQ = [
   `| [ (map(select(.decided)) | length), (map(select(.reviewed)) | length) ] | @tsv`,
 ];
 
-/** The check-run author a swept marker must have: written with GITHUB_TOKEN. */
-const MARK_APP = "github-actions";
+/**
+ * Counts this lane's reviews that cover $SHA: one it posted there (its posted
+ * marker) or one marked as covering it, since any re-review request ($SINCE).
+ * Reads env BOT_LOGIN, NODE, SHA, SINCE, POSTED_PREFIX and ALSO_HEAD_PREFIX.
+ */
+const LANE_REVIEWED_JQ = [
+  `[ .[] | select(.user.login == env.BOT_LOGIN) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE)`,
+  `  | (.body // "") | select(contains(env.POSTED_PREFIX + env.NODE + ":" + env.SHA + " -->") or contains(env.ALSO_HEAD_PREFIX + env.SHA + " -->")) ] | length`,
+];
 
 // ── skip= guard ──────────────────────────────────────────────────────────────
 
@@ -851,6 +860,7 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
       MAX_IDLE: String(SWEEP_MAX_IDLE),
     },
     envAfter: quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {},
+    beforeCase: [],
     failedBy: "",
     retry: "Push a new commit, or re-run the lane by hand, to try again.",
     onSuccess: [
@@ -911,13 +921,18 @@ function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
 
 /**
  * `<node>_bots_mark` (rollout.bot_authors): the bot pass's record of the heads
- * it reviewed. The same job as a sweep's mark, with a simpler post-condition:
- * the pass's lane posts no verdict, so a run that succeeded reviewed the head.
+ * it reviewed. The same job as a sweep's mark, with the pass's post-condition:
+ * a lane job that succeeded AND left this lane's review on the head. The post
+ * step exits 0 when the agent printed no usable review, and nobody pushes to a
+ * bot's PR to start another run — so such a run is counted as a failed one and
+ * retried, up to the cap, instead of being recorded as a review. (A lane
+ * without post="review" leaves no marker to look for: its success is the record.)
  * Only this job's own records count as failures (MARK_APP), as its select job reads them.
  */
 export function emitBotPassMark(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const ids = botPassJobIds(node);
+  const posts = postsReview(node);
   return markJob(ctx, {
     jobId: ids.mark,
     name: `${node.id} bot pass mark`,
@@ -925,9 +940,33 @@ export function emitBotPassMark(ctx: EmitContext): WorkflowJobFragment {
     stepName: "Mark the heads this pass covered",
     select: ids.select,
     lane: ids.lane,
-    permissions: { checks: "write", actions: "read" },
-    env: { JOB_PREFIX: botPassJobNamePrefix(node), SWEPT_CHECK: sweptCheckName(node), FAILED_CHECK: sweepFailedCheckName(node), MARK_APP },
+    permissions: { checks: "write", actions: "read", ...(posts ? { "pull-requests": "read" as const } : {}) },
+    env: {
+      JOB_PREFIX: botPassJobNamePrefix(node),
+      SWEPT_CHECK: sweptCheckName(node),
+      FAILED_CHECK: sweepFailedCheckName(node),
+      MARK_APP,
+      ...(posts ? { BOT_LOGIN: ctx.config.identity?.bot_login ?? "", POSTED_PREFIX: POSTED_MARKER_PREFIX, ALSO_HEAD_PREFIX: alsoHeadMarkerPrefix(node) } : {}),
+    },
     envAfter: {},
+    beforeCase: posts
+      ? [
+          `  # A lane job succeeds even when its post step found no usable review in the`,
+          `  # agent's output. Such a head is not reviewed: count the run as a failed one.`,
+          `  if [ "$RESULT" = "success" ]; then`,
+          `    POSTED=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
+          `      ${LANE_REVIEWED_JQ[0]}`,
+          `      ${LANE_REVIEWED_JQ[1]}' \\`,
+          `      | awk '{s+=$1} END {print s+0}') || POSTED=""`,
+          `    if [ -z "$POSTED" ]; then`,
+          `      RESULT="its reviews could not be read"`,
+          `    elif [ "$POSTED" = "0" ]; then`,
+          `      echo "::warning::#$NUM: the lane succeeded but left no review on $SHA — counted as a failed run"`,
+          `      RESULT=failure`,
+          `    fi`,
+          `  fi`,
+        ]
+      : [],
     failedBy: " and .app.slug == env.MARK_APP",
     retry: botPassRetryAdvice(ctx),
     onSuccess: [
@@ -954,6 +993,8 @@ interface MarkJobSpec {
   /** The step's own env, between the shared head and tail (key order is the generated file's). */
   env: Record<string, string>;
   envAfter: Record<string, string>;
+  /** Script lines run for each head once its lane job's RESULT is known, which they may revise. */
+  beforeCase: string[];
   /** A further jq test on the failed-run records counted (`" and …"`), or "". */
   failedBy: string;
   /** How to try a head again once the job has given up on it. */
@@ -1003,6 +1044,7 @@ function markJob(ctx: EmitContext, spec: MarkJobSpec): WorkflowJobFragment {
           `  export SINCE="\${SINCE:-}"`,
           `  [ -n "$NUM" ] || continue`,
           `  RESULT=$(awk -F'\\t' -v n="$JOB_PREFIX$NUM" '$2 == n {print $1}' <<< "$JOBS" | tail -n 1)`,
+          ...spec.beforeCase,
           `  case "$RESULT" in`,
           `    success)`,
           ...spec.onSuccess,
@@ -1145,8 +1187,8 @@ export function emitBotPassSelect(ctx: EmitContext): WorkflowJobFragment {
     `  if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs. ${botPassRetryAdvice(ctx)}"; continue; fi`,
     `  # A review by this lane on this head (its posted marker), or one marked as covering it.`,
     `  COVERED=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
-    `    [ .[] | select(.user.login == env.BOT_LOGIN) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE)`,
-    `      | (.body // "") | select(contains(env.POSTED_PREFIX + env.NODE + ":" + env.SHA + " -->") or contains(env.ALSO_HEAD_PREFIX + env.SHA + " -->")) ] | length' \\`,
+    `    ${LANE_REVIEWED_JQ[0]}`,
+    `    ${LANE_REVIEWED_JQ[1]}' \\`,
     `    | awk '{s+=$1} END {print s+0}') || { echo "#$NUM: could not read reviews"; continue; }`,
     `  if [ "$COVERED" != "0" ]; then echo "#$NUM: already reviewed at $SHA"; continue; fi`,
     `  DIFF_HASH=""`,
@@ -1189,6 +1231,8 @@ export function emitBotPassSelect(ctx: EmitContext): WorkflowJobFragment {
     steps: [
       ...scopeListSteps(ctx, {
         "bot-authors-only": "true",
+        // A head the pass has recorded is dropped before its commits are read.
+        "reviewed-check": sweptCheckName(node),
         ...(rereview ? { "rereview-label": rereview } : {}),
         only: "${{ inputs.pr }}",
       }),

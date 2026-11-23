@@ -15,7 +15,7 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { commitAuthorOf, inScope, isAgentWritten, isBotWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
 import { parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
-import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
+import { excludeLabelQualifier, MARK_APP, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 import { requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -120,7 +120,7 @@ export interface ScopedPr {
  */
 export async function listInScope(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number; botAuthorsOnly?: boolean },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
 ): Promise<ScopedPr[] | undefined> {
   const out = await listCandidates(octokit, opts);
   if (!out || !opts.rereviewLabel) return out?.map(({ labels: _l, ...p }) => p);
@@ -149,7 +149,7 @@ export async function listInScope(
 
 async function listCandidates(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number; botAuthorsOnly?: boolean },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
 ): Promise<(ScopedPr & { labels: string[] })[] | undefined> {
   const listed = await listScoped(octokit, opts);
   if (!listed) return undefined;
@@ -160,6 +160,13 @@ async function listCandidates(
   for (const { botAuthor, author, title, ...p } of listed) {
     if (!botAuthor) {
       if (!opts.botAuthorsOnly) out.push(p);
+      continue;
+    }
+    // A head the lane's bot pass has recorded as reviewed needs no further look:
+    // one read instead of the commits' and the select job's two. Not while a
+    // re-review is requested — which records still count is then the select job's to say.
+    if (opts.reviewedCheck && !(opts.rereviewLabel && p.labels.includes(opts.rereviewLabel)) && (await carriesMark(octokit, opts.owner, opts.repo, p.sha, opts.reviewedCheck))) {
+      core.info(`#${p.number}: already reviewed at ${p.sha}`);
       continue;
     }
     let commits: ReturnType<typeof commitAuthorOf>[];
@@ -185,9 +192,19 @@ async function listCandidates(
   return out;
 }
 
+/** Does `sha` carry the check `name`, published by a mark job? Unreadable: no (the caller reads on). */
+async function carriesMark(octokit: Octokit, owner: string, repo: string, sha: string, name: string): Promise<boolean> {
+  try {
+    const runs = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: sha, check_name: name, filter: "all", per_page: 100 });
+    return runs.some((c) => c.app?.slug === MARK_APP);
+  } catch {
+    return false;
+  }
+}
+
 async function listScoped(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number; botAuthorsOnly?: boolean },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
 ): Promise<(ScopedPr & { labels: string[]; botAuthor: boolean; author: string; title: string })[] | undefined> {
   const { owner, repo } = opts;
   const now = opts.nowMs ?? Date.now();
@@ -341,6 +358,7 @@ export async function run(): Promise<void> {
         rereviewLabel: core.getInput("rereview-label").trim() || undefined,
         only: onlyInput(core.getInput("only")),
         botAuthorsOnly: core.getInput("bot-authors-only").trim() === "true",
+        reviewedCheck: core.getInput("reviewed-check").trim() || undefined,
       });
       core.setOutput("listed", String(prs !== undefined));
       core.setOutput("prs", JSON.stringify(prs ?? []));

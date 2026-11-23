@@ -48,6 +48,14 @@ inputs:
       whose own events carry no secrets.
     required: false
     default: "false"
+  reviewed-check:
+    description: >-
+      With `list`: the name of the check run a lane's bot pass publishes on a
+      head it has reviewed. A botAuthors PR whose head carries it (from the
+      github-actions App) is left out before its commits are read — unless it
+      carries the re-review label.
+    required: false
+    default: ""
   base-branch:
     description: "With `list`: only PRs targeting this branch."
     required: false

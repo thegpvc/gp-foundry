@@ -34,6 +34,12 @@ export interface Candidate {
   title?: string;
 }
 
+/**
+ * The App whose check runs the mark jobs publish (GITHUB_TOKEN's): a lane's
+ * record of the heads it has covered counts only from it.
+ */
+export const MARK_APP = "github-actions";
+
 export type GraphqlFn = <T>(query: string, vars: Record<string, unknown>) => Promise<T>;
 
 const SEARCH = `query($q: String!, $cursor: String) {
