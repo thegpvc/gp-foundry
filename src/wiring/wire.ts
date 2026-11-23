@@ -26,6 +26,9 @@ import {
   optInLabelOf,
   parseConfigAuthors,
   skipOf,
+  botPassOf,
+  botScheduleOf,
+  listensToDispatch,
   NO_AUTHOR,
 } from "../handlers/attrs.js";
 import { detectDiamonds } from "./diamond.js";
@@ -368,7 +371,7 @@ export function wire(ir: Harness): WiringPlan {
       const g = rollout
         ? // A review panel reads: any PR in scope. It has no guard job of its own,
           // so here the prefilter is all there is (and another bot's PR gets through).
-          andForPrEvents(entryGuard, effEvents, scopePrefilter(rollout, botLogin, false))
+          andForPrEvents(entryGuard, effEvents, scopePrefilter(rollout, botLogin, false, false))
         : applyAuthors(applyBranchPrefix(entryGuard, effEvents, ir.config), effEvents, panelAuthors);
       if (g) nw.guard = g;
       // Unit scope follows the entry event; convention `<node-id>-<num>`, never cancel
@@ -508,6 +511,41 @@ export function wire(ir: Harness): WiringPlan {
         group: `\${{ inputs.pr && format('${node.id}-pr-{0}', inputs.pr) || '${node.id}' }}`,
         // A run for one PR is never cancelled mid-agent by the next dispatch for it.
         "cancel-in-progress": nw.concurrency["cancel-in-progress"] === true ? "${{ !inputs.pr }}" : false,
+      };
+    }
+    // rollout.bot_authors: the lane's scheduled bot pass rides in the same
+    // workflow, on a cron and on dispatch for one PR. Its runs share one slot of
+    // their own; an event run keeps its PR's slot.
+    const inEdges = incoming.get(node.id) ?? [];
+    if (botPassOf(node, ir.config, inEdges)) {
+      // Added to the lane's own triggers, never replacing them.
+      triggers.schedule = [...(triggers.schedule ?? []), { cron: botScheduleOf(node) }];
+      const ownDispatch = listensToDispatch(inEdges);
+      const dispatch = typeof triggers.workflow_dispatch === "object" && triggers.workflow_dispatch ? triggers.workflow_dispatch : {};
+      triggers.workflow_dispatch = {
+        ...dispatch,
+        inputs: {
+          ...(dispatch.inputs ?? {}),
+          pr: { description: "Review just this PR in the bot pass; empty: every bot-authored PR in scope", required: false, type: "string" },
+        },
+      };
+      // The event jobs run on events alone: on a scheduled run the payload is
+      // empty, and `null == false` is true in an expression. A lane started by
+      // hand keeps its own dispatch.
+      const events = ownDispatch
+        ? "github.event_name != 'schedule'"
+        : "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'";
+      nw.guard = nw.guard ? `${events} && (${nw.guard})` : events;
+      const num = "github.event.pull_request.number";
+      const { group, "cancel-in-progress": cancel } = nw.concurrency ?? { group: `${node.id}-\${{ ${num} }}`, "cancel-in-progress": false };
+      const plain = `${node.id}-\${{ ${num} }}`;
+      const inner = group === plain ? `format(${exprString(`${node.id}-{0}`)}, ${num})` : `(${group.replace(/^\$\{\{\s*|\s*\}\}$/g, "")})`;
+      nw.concurrency = {
+        // An event keeps its PR's slot; a dispatch for one PR gets that PR's own, so
+        // a scheduled tick never replaces it while it waits; the scheduled pass shares one.
+        group: `\${{ ${num} && ${inner} || inputs.pr && format(${exprString(`${node.id}-bots-pr-{0}`)}, inputs.pr) || ${exprString(`${node.id}-bots`)} }}`,
+        // A scheduled pass is never cancelled mid-review by the next tick.
+        "cancel-in-progress": cancel === true ? `\${{ ${num} != null }}` : cancel,
       };
     }
     if (singleGate) {

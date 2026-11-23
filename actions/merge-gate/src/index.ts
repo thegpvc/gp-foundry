@@ -37,7 +37,7 @@ import {
   latestAttemptPerCheck,
   latestValidApproval,
   normalizePolicyKeys,
-  parseDependabotBump,
+  parseDependabotUpdateType,
   DEPENDABOT_LOGIN,
   type CandidateSelection,
   type CheckConclusion,
@@ -52,7 +52,7 @@ import {
   type VerdictTrustPolicy,
 } from "./gate.js";
 import { parseVerdictWords, quietVerdictOf, verdictLine, verdictRegexSource, type QuietCheckRunLike, type VerdictWords } from "../../../src/shared/verdicts.js";
-import { inScope, isAgentWritten, type Rollout } from "../../../src/shared/scope.js";
+import { commitAuthorOf, inScope, isAgentWritten, isBotWritten, isGitHubSignedBy, type Rollout } from "../../../src/shared/scope.js";
 import { isFresh, requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 import { excludeLabelQualifier, reviewedByQualifier, rotatingWindow, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 
@@ -396,6 +396,7 @@ export async function gatherFacts(
   policy: PolicyFile,
   checksOctokit: Octokit = octokit,
   self?: GateRun,
+  opts: { readCommits?: boolean } = {},
 ): Promise<PullRequestFacts> {
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const labels = pr.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean);
@@ -532,7 +533,26 @@ export async function gatherFacts(
   else if (overrideRebase === "false") cleanRebase = false;
 
   const authorLogin = pr.user?.login;
-  const dependabotUpdateType = authorLogin === DEPENDABOT_LOGIN ? parseDependabotBump(pr.title) : undefined;
+  // The head's commits, once, after the head is known: for a caller that judges
+  // who wrote them, and for dependabot's update level. A list whose last commit
+  // is not the head (a push in between) counts as unread.
+  let headCommits: PullRequestFacts["headCommits"];
+  if (opts.readCommits || authorLogin === DEPENDABOT_LOGIN) {
+    try {
+      const listed = (await octokit.paginate(octokit.rest.pulls.listCommits, { owner, repo, pull_number: prNumber, per_page: 100 })).map(commitAuthorOf);
+      if (listed.length && listed[listed.length - 1]!.sha === pr.head.sha) headCommits = listed;
+      else core.warning(`PR #${prNumber}: its commits as listed do not end at the head ${pr.head.sha.slice(0, 8)} — treating them as unread`);
+    } catch (e) {
+      core.warning(`PR #${prNumber}: could not read its commits (${(e as Error).message})`);
+    }
+  }
+  // The level comes from the `updated-dependencies` block in the messages of the
+  // commits GitHub made for dependabot (anyone who can push could write one), and
+  // from the title; the higher of the two.
+  const dependabotUpdateType =
+    authorLogin === DEPENDABOT_LOGIN
+      ? parseDependabotUpdateType((headCommits ?? []).filter((c) => isGitHubSignedBy(c, DEPENDABOT_LOGIN)).map((c) => c.message), pr.title)
+      : undefined;
 
   // Evaluate-mode facts. Threads cost a GraphQL query, so only when the clause is on.
   const reviewThreads = policy.requireNoOpenThreads ? await fetchReviewThreads(octokit, owner, repo, prNumber) : undefined;
@@ -595,7 +615,7 @@ export async function gatherFacts(
     }
   }
 
-  return { number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}), ...(rereview ? { rereview } : {}) };
+  return { ...(headCommits ? { headCommits } : {}), number: prNumber, title: pr.title, headSha: pr.head.sha, headRefName: pr.head.ref, baseRefName: pr.base.ref, labels, ciStatus, checkRuns, approvedAt, files, cleanRebase, authorLogin, dependabotUpdateType, reviewThreads, requestedReviewers, changesRequestedBy, escalated: headVerdict === "escalate" || escalationLabel({ labels }, policy) !== undefined, headVerdict, ...(signoff ? { signoff } : {}), ...(signoffUnavailable ? { signoffUnavailable } : {}), ...(rereview ? { rereview } : {}) };
 }
 
 /** Open PRs on branch-prefix (or, when the dependabot lane is on, dependabot/) branches targeting base, oldest first. */
@@ -1044,6 +1064,12 @@ export async function runHybridGate(opts: {
   checkApp: string;
   baseBranch: string;
   merge: MergeSetting;
+  /**
+   * merge_bots= on the gate: the bots (each in rollout.bot_authors) whose own PRs
+   * the gate merges once ready. A separate grant from merge="agent-only", which
+   * merges only what the pipeline wrote. Empty: a person merges every bot's PR.
+   */
+  mergeBots?: string[];
   rollout: Rollout | undefined;
   prNumber?: number;
   dryRun: boolean;
@@ -1164,15 +1190,39 @@ export async function runHybridGate(opts: {
     const n = p.number;
     const author = p.user?.login;
     const scope = scopeOf(p);
-    const onDependabotLane = scope.onDependabotLane;
+    let onDependabotLane = scope.onDependabotLane;
     if (!scope.admitted) {
       core.info(`PR #${n}: out of scope — ${scope.detail}`);
       continue;
     }
+    let botWritten: { botWritten: boolean; detail: string } | undefined;
     evaluated++;
     let removeRereviewLabel = false;
     try {
-      const facts = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit, opts.self);
+      const gathered = await gatherFacts(octokit, owner, repo, n, checkPolicy, checksOctokit, opts.self, {
+        readCommits: scope.reason === "bot-author" || (opts.merge === "agent-only" && sameLogin(author, botLogin)),
+      });
+      // rollout.bot_authors: the bot's PR is judged on the verdict — and may be
+      // merged — only while every commit on the head is the bot's, made and signed
+      // by GitHub. Anything else puts it back under the rule for everyone else: the
+      // policy's dependabot lane if that is on and the author is dependabot, else
+      // out of scope. Commits that cannot be read: not judged this tick (fail closed).
+      if (scope.reason === "bot-author") {
+        if (!gathered.headCommits) {
+          core.warning(`PR #${n}: its commits could not be read — not evaluated this tick`);
+          evaluated--;
+          continue;
+        }
+        botWritten = isBotWritten({ authorLogin: author }, gathered.headCommits, rollout);
+        if (botWritten.botWritten) {
+          onDependabotLane = false;
+        } else if (!onDependabotLane) {
+          core.info(`PR #${n}: out of scope — ${botWritten.detail}; rollout.bot_authors admits a bot's PR only while every commit is its own`);
+          evaluated--;
+          continue;
+        }
+      }
+      const facts: PullRequestFacts = { ...gathered, ...(botWritten?.botWritten ? { botWritten: true } : {}) };
       // No verdict from the approver on this head: no result. A missing required
       // check blocks a merge; a neutral one would PASS it. (The dependabot lane
       // needs no verdict.) A result already on this head — its verdict since
@@ -1227,17 +1277,11 @@ export async function runHybridGate(opts: {
 
       // Who merges this PR? Only asked when the gate may merge at all.
       let writer: { agentWritten: boolean; detail: string } | undefined;
-      if (opts.merge === "agent-only" && !onDependabotLane) {
-        let commits: { authorLogin?: string | null }[] | undefined;
-        if (sameLogin(author, botLogin)) {
-          try {
-            commits = (await octokit.paginate(octokit.rest.pulls.listCommits, { owner, repo, pull_number: n, per_page: 100 })).map((c) => ({ authorLogin: c.author?.login }));
-          } catch (e) {
-            core.warning(`PR #${n}: could not read its commits (${(e as Error).message}) — treating it as human-written`);
-          }
-        }
-        writer = isAgentWritten({ authorLogin: author }, commits, botLogin);
+      if (opts.merge === "agent-only" && !onDependabotLane && !botWritten?.botWritten) {
+        writer = isAgentWritten({ authorLogin: author }, facts.headCommits, botLogin);
       }
+      // merge_bots=: a bot's own PR is merged only when its author is named there.
+      const botMerges = !!botWritten?.botWritten && (opts.mergeBots ?? []).some((b) => sameLogin(b, author));
 
       const decision = evaluateMergeGate(facts, checkPolicy);
       const out = renderCheckOutput(decision, facts, checkPolicy, checkName);
@@ -1255,10 +1299,14 @@ export async function runHybridGate(opts: {
         out.conclusion !== "success" &&
         checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion === "success";
       // Say, on the PR, who will merge it — the one thing the result alone does not.
-      if (opts.merge === "agent-only") {
+      if (opts.merge === "agent-only" || botWritten?.botWritten) {
         const line = onDependabotLane
           ? "Merge: the pipeline merges this PR on the dependabot lane when it is ready."
-          : writer?.agentWritten
+          : botWritten?.botWritten
+            ? botMerges
+              ? `Merge: ${author} wrote every commit on this PR and the gate's merge_bots names it; the pipeline merges it when it is ready.`
+              : `Merge: a person merges this PR — ${author} is a bot author, and the gate's merge_bots does not name it.`
+            : writer?.agentWritten
             ? "Merge: the pipeline wrote this PR and merges it when it is ready."
             : `Merge: a person merges this PR — it is not agent-written (${writer?.detail ?? "unknown"}).`;
         out.text = out.text ? `${out.text}\n\n${line}` : line;
@@ -1283,8 +1331,14 @@ export async function runHybridGate(opts: {
       }
 
       // Acting is for the pipeline's own PRs only, and one merge per run.
-      if (opts.merge !== "agent-only" || mergedPr) continue;
-      if (!onDependabotLane && !writer?.agentWritten) continue;
+      if (mergedPr) continue;
+      if (botWritten?.botWritten) {
+        // A separate grant from merge="agent-only": only the bots merge_bots names.
+        if (!botMerges) continue;
+      } else {
+        if (opts.merge !== "agent-only") continue;
+        if (!onDependabotLane && !writer?.agentWritten) continue;
+      }
       // Judged again under the merge's own policy: the rebase clause is on here
       // by default, where the check above leaves it off.
       const mergeDecision = evaluateMergeGate(facts, base);
@@ -1423,6 +1477,17 @@ export async function run(): Promise<void> {
           throw new Error("rollout must be the JSON the compiler writes — run `gp-foundry build`");
         }
       }
+      // merge-bots: bot logins, comma-separated, each one of the rollout's botAuthors.
+      const mergeBots = core
+        .getInput("merge-bots")
+        .split(",")
+        .map((b) => b.trim().toLowerCase())
+        .filter(Boolean);
+      for (const b of mergeBots) {
+        if (!(rollout?.botAuthors ?? []).some((a) => sameLogin(a, b))) {
+          throw new Error(`merge-bots names ${b}, which the rollout's botAuthors does not — run \`gp-foundry build\``);
+        }
+      }
       let prNumber: number | undefined;
       if (prNumberInput) {
         prNumber = parseInt(prNumberInput, 10);
@@ -1431,6 +1496,7 @@ export async function run(): Promise<void> {
       const r = await runHybridGate({
         octokit, checksOctokit, owner, repo, policy, checkName, baseBranch, prNumber, dryRun, rollout,
         merge: mergeSetting,
+        ...(mergeBots.length ? { mergeBots } : {}),
         checkApp: core.getInput("check-app").trim() || CHECK_APP,
         timeBudgetSeconds: parseInt(core.getInput("time-budget-seconds"), 10) || undefined,
         // The window advances once per schedule period: computed from the clock,

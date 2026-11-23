@@ -20,6 +20,7 @@ import {
   filterCountableVerdicts,
   latestValidApproval,
   parseDependabotBump,
+  parseDependabotUpdateType,
   DEPENDABOT_LOGIN,
   type PullRequestFacts,
   type MergePolicy,
@@ -786,6 +787,44 @@ describe("parseDependabotBump", () => {
   });
 });
 
+describe("parseDependabotUpdateType (the updated-dependencies block)", () => {
+  const msg = (entries: string[][], title = "Bump the npm group with 3 updates") =>
+    [title, "", "Bumps the npm group with 3 updates.", "", "---", "updated-dependencies:", ...entries.flat(), "...", "", "Signed-off-by: dependabot[bot] <support@github.com>"].join("\n");
+  const dep = (name: string, type?: string) => [`- dependency-name: ${name}`, "  dependency-version: 2.0.0", "  dependency-type: direct:production", ...(type ? [`  update-type: version-update:semver-${type}`] : [])];
+
+  it("classifies a grouped update as the highest level present", () => {
+    expect(parseDependabotUpdateType([msg([dep("a", "patch"), dep("b", "patch")])])).toBe("patch");
+    expect(parseDependabotUpdateType([msg([dep("a", "patch"), dep("b", "minor")])])).toBe("minor");
+    expect(parseDependabotUpdateType([msg([dep("a", "patch"), dep("b", "major"), dep("c", "minor")])])).toBe("major");
+  });
+
+  it("reads the highest level across every commit's block", () => {
+    expect(parseDependabotUpdateType([msg([dep("a", "patch")]), msg([dep("b", "major")])])).toBe("major");
+  });
+
+  it("an entry without a recognisable level makes the whole update unknown", () => {
+    expect(parseDependabotUpdateType([msg([dep("a", "patch"), dep("b")])])).toBe("unknown");
+    expect(parseDependabotUpdateType([msg([dep("a", "patch"), [...dep("b").slice(0, 3), "  update-type: version-update:semver-something"]])])).toBe("unknown");
+  });
+
+  it("takes the higher of the block's level and the title's, when the title names versions", () => {
+    expect(parseDependabotUpdateType([msg([dep("a", "patch")])], "Bump a from 1.2.3 to 2.0.0")).toBe("major");
+    expect(parseDependabotUpdateType([msg([dep("a", "major")])], "Bump a from 1.2.3 to 1.2.4")).toBe("major");
+    // A grouped title names none: the block alone decides.
+    expect(parseDependabotUpdateType([msg([dep("a", "minor")])], "Bump the npm group with 1 update")).toBe("minor");
+  });
+
+  it("with no block, falls back to the title", () => {
+    expect(parseDependabotUpdateType(["Bump x from 1.2.3 to 1.3.0"], "Bump x from 1.2.3 to 1.3.0")).toBe("minor");
+    expect(parseDependabotUpdateType([], "Bump the npm group with 3 updates")).toBe("unknown");
+    expect(parseDependabotUpdateType([""], undefined)).toBe("unknown");
+  });
+
+  it("ignores an update-type line outside the block", () => {
+    expect(parseDependabotUpdateType(["update-type: version-update:semver-patch\nfixes things"], "Bump the npm group with 3 updates")).toBe("unknown");
+  });
+});
+
 describe("dependabot lane (#deps)", () => {
   const dependabotPolicy: MergePolicy = {
     ...policy,
@@ -824,6 +863,19 @@ describe("dependabot lane (#deps)", () => {
     expect(d.action).toBe("label");
     expect(d.code).toBe("dependabot-review");
     expect(d.label).toBe("needs-human");
+  });
+
+  it("a PR the rollout admits through bot_authors (botWritten) is judged on its verdict, not on the lane", () => {
+    // An approved major: the lane would hand it to a person; the verdict says ready.
+    const approved = dependabotPr({ dependabotUpdateType: "major", botWritten: true, approvedAt: "2025-12-31T00:00:00Z", headVerdict: "approve", headRefName: "dependabot/npm/x" });
+    const single = { ...dependabotPolicy, branchPrefix: undefined };
+    expect(evaluateMergeGate(approved, single, NOW).code).toBe("ready-to-merge");
+    expect(failingClauses(approved, single, NOW)).toEqual([]);
+    // The same PR without botWritten is the lane's.
+    expect(evaluateMergeGate({ ...approved, botWritten: undefined }, single, NOW).code).toBe("dependabot-review");
+    // No approval: not ready, whatever the lane would say of a patch.
+    const unapproved = dependabotPr({ botWritten: true });
+    expect(evaluateMergeGate(unapproved, dependabotPolicy, NOW).action).not.toBe("merge");
   });
 
   it("routes an unknown/group update to a human", () => {

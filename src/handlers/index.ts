@@ -39,6 +39,10 @@ import {
   preJobId,
   skipOf,
   sweepJobNamePrefix,
+  botPassJobIds,
+  botPassJobNamePrefix,
+  rolloutOf,
+  mergeBotsOf,
 } from "./attrs.js";
 import {
   analystPersistsCredentials,
@@ -174,10 +178,16 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // event payload to read the PR from — the selector job hands each chosen head
   // to this job as a matrix entry instead.
   const sweep = isSweep(node);
+  // The lane's bot pass (rollout.bot_authors): its PRs come from a matrix too,
+  // from the bot-pass select job, but the lane is otherwise the event one.
+  const botPass = !!ctx.botPass;
+  const fromMatrix = sweep || botPass;
   const skipGuard = !sweep && hasSkipGuard(node, ctx.config);
-  const pre = preJobId(node);
-  const prNumber = sweep ? "${{ matrix.pr.number }}" : PR_NUMBER;
-  const prHeadSha = sweep ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
+  const pre = botPass ? botPassJobIds(node).select : preJobId(node);
+  const prNumber = fromMatrix ? "${{ matrix.pr.number }}" : PR_NUMBER;
+  const prHeadSha = fromMatrix ? "${{ matrix.pr.sha }}" : PR_HEAD_SHA;
+  // Which PRs may be a bot's own (rollout.bot_authors): their matrix entries say so.
+  const botAuthors = !!rolloutOf(ctx.config)?.botAuthors?.length;
 
   const steps: StepSpec[] = [];
   // quiet_verdicts=: the post step delivers such a verdict as a check run, which
@@ -199,7 +209,7 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // From here on the harness files (role, scope, setup composite, vendored
   // actions) come from the base ref, not from the PR under review.
   if (isPr && harnessFromBase(node)) {
-    const h = harnessCheckout(ctx, sweep ? "${{ matrix.pr.base }}" : PR_BASE_REF);
+    const h = harnessCheckout(ctx, fromMatrix ? "${{ matrix.pr.base }}" : PR_BASE_REF);
     steps.push(...h.steps);
     ctx = h.ctx;
   }
@@ -236,6 +246,9 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // An analyst re-reading its own earlier review is looking at a baseline, not
   // at instructions: only the fixer treats the bot's posts as its work item.
   steps.push(contextStep(ctx, ctxType, isPr ? prNumber : ISSUE_NUMBER, { framing: "baseline", checks: isPr }));
+  // rollout.bot_authors: the update's semver level, where the matrix carries it
+  // (a bot's own PR, or a person's whose title names versions), as context.
+  if (isPr && fromMatrix && botAuthors) steps.push(bumpContextStep());
   // Waiting for a gate is not the same as reading it: wait-for-checks never fails
   // the step, so a red or timed-out gate used to be indistinguishable from a green
   // one. Put every conclusion in front of the reviewer and say what a non-success
@@ -265,7 +278,26 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
     timeoutMinutes: jobTimeout,
     steps,
   };
-  if (sweep) {
+  if (botPass) {
+    fragment.jobId = botPassJobIds(node).lane;
+    fragment.name = `${node.id} bots`;
+    fragment.needs = [pre];
+    // Named per PR: the mark job reads this run's jobs to learn which heads it reviewed.
+    fragment.displayName = `${botPassJobNamePrefix(node)}\${{ matrix.pr.number }}`;
+    fragment.if = `needs.${pre}.outputs.count != '0'`;
+    fragment.strategy = { "fail-fast": false, matrix: { pr: `\${{ fromJSON(needs.${pre}.outputs.prs) }}` } };
+    if (skipOf(node).some((c) => c.kind === "unchanged-diff")) {
+      steps.push(
+        diffStampStep(ctx, {
+          when: "matrix.pr.diff_hash != ''",
+          pr: "${{ matrix.pr.number }}",
+          headSha: "${{ matrix.pr.sha }}",
+          diffHash: "${{ matrix.pr.diff_hash }}",
+          startedAt: "${{ matrix.pr.started_at }}",
+        }),
+      );
+    }
+  } else if (sweep) {
     fragment.needs = [pre];
     // Named per PR: the mark job reads this run's jobs to learn which heads
     // the lane actually finished, and a matrix job's default name is not stable.
@@ -280,9 +312,39 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   } else if (skipGuard) {
     fragment.needs = [pre];
     fragment.if = `needs.${pre}.outputs.run == 'true'`;
-    if (skipOf(node).some((c) => c.kind === "unchanged-diff")) steps.push(diffStampStep(ctx, pre));
+    if (skipOf(node).some((c) => c.kind === "unchanged-diff")) {
+      steps.push(
+        diffStampStep(ctx, {
+          when: `needs.${pre}.outputs.diff_hash != ''`,
+          pr: PR_NUMBER,
+          headSha: `\${{ needs.${pre}.outputs.head_sha }}`,
+          diffHash: `\${{ needs.${pre}.outputs.diff_hash }}`,
+          startedAt: `\${{ needs.${pre}.outputs.started_at }}`,
+        }),
+      );
+    }
   }
   return fragment;
+}
+
+/**
+ * rollout.bot_authors: the update's semver level (patch, minor or major; the
+ * select job's, from the commits' `updated-dependencies` block or the title),
+ * appended to the agent's context. Nothing when the level is unknown.
+ */
+function bumpContextStep(): StepSpec {
+  return runStep({
+    name: "Note the dependency update's level",
+    env: { CONTEXT_FILE: "${{ steps.ctx.outputs.context-file }}", BUMP: "${{ matrix.pr.bump }}" },
+    run: [
+      `case "$BUMP" in patch|minor|major) ;; *) exit 0 ;; esac`,
+      `[ -n "$CONTEXT_FILE" ] || exit 0`,
+      `{`,
+      `  printf '\\n## Dependency update\\n\\n'`,
+      `  printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata, else the PR title): **%s**.\\n' "$BUMP"`,
+      `} >> "$CONTEXT_FILE"`,
+    ].join("\n"),
+  });
 }
 
 /**
@@ -292,19 +354,22 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
  * asked of the agent, so the marker cannot be forgotten, mistyped or invented —
  * and only onto a review of the exact head the guard hashed.
  */
-function diffStampStep(ctx: EmitContext, guardJob: string): StepSpec {
+function diffStampStep(
+  ctx: EmitContext,
+  src: { when: string; pr: string; headSha: string; diffHash: string; startedAt: string },
+): StepSpec {
   return runStep({
     name: "Stamp the review with the diff hash",
     // success(): a failed or timed-out agent reviewed nothing worth remembering.
-    if: `\${{ success() && needs.${guardJob}.outputs.diff_hash != '' }}`,
+    if: `\${{ success() && ${src.when} }}`,
     env: {
       GH_TOKEN: tokenExpr(ctx),
-      PR: PR_NUMBER,
-      HEAD_SHA: `\${{ needs.${guardJob}.outputs.head_sha }}`,
-      DIFF_HASH: `\${{ needs.${guardJob}.outputs.diff_hash }}`,
+      PR: src.pr,
+      HEAD_SHA: src.headSha,
+      DIFF_HASH: src.diffHash,
       BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
       MARKER_PREFIX: diffMarkerPrefix(ctx.node),
-      STARTED_AT: `\${{ needs.${guardJob}.outputs.started_at }}`,
+      STARTED_AT: src.startedAt,
     },
     run: [
       `# Best-effort: a missing stamp only means the next event is reviewed again.`,
@@ -702,7 +767,9 @@ function verdictCheckInputs(ctx: EmitContext): Record<string, string> {
 
 function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: string[]): WorkflowJobFragment {
   const node = ctx.node;
-  const merging = merge === "agent-only";
+  // merge_bots=: the gate also merges these bots' own PRs — a separate grant.
+  const mergeBots = mergeBotsOf(node);
+  const merging = merge === "agent-only" || mergeBots.length > 0;
   let checkName: string;
   try {
     checkName = parseEvaluateCheckName(node);
@@ -743,9 +810,16 @@ function emitSingleGate(ctx: EmitContext, merge: MergeSetting, requiredChecks: s
   steps.push({
     ...(targets.length ? { id: "gate" } : {}),
     uses: ctx.actionRef("merge-gate"),
-    name: merging ? "Evaluate merge gate (publish check, merge agent-written PRs)" : "Evaluate merge gate (publish check, never merge)",
+    name: !merging
+      ? "Evaluate merge gate (publish check, never merge)"
+      : !mergeBots.length
+        ? "Evaluate merge gate (publish check, merge agent-written PRs)"
+        : merge === "agent-only"
+          ? "Evaluate merge gate (publish check, merge agent-written and named bots' PRs)"
+          : "Evaluate merge gate (publish check, merge named bots' PRs)",
     with: {
       merge,
+      ...(mergeBots.length ? { "merge-bots": mergeBots.join(",") } : {}),
       "check-name": checkName,
       // This job's own check run is on the PR's head during an event run; it is
       // not CI. The job is named after its node, like every lane's, so its check

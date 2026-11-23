@@ -93,6 +93,15 @@ inputs:
       `rollout`, not from a branch prefix. Replaces `mode`; set one, not both.
     required: false
     default: ""
+  merge-bots:
+    description: >
+      With `merge`: bot logins, comma-separated, each one of the rollout's
+      `botAuthors`, whose own PRs the gate merges once ready — opened by that
+      bot, every commit on the head authored by it and committed and signed by
+      GitHub. A separate grant from `merge: agent-only`, which merges only the
+      PRs the pipeline wrote. Empty: a person merges every bot's PR.
+    required: false
+    default: ""
   rollout:
     description: >
       With `merge`: the rollout dial as JSON ({"authors":[...],"optInLabel":"...",

@@ -13,6 +13,9 @@ import {
   hasSkipGuard,
   isHybrid,
   isWritingPrLane,
+  botPassOf,
+  parseMergeBots,
+  rolloutOf,
   KNOWN_EDGE_ATTRS,
   KNOWN_NODE_ATTRS,
   hasPrContext,
@@ -199,6 +202,64 @@ export function validate(ir: Harness, deps: ValidateDeps = {}): Diagnostic[] {
           hint: "add `rollout: {}` (every PR), or rollout: { authors: [...], opt_in_label: ..., skip_label: ... }",
         });
       }
+    }
+  }
+
+  // rollout.bot_authors and the lane attributes that serve it.
+  const botAuthors = hybrid ? (rolloutOf(ir.config)?.botAuthors ?? []) : [];
+  const botLogin = ir.config.identity?.bot_login;
+  if (botLogin && botAuthors.includes(botLogin.toLowerCase())) {
+    diags.push({
+      level: "error",
+      code: "config.bot-authors-names-harness",
+      message: `rollout.bot_authors names identity.bot_login ('${botLogin}') — the pipeline's own PRs are always in scope, and are not a bot author's`,
+      hint: "remove it from rollout.bot_authors",
+    });
+  }
+  for (const n of ir.nodes) {
+    const where = { node: n.id, line: n.line };
+    if (n.attrs.merge_bots !== undefined) {
+      let bots: string[] = [];
+      try {
+        bots = parseMergeBots(n);
+      } catch (e) {
+        diags.push({ level: "error", code: "node.bad-merge-bots", message: (e as Error).message, where, hint: `e.g. merge_bots="dependabot[bot]"` });
+      }
+      if (n.type !== "merge-gate" || mergeSettingOf(n) === undefined) {
+        diags.push({
+          level: "error",
+          code: "node.merge-bots-needs-single-gate",
+          message: `merge_bots= on '${n.id}' applies only to a merge-gate with merge= (the single gate)`,
+          where,
+          hint: "move it to the gate node, which needs merge=\"off\" or merge=\"agent-only\"",
+        });
+      }
+      for (const b of bots.filter((b) => !botAuthors.includes(b))) {
+        diags.push({
+          level: "error",
+          code: "node.merge-bots-not-bot-author",
+          message: `merge_bots= on '${n.id}' names ${b}, which rollout.bot_authors does not — the gate merges only bots the rollout admits`,
+          where,
+          hint: `add "${b}" to rollout.bot_authors, or remove it from merge_bots=`,
+        });
+      }
+    }
+    if (n.attrs.bot_schedule !== undefined && !botPassOf(n, ir.config, ir.edges.filter((e) => e.to === n.id))) {
+      diags.push({
+        level: "warning",
+        code: "node.bot-schedule-ignored",
+        message: `bot_schedule= on '${n.id}' has no effect: only a PR-reading lane entered when a PR opens or its head moves, in a harness whose rollout names bot_authors, has a bot pass to schedule`,
+        where,
+        hint: "remove bot_schedule= (a sweep runs on its own schedule=)",
+      });
+    } else if (n.attrs.bot_schedule !== undefined && (typeof n.attrs.bot_schedule !== "string" || n.attrs.bot_schedule.trim().split(/\s+/).length !== 5)) {
+      diags.push({
+        level: "error",
+        code: "node.bad-bot-schedule",
+        message: `bot_schedule= on '${n.id}' must be a five-field cron expression, got ${JSON.stringify(n.attrs.bot_schedule)}`,
+        where,
+        hint: `e.g. bot_schedule="*/15 * * * *"`,
+      });
     }
   }
 

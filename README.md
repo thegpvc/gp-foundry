@@ -189,6 +189,7 @@ rollout:
   # authors: [alice, bob]      # ...and these people's
   # opt_in_label: agent-review # ...and any PR carrying this label
   # skip_label: no-agent-review
+  # bot_authors: ["dependabot[bot]"] # ...and these bots' PRs (quoted: [ ] is YAML syntax)
 ```
 
 - **Quiet approvals.** `quiet_verdicts="APPROVE"` on the approver delivers an approval as a
@@ -198,7 +199,7 @@ rollout:
   gets a fresh review and a fresh verdict on the same head; the gate holds its check and
   merges nothing until then, then removes the label.
 - **What the pipeline looks at.** Its own PRs always; then whoever the rollout admits.
-  Drafts and other bots' PRs never. `rollout: {}` is every PR.
+  Drafts and other bots' PRs never, unless named in `bot_authors` (below). `rollout: {}` is every PR.
 - **What it may change.** Lanes that read (the reviewer, the gate's check) run on any PR in
   scope. Lanes that write (the fixer, a merge) act only on a PR the pipeline *wrote*:
   opened by `identity.bot_login`, every commit its own. One commit from anyone else and a
@@ -206,6 +207,44 @@ rollout:
 - **Merging is a switch on the gate.** `merge="off"` (the default for a new harness)
   publishes the gate's result as a check and merges nothing. `merge="agent-only"` also
   merges the PRs the pipeline wrote. There is no setting that merges a person's PR.
+
+### Dependency bots beside people
+
+`rollout.bot_authors` admits named bots (`dependabot[bot]`) *in addition to* whatever admits
+people; unlike `authors`, it does not turn the rollout into an allowlist. Other bots stay
+out, and the skip label and drafts still win.
+
+- **Judged like anyone's PR.** The reviewer and approver use the same role files for a bot's
+  PR as for a person's, so the approve or escalate verdict on a dependency update does not
+  depend on who opened it. The agent's context states the update's semver level where it is
+  cheap to tell.
+- **Reviewed on a schedule.** A bot's own PR events carry none of the repo's secrets, so an
+  event-driven reviewer's guard hands those PRs over (no token minted, the reason in the log)
+  to the lane's **bot pass**: jobs in the same workflow that run on `bot_schedule=` (default
+  every 15 minutes) or on dispatch with a `pr` input. They select the bot's PRs whose head the
+  lane has not reviewed, review each, and record the head. A head already reviewed is not
+  reviewed again; with `skip="unchanged-diff"`, a rebase that leaves the diff unchanged is
+  covered by the earlier review, as on a push. Only lanes entered when a PR opens or its head
+  moves get a bot pass.
+- **Who may merge.** Two separate grants on the gate. `merge="agent-only"` merges the PRs the
+  pipeline wrote itself. `merge_bots="dependabot[bot]"` merges the named bots' own PRs once the
+  approver's verdict is ready; every login it names must be in `bot_authors`. A change a named
+  bot sends is taken as within policy: whether it is merged depends on who sent it, not on its
+  bump level. A bot in `bot_authors` but not in `merge_bots` is reviewed and approved, and a
+  person merges it. `merge="agent-only"` alone never merges a bot's PR.
+- **Only while the PR is still the bot's.** The bot path matches the exact login, never a
+  branch name, and holds only while **every commit on the head is authored by that bot and
+  committed and signed by GitHub** (committer `web-flow`, signature verified), which is how
+  Dependabot's commits arrive. A commit's author email alone can be written by anyone who can
+  push, so it is not enough. One commit that fails this, a commit list at the API's limit of
+  250, or commits that cannot be read take the PR off the bot path: it is out of scope, or on
+  the policy's dependabot lane if that is on, and it is never merged as the bot's.
+- **The verdict outranks the dependabot lane.** For a PR admitted through `bot_authors` the
+  gate takes the approver's verdict, never the policy's `dependabot:` lane. That lane still
+  judges dependabot's PRs that `bot_authors` does not admit, as before. Its update level now
+  comes from the `updated-dependencies` block in dependabot's own commits (the highest level
+  present; `unknown` if any entry has none) and from the title, whichever is higher, so a
+  grouped update is no longer always `unknown`.
 
 Set `identity.bot_login` to the account the pipeline actually posts as (under PAT auth, the
 PAT's owner). It is how the pipeline recognizes its own PRs; if it is wrong, the guard job's

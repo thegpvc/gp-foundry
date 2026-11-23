@@ -1,0 +1,19 @@
+# A hybrid harness that admits a dependency-update bot beside every human PR:
+# the reviewer's bot pass reviews the bot's PRs on a schedule, the approver
+# judges them with the same role as any PR, and the gate (merge_bots=) merges
+# the bot's PRs once ready.
+name: bot-authors
+identity:
+  app_id_secret: AGENT_APP_ID
+  app_key_secret: AGENT_APP_PRIVATE_KEY
+  bot_login: agent-app[bot]
+  git_name: agent-app[bot]
+repo:
+  base_branch: main
+labels:
+  re_review: re-review
+rollout:
+  skip_label: no-agent-review
+  bot_authors: ["dependabot[bot]"] # quoted: [ and ] are YAML syntax
+runtime:
+  ref: fixture-ref

@@ -41,6 +41,13 @@ inputs:
       started for one PR. Empty: every candidate.
     required: false
     default: ""
+  bot-authors-only:
+    description: >-
+      With `list`: "true" lists only PRs admitted through the rollout's
+      `botAuthors` — for a lane's scheduled bot pass, which reviews the PRs
+      whose own events carry no secrets.
+    required: false
+    default: "false"
   base-branch:
     description: "With `list`: only PRs targeting this branch."
     required: false
@@ -50,10 +57,12 @@ inputs:
     required: true
   rollout:
     description: >-
-      The rollout dial as JSON ({"authors":[...],"optInLabel":"...","skipLabel":"..."}),
+      The rollout dial as JSON ({"authors":[...],"botAuthors":[...],"optInLabel":"...","skipLabel":"..."}),
       written by the compiler from foundry.config.yaml. Empty means every PR is
       in scope. Drafts and other bots' PRs never are; PRs opened by bot-login
-      always are.
+      always are. A PR opened by a login in botAuthors is in scope, but a guard
+      (one PR, from its event) does not run the lane on it: the lane's scheduled
+      bot pass does, while every commit on it is that bot's.
     required: false
     default: ""
   bot-login:
@@ -88,7 +97,11 @@ outputs:
     description: "One line saying why."
   prs:
     description: >-
-      With `list`: a JSON array of {number, sha, base, requested, quiet}. With
+      With `list`: a JSON array of {number, sha, base, requested, quiet}, plus
+      `bump` (the update's semver level) when one can be told: for a PR
+      admitted through botAuthors from its commits and title, otherwise from
+      the title. A botAuthors PR is listed only while every commit on it is its
+      author's, committed and signed by GitHub. With
       `reviewed-by`: round-robin by author (each author's oldest PR, then each
       author's next, longest-waiting author first); otherwise oldest first — head SHA, base ref, the number of pending review
       requests, and seconds since the PR last changed.

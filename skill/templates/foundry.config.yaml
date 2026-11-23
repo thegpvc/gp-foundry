@@ -47,12 +47,17 @@ repo:
 #   authors: [alice, bob]  ...and these people's
 #   opt_in_label: <label>  ...and any PR carrying this label
 #   skip_label: <label>    never a PR carrying this one
+#   bot_authors: ["dependabot[bot]"]  ...and these bots' PRs, beside people's (not an
+#                          allowlist), judged like anyone's and reviewed on a schedule.
+#                          The gate merges one only if its merge_bots= names the bot.
+#                          Quote the login: [ ] is YAML syntax.
 #   rollout: {}            every PR — the end of a rollout. Keep the key: it is what makes
 #                          the reviewer, the fixer and the gate share one scope.
 rollout:
   authors: []
   # opt_in_label: agent-review
   # skip_label: no-agent-review
+  # bot_authors: ["dependabot[bot]"]
 
 labels: # semantic key -> actual repo label. Guards (`when="label=build"`) resolve
   # through this map, so renaming a repo label is a one-line change HERE —

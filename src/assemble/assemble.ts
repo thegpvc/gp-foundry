@@ -18,11 +18,11 @@ import type {
 } from "../ir/types.js";
 import { isUsesStep } from "../ir/types.js";
 import { emitFanIn, emitNode } from "../handlers/index.js";
-import { emitPostJobs, emitPreJob } from "../handlers/prejob.js";
+import { emitBotPassSelect, emitPostJobs, emitPreJob, emitSweepMark } from "../handlers/prejob.js";
 import { detectDiamonds } from "../wiring/diamond.js";
 import { IMMUTABLE_PATHS_AWK } from "../shared/immutable-paths.js";
 import { releaseTag } from "../shared/version.js";
-import { runnerOf } from "../handlers/attrs.js";
+import { botPassOf, runnerOf } from "../handlers/attrs.js";
 
 /** First line of every generated workflow — how a stale one is told from a hand-written one. */
 export const GENERATED_MARKER = "# GENERATED FROM harness.dot — DO NOT EDIT.";
@@ -270,6 +270,16 @@ export function assemble(
       ? { [pre.jobId]: fragmentToJob(pre, node, nw.guard), [fragment.jobId]: fragmentToJob(fragment, node) }
       : { [fragment.jobId]: fragmentToJob(fragment, node, nw.guard) };
     for (const post of emitPostJobs(mkCtx(node))) jobs[post.jobId] = fragmentToJob(post, node);
+    // rollout.bot_authors: the lane's scheduled bot pass, in the same workflow —
+    // select the bots' PRs, run the lane on each (a matrix), record the heads.
+    if (botPassOf(node, ir.config, inByNode.get(node.id) ?? [])) {
+      const select = emitBotPassSelect(mkCtx(node));
+      const lane = emitNode(node, ir, { ...mkCtx(node), botPass: true });
+      const mark = emitSweepMark(mkCtx(node), true);
+      jobs[select.jobId] = fragmentToJob(select, node);
+      if (lane) jobs[lane.jobId] = fragmentToJob(lane, node);
+      jobs[mark.jobId] = fragmentToJob(mark, node);
+    }
     emitFile(node.id, {
       name: displayName(node),
       on: nw.triggers,

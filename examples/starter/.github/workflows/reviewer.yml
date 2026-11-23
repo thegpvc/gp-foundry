@@ -30,7 +30,7 @@ jobs:
     steps:
       - name: Is this PR in scope?
         id: scope
-        uses: thegpvc/gp-foundry/actions/pr-scope@v0.7.0
+        uses: thegpvc/gp-foundry/actions/pr-scope@v0.8.0
         with:
           number: ${{ github.event.pull_request.number }}
           token: ${{ github.token }}
@@ -92,7 +92,7 @@ jobs:
         uses: ./.gp-foundry/harness/.github/agent-setup
       - name: Fetch context
         id: ctx
-        uses: thegpvc/gp-foundry/actions/agent-context@v0.7.0
+        uses: thegpvc/gp-foundry/actions/agent-context@v0.8.0
         with:
           type: pr-diff
           number: ${{ github.event.pull_request.number }}
@@ -102,7 +102,7 @@ jobs:
           trusted-framing: baseline
       - name: Run agent
         timeout-minutes: 15
-        uses: thegpvc/gp-foundry/actions/run-agent@v0.7.0
+        uses: thegpvc/gp-foundry/actions/run-agent@v0.8.0
         with:
           role-file: .gp-foundry/harness/.github/agents/roles/reviewer.md
           model: claude-opus-4-8

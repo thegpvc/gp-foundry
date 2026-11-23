@@ -19,6 +19,8 @@ import { loadConfig } from "../src/config/load.js";
 import { compile } from "../src/index.js";
 import { evalGuard } from "../src/sim/gh-expr.js";
 import type { FoundryConfig, Harness } from "../src/ir/types.js";
+import { decide as scopeDecide } from "../actions/pr-scope/src/index.js";
+import { wire } from "../src/wiring/wire.js";
 
 const BOT = "agent-bot[bot]";
 const APP = { auth: { mode: "app", app_id_secret: "APP_ID", app_key_secret: "APP_KEY" } } as Partial<FoundryConfig>;
@@ -321,3 +323,259 @@ describe("the guard, run as Actions runs it (App auth, unchanged-diff)", () => {
     });
   });
 });
+
+// ── rollout.bot_authors (#55): the bot's PRs, from a scheduled bot pass ───────
+
+describe("rollout.bot_authors: the reviewer's bot pass", () => {
+  const DEP = "dependabot[bot]";
+  const BOTS = { rollout: { skip_label: "no-agent-review", bot_authors: [DEP] } } as Partial<FoundryConfig>;
+  const ROLE = 'skip="unchanged-diff", post="review"';
+  const compiled = (cfg: Partial<FoundryConfig> = BOTS, attrs = ROLE) => guardJob({ ...APP, ...cfg }, attrs).wf;
+  const ev = (event: string, payload: Record<string, unknown> = {}) => ({ github: { event_name: event, event: payload, actor: "someone" } }) as any;
+  const prEvent = (login: string, type = "Bot") =>
+    ev("pull_request", { action: "synchronize", pull_request: { number: 7, draft: false, labels: [], user: { login, type } } });
+
+  it("on the bot's pull_request event, without the App secrets: no mint, the guard succeeds and says why, no review", async () => {
+    const wf = compiled();
+    const job = wf.jobs.reviewer_guard;
+    // The event reaches the guard, so the reason is published rather than nothing at all.
+    expect(evalGuard(String(job.if), prEvent(DEP))).toBe(true);
+    // pr-scope's own answer for this PR, with the rollout the compiler wrote.
+    const rollout = JSON.parse(job.steps.find((s: any) => s.id === "scope").with.rollout);
+    const octo = {
+      rest: { pulls: { get: async () => ({ data: { draft: false, labels: [], user: { login: DEP, type: "Bot" }, head: { ref: "dependabot/npm/x" } } }) } },
+    } as any;
+    const s = await scopeDecide(octo, { owner: "o", repo: "r", number: 7, rollout, botLogin: BOT, requireAgentWritten: false });
+    const r = runGuard(job, { scope: { run: String(s.run) as "true" | "false", reason: s.reason }, noSecrets: true });
+    expect(r.steps).toEqual({ scope: "ran", "app-token": "skipped", decide: "ran" });
+    expect(r.conclusion).toBe("success");
+    expect(r.log).toContain("::notice::Skipping reviewer:");
+    expect(r.log).toContain("bot pass");
+    expect(reviewerRuns(wf, r)).toBe(false);
+  });
+
+  it("with an author allowlist, the bot's events still reach the guard (and another bot's do not)", () => {
+    const wf = compiled({ rollout: { authors: ["alice"], bot_authors: [DEP] } } as Partial<FoundryConfig>);
+    expect(evalGuard(String(wf.jobs.reviewer_guard.if), prEvent(DEP))).toBe(true);
+    expect(evalGuard(String(wf.jobs.reviewer_guard.if), prEvent("renovate[bot]"))).toBe(false);
+    expect(evalGuard(String(wf.jobs.reviewer_guard.if), prEvent("alice", "User"))).toBe(true);
+    expect(evalGuard(String(wf.jobs.reviewer_guard.if), prEvent("bob", "User"))).toBe(false);
+  });
+
+  it("a scheduled or dispatched run drives the pass, never the event jobs", () => {
+    const wf = compiled();
+    expect(wf.on.schedule).toEqual([{ cron: "*/15 * * * *" }]);
+    expect(wf.on.workflow_dispatch.inputs.pr.type).toBe("string");
+    for (const e of ["schedule", "workflow_dispatch"]) {
+      expect(evalGuard(String(wf.jobs.reviewer_guard.if), ev(e))).toBe(false);
+      expect(evalGuard(String(wf.jobs.reviewer_bots_select.if), ev(e))).toBe(true);
+    }
+    expect(evalGuard(String(wf.jobs.reviewer_bots_select.if), prEvent(DEP))).toBe(false);
+    // Spelled out, not left to the payload prefilter: on a scheduled run the payload is
+    // empty, and GitHub reads `null == false` as true.
+    expect(String(wf.jobs.reviewer_guard.if)).toMatch(/^github\.event_name != 'schedule' && github\.event_name != 'workflow_dispatch' && /);
+    // Its own concurrency slot; an event keeps its PR's.
+    expect(wf.concurrency.group).toContain("'reviewer-bots'");
+    expect(wf.concurrency.group).toContain("github.event.pull_request.number");
+  });
+
+  it("bot_schedule= sets the pass's cron", () => {
+    const wf = compiled(BOTS, `${ROLE}, bot_schedule="7 * * * *"`);
+    expect(wf.on.schedule).toEqual([{ cron: "7 * * * *" }]);
+  });
+
+  it("the pass reviews each selected head with the lane's own role, and records the heads it covered", () => {
+    const wf = compiled();
+    const lane = wf.jobs.reviewer_bots;
+    expect(lane.needs).toEqual(["reviewer_bots_select"]);
+    expect(lane.strategy.matrix.pr).toBe("${{ fromJSON(needs.reviewer_bots_select.outputs.prs) }}");
+    const agent = lane.steps.find((st: any) => String(st.uses ?? "").includes("run-agent"));
+    // The verdict is authorship-blind: the same role as for a person's PR.
+    expect(agent.with["role-file"]).toBe(".gp-foundry/harness/agents/roles/reviewer.md");
+    expect(lane.steps.find((st: any) => st.name === "Fetch context").with.number).toBe("${{ matrix.pr.number }}");
+    const post = lane.steps.find((st: any) => st.name === "Post the review");
+    expect(post.env).toMatchObject({ PR: "${{ matrix.pr.number }}", HEAD_SHA: "${{ matrix.pr.sha }}", REQUIRE_VERDICT: "false" });
+    const stamp = lane.steps.find((st: any) => st.name === "Stamp the review with the diff hash");
+    expect(stamp.env).toMatchObject({ HEAD_SHA: "${{ matrix.pr.sha }}", DIFF_HASH: "${{ matrix.pr.diff_hash }}" });
+    expect(wf.jobs.reviewer_bots_mark.needs).toEqual(["reviewer_bots_select", "reviewer_bots"]);
+    expect(wf.jobs.reviewer_bots_mark.permissions).toEqual({ checks: "write", actions: "read" });
+    // Its failure count reads only its own records, as the select job's does.
+    expect(wf.jobs.reviewer_bots_mark.steps[0].run).toContain("select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP");
+    expect(wf.jobs.reviewer_bots_mark.steps[0].env.MARK_APP).toBe("github-actions");
+    // No job that runs the agent may write checks.
+    expect(lane.permissions.checks).toBe("read");
+  });
+
+  it("a single-PR dispatch gets its own concurrency slot, apart from the scheduled pass", () => {
+    const group = compiled().concurrency.group.slice(4, -3);
+    expect(group).toContain("inputs.pr && format('reviewer-bots-pr-{0}', inputs.pr)");
+  });
+
+  it("a lane entered on a review, not on a PR's head, gets no bot pass", () => {
+    const g = parseDot(`digraph t {
+      start    [type=start]
+      critic   [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+      start    -> critic [on="pull_request_review.submitted"]
+    }`);
+    const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, ...APP, ...BOTS } as FoundryConfig;
+    const wf: any = yaml.load(compile({ name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" }).files.find((f) => f.path.endsWith("/critic.yml"))!.contents);
+    expect(wf.on.schedule).toBeUndefined();
+    expect(wf.jobs.critic_bots_select).toBeUndefined();
+    expect(String(wf.jobs.critic_guard.if)).not.toContain("schedule");
+  });
+
+  it("a lane also started by hand keeps its own dispatch; its pass runs on dispatch only for a pr", () => {
+    const g = parseDot(`digraph t {
+      start    [type=start]
+      reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+      start    -> reviewer [on="pull_request.opened, workflow_dispatch"]
+    }`);
+    const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, ...APP, ...BOTS } as FoundryConfig;
+    const wf: any = yaml.load(compile({ name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" }).files.find((f) => f.path.endsWith("/reviewer.yml"))!.contents);
+    expect(wf.on.workflow_dispatch.inputs.pr).toBeDefined();
+    expect(String(wf.jobs.reviewer_guard.if)).not.toContain("!= 'workflow_dispatch'");
+    expect(String(wf.jobs.reviewer_bots_select.if)).toContain("inputs.pr != ''");
+  });
+
+  it("a review panel (no guard, no bot pass) leaves the listed bots' PRs alone", () => {
+    const g = parseDot(`digraph t {
+      start [type=start]
+      split [type=parallel]
+      a     [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+      b     [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff"]
+      join  [type=fan_in, role="agents/roles/reviewer.md"]
+      start -> split [on="pull_request.opened"]
+      split -> a
+      split -> b
+      a -> join
+      b -> join
+    }`);
+    const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, ...APP, ...BOTS } as FoundryConfig;
+    // The panel's wiring guard. (Its legs' jobs currently take a guard-job
+    // condition instead — a known issue that predates bot_authors.)
+    const cond = String(wire({ name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" }).perNode.join!.guard);
+    expect(evalGuard(cond, prEvent(DEP))).toBe(false);
+    expect(evalGuard(cond, prEvent("alice", "User"))).toBe(true);
+  });
+
+  describe("the select job, run as Actions runs it", () => {
+    const select = () => compiled().jobs.reviewer_bots_select;
+    const listed = (prs: unknown[]) => ({ run: "true" as const, reason: "", listed: "true", prs: JSON.stringify(prs) }) as any;
+    const head = (sha: string) => ({ number: 9, sha, base: "main", requested: 0, quiet: 900, bot: true, bump: "minor" });
+    const checks = (runs: unknown[] = []) => ({ check_runs: runs });
+    const base9 = { "repos/o/r/pulls/9": { base: { sha: "base9" } } };
+    const run = (sha: string, fixtures: Record<string, unknown>, env?: Record<string, string>) =>
+      runGuard(select(), { scope: listed([head(sha)]), fixtures: { ...base9, ...fixtures }, ...(env ? { env } : {}) });
+    const selected = (r: JobResult) => JSON.parse(r.outputs.prs || "[]");
+
+    it("an unreviewed head is selected, with its update level and diff hash", () => {
+      const r = run("s1", { "repos/o/r/commits/s1/check-runs?per_page=100&filter=all": checks(), "repos/o/r/pulls/9/reviews?per_page=100": [], "repos/o/r/compare/base9...s1": DIFF, "repos/o/r/pulls/9/reviews": [] });
+      expect(r.conclusion).toBe("success");
+      const [p] = selected(r);
+      expect(p).toMatchObject({ number: 9, sha: "s1", base: "main", bump: "minor" });
+      expect(p.diff_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(r.outputs.count).toBe("1");
+    });
+
+    it("a head the pass already reviewed (its swept check) is not reviewed again", () => {
+      const swept = { name: "gp-foundry/swept (reviewer)", app: { slug: "github-actions" }, started_at: "2026-01-01T00:00:00Z" };
+      const r = run("s1", { "repos/o/r/commits/s1/check-runs?per_page=100&filter=all": checks([swept]) });
+      expect(selected(r)).toEqual([]);
+      expect(r.log).toContain("#9: already reviewed at s1");
+    });
+
+    it("a head this lane posted its review on (an event run, or a pass whose mark was lost) is not reviewed again", () => {
+      const review = { user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: "ok\n\n<!-- gp-foundry:posted:reviewer:s1 -->" };
+      const r = run("s1", { "repos/o/r/commits/s1/check-runs?per_page=100&filter=all": checks(), "repos/o/r/pulls/9/reviews?per_page=100": [review] });
+      expect(selected(r)).toEqual([]);
+    });
+
+    it("a new head with the same diff (the bot rebased): the last review is marked as covering it, no second review", () => {
+      const first = run("s1", { "repos/o/r/commits/s1/check-runs?per_page=100&filter=all": checks(), "repos/o/r/pulls/9/reviews?per_page=100": [], "repos/o/r/compare/base9...s1": DIFF, "repos/o/r/pulls/9/reviews": [] });
+      const hash = selected(first)[0].diff_hash;
+      const stampedReview = { id: 41, user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: `ok\n\n<!-- gp-foundry:posted:reviewer:s1 -->\n\n<!-- gp-foundry:diff:reviewer:${hash} -->` };
+      const r = run("s2", {
+        "repos/o/r/commits/s2/check-runs?per_page=100&filter=all": checks(),
+        "repos/o/r/pulls/9/reviews?per_page=100": [stampedReview],
+        "repos/o/r/compare/base9...s2": DIFF,
+        "repos/o/r/pulls/9/reviews": [stampedReview],
+        "repos/o/r/pulls/9/reviews/41": { body: stampedReview.body },
+      });
+      expect(selected(r)).toEqual([]);
+      expect(r.writes).toContain("PUT repos/o/r/pulls/9/reviews/41 token=app-tok");
+      expect(r.writes).toContain("<!-- gp-foundry:also-head:reviewer:s2 -->");
+    });
+
+    it("a new head with a changed diff is reviewed", () => {
+      const stampedReview = { id: 41, user: { login: BOT }, submitted_at: "2026-01-01T00:00:00Z", body: "ok\n\n<!-- gp-foundry:diff:reviewer:" + "0".repeat(64) + " -->" };
+      const r = run("s2", {
+        "repos/o/r/commits/s2/check-runs?per_page=100&filter=all": checks(),
+        "repos/o/r/pulls/9/reviews?per_page=100": [stampedReview],
+        "repos/o/r/compare/base9...s2": DIFF,
+        "repos/o/r/pulls/9/reviews": [stampedReview],
+      });
+      expect(selected(r).map((p: any) => p.sha)).toEqual(["s2"]);
+      expect(r.writes).toBe("");
+    });
+
+    it("a head whose state cannot be read is left for the next run", () => {
+      const r = run("s1", {});
+      expect(selected(r)).toEqual([]);
+      expect(r.conclusion).toBe("success");
+    });
+
+    it("a failed listing is a quiet tick", () => {
+      const r = runGuard(select(), { scope: { listed: "false", prs: "[]" } as any });
+      expect(r.conclusion).toBe("success");
+      expect(r.outputs.count).toBe("0");
+    });
+  });
+
+  describe("the approver sweep and the gate", () => {
+    const sweep = 'role="agents/roles/approver.md", context="pr-review", select="sweep", schedule="*/10 * * * *", requires_review=true, post="review"';
+    const harness = (cfg: Partial<FoundryConfig>) => {
+      const g = parseDot(`digraph t {
+        start    [type=start]
+        reviewer [type=pr-review, role="agents/roles/reviewer.md", context="pr-diff", post="review", skip="unchanged-diff"]
+        approver [type=pr-review, ${sweep}]
+        gate     [type=merge-gate, policy="agents/policy/merge.yaml", schedule="*/10 * * * *", merge="off"]
+        start    -> reviewer [on="pull_request.opened, pull_request.synchronize"]
+      }`);
+      const config = { ...loadConfig(undefined), identity: { bot_login: BOT }, ...APP, ...cfg } as FoundryConfig;
+      const ir: Harness = { name: g.name, nodes: g.nodes, edges: g.edges, config, sourcePath: "t.dot" };
+      return Object.fromEntries(compile(ir).files.filter((f) => f.path.includes("/workflows/")).map((f) => [f.path.split("/").pop()!.replace(".yml", ""), yaml.load(f.contents) as any]));
+    };
+
+    it("the approver judges a bot's PR with its own role, and hands the update level to the agent", () => {
+      const wf = harness(BOTS).approver;
+      const agent = wf.jobs.approver.steps.find((st: any) => String(st.uses ?? "").includes("run-agent"));
+      expect(agent.with["role-file"]).toBe(".gp-foundry/harness/agents/roles/approver.md");
+      expect(wf.jobs.approver.steps.some((st: any) => st.name === "Note the dependency update's level")).toBe(true);
+      const select = wf.jobs.approver_select.steps.find((st: any) => st.id === "select").run;
+      expect(select).toContain("{bump: $bump}");
+      // The approver sweep is already scheduled: it gets no bot pass of its own.
+      expect(wf.jobs.approver_bots_select).toBeUndefined();
+    });
+
+    it("the gate's event prefilter lets a person's or the harness's event on the bot's PR through, and still not the bot's own", () => {
+      const gate = harness(BOTS).gate.jobs.gate;
+      const on = (login: string, actor: string) =>
+        evalGuard(String(gate.if), { github: { event_name: "pull_request_review", actor, repository: "o/r", event: { pull_request: { state: "open", draft: false, labels: [], base: { ref: "main" }, head: { repo: { full_name: "o/r" } }, user: { login, type: "Bot" } } } } } as any);
+      expect(on(DEP, BOT)).toBe(true);
+      expect(on(DEP, "alice")).toBe(true);
+      expect(on(DEP, DEP)).toBe(false);
+      expect(on("renovate[bot]", BOT)).toBe(false);
+    });
+
+    it("with no bot_authors (or an empty list) every workflow is byte-identical", () => {
+      const plain = { rollout: { skip_label: "no-agent-review" } } as Partial<FoundryConfig>;
+      const empty = { rollout: { skip_label: "no-agent-review", bot_authors: [] } } as Partial<FoundryConfig>;
+      const a = harness(plain);
+      const b = harness(empty);
+      expect(yaml.dump(b)).toBe(yaml.dump(a));
+      expect(a.reviewer.jobs.reviewer_bots_select).toBeUndefined();
+      expect(a.reviewer.on.schedule).toBeUndefined();
+    });
+  });
+});
+

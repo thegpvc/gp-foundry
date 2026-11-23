@@ -86,12 +86,17 @@ export const CONFIG_SCHEMA = {
     "rollout": {
       "type": "object",
       "additionalProperties": false,
-      "description": "The rollout dial: which human PRs the pipeline looks at while it is brought to a repo gradually. Leave the block out and every PR is in scope. PRs the harness bot opened are always in scope; drafts and other bots' PRs never are (a bot is reviewed only if named in authors).",
+      "description": "The rollout dial: which human PRs the pipeline looks at while it is brought to a repo gradually. Leave the block out and every PR is in scope. PRs the harness bot opened are always in scope; drafts and other bots' PRs never are (a bot is reviewed only if named in authors or bot_authors).",
       "properties": {
         "authors": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
           "description": "GitHub logins whose PRs are in scope. Case-insensitive."
+        },
+        "bot_authors": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "\\[[Bb][Oo][Tt]\\]$" },
+          "description": "Bot logins (e.g. dependabot[bot]) whose PRs are in scope as well as whatever admits people; naming them does not make the rollout an allowlist. A lane acts on such a PR only while every commit on it is the bot's, committed and signed by GitHub. Event-driven reading lanes review them from a scheduled bot pass, with the same role as any PR. A gate merges them only when its merge_bots= names the bot. Case-insensitive."
         },
         "opt_in_label": {
           "type": "string",
