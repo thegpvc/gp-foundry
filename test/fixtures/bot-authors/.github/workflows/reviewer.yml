@@ -600,11 +600,12 @@ jobs:
             fi
           }
           SELECTED='[]'
-          while IFS=$'\t' read -r NUM SHA BASE BUMP SINCE; do
+          while IFS=$'\t' read -r NUM SHA BASE BUMP UPDATES SINCE; do
             [ -n "$NUM" ] || continue
             # SINCE: when a re-review was requested ("-": none). Records from before it do not count.
             [ "$SINCE" = "-" ] && SINCE=""
             [ "$BUMP" = "-" ] && BUMP=""
+            [ "$UPDATES" = "-" ] && UPDATES=""
             export SINCE SHA
             # The pass's own record of its runs on this head: done, or failed too often.
             # filter=all: the default keeps only the newest run per name, hiding the count.
@@ -632,13 +633,13 @@ jobs:
               if [ -n "$COVERED" ]; then echo "#$NUM: the diff is unchanged since the last review — marked it as covering $SHA"; continue; fi
             fi
             echo "#$NUM: selected at $SHA"
-            SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg bump "$BUMP" --arg since "$SINCE" --arg h "$DIFF_HASH" --arg t "$STARTED_AT" \
-              '. + [{number: $n, sha: $s, base: $b, diff_hash: $h, started_at: $t} + (if $bump == "" then {} else {bump: $bump} end) + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")
+            SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg bump "$BUMP" --arg updates "$UPDATES" --arg since "$SINCE" --arg h "$DIFF_HASH" --arg t "$STARTED_AT" \
+              '. + [{number: $n, sha: $s, base: $b, diff_hash: $h, started_at: $t} + (if $bump == "" then {} else {bump: $bump} end) + (if $updates == "" then {} else {updates: $updates} end) + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")
             if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then
               echo "limit of $LIMIT reached — the rest wait for the next run"
               break
             fi
-          done < <(jq -r '.[] | [.number, .sha, .base, (.bump // "-"), (.since // "-")] | @tsv' <<< "$SCOPED")
+          done < <(jq -r '.[] | [.number, .sha, .base, (.bump // "-"), (.updates // "-"), (.since // "-")] | @tsv' <<< "$SCOPED")
           { echo "prs=$SELECTED"; echo "count=$(jq 'length' <<< "$SELECTED")"; } >> "$GITHUB_OUTPUT"
   reviewer_bots:
     name: "reviewer bots #${{ matrix.pr.number }}"
@@ -722,12 +723,26 @@ jobs:
         env:
           CONTEXT_FILE: ${{ steps.ctx.outputs.context-file }}
           BUMP: ${{ matrix.pr.bump }}
+          UPDATES: ${{ matrix.pr.updates }}
         run: |-
-          case "$BUMP" in patch|minor|major) ;; *) exit 0 ;; esac
+          case "$BUMP" in patch|minor|major) ;; *) BUMP="" ;; esac
+          [ -n "$BUMP$UPDATES" ] || exit 0
           [ -n "$CONTEXT_FILE" ] || exit 0
           {
             printf '\n## Dependency update\n\n'
-            printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\n' "$BUMP"
+            if [ -n "$BUMP" ]; then
+              printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\n' "$BUMP"
+            else
+              printf 'The semver level of this update could not be determined: at least one dependency has no readable MAJOR.MINOR.PATCH versions.\n'
+            fi
+            if [ -n "$UPDATES" ]; then
+              printf '\nDependencies updated (from the commit messages):\n\n'
+              IFS=',' read -ra ALL <<< "$UPDATES"
+              for U in "${ALL[@]}"; do
+                IFS='>' read -r NAME FROM TO <<< "$U"
+                printf -- '- %s: %s → %s\n' "$NAME" "$FROM" "$TO"
+              done
+            fi
           } >> "$CONTEXT_FILE"
       - name: Run agent
         id: agent

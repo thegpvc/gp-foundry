@@ -14,7 +14,7 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { commitAuthorOf, inScope, isAgentWritten, isBotWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
-import { parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
+import { encodeDependabotUpdates, parseDependabotUpdates, type DependabotBump } from "../../../src/shared/dependabot.js";
 import { excludeLabelQualifier, MARK_APP, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 import { requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
@@ -110,6 +110,12 @@ export interface ScopedPr {
    * title is its author's claim, and only the bot's is taken at its word.
    */
   bump?: Exclude<DependabotBump, "unknown">;
+  /**
+   * With it, each dependency's versions as one word (`name>from>to`,
+   * comma-separated; encodeDependabotUpdates), when the bot's commits name
+   * them all — so a role can judge a single package ("any 0.x bump needs a person").
+   */
+  updates?: string;
 }
 
 /**
@@ -186,8 +192,9 @@ async function listCandidates(
       core.info(`#${p.number}: out of scope — ${written.detail}; rollout.bot_authors admits a bot's PR only while every commit is its own, made by GitHub`);
       continue;
     }
-    const bump = parseDependabotUpdateType(commits.map((c) => c.message), title);
-    out.push({ ...p, ...(bump !== "unknown" ? { bump } : {}) });
+    const { level: bump, updates: all } = parseDependabotUpdates(commits.map((c) => c.message), title);
+    const updates = encodeDependabotUpdates(all);
+    out.push({ ...p, ...(bump !== "unknown" ? { bump } : {}), ...(updates ? { updates } : {}) });
   }
   return out;
 }

@@ -554,11 +554,16 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `}`,
   ];
   const hybrid = isHybrid(ctx.config);
-  // rollout.bot_authors: a bot's PR carries its update's level (pr-scope's `bump`)
-  // through the list and into its matrix entry, as context for the agent. With
+  // rollout.bot_authors: a bot's PR carries its update's level and versions
+  // (pr-scope's `bump` and `updates`) through the list and into its matrix entry, as context for the agent. With
   // no bot authors the script is as it was.
   const bump = rolloutOf(ctx.config)?.botAuthors?.length
-    ? { column: ` \\(.bump // "-")`, field: " BUMP", arg: ` --arg bump "$BUMP"`, entry: ` + (if $bump == "-" then {} else {bump: $bump} end)` }
+    ? {
+        column: ` \\(.bump // "-") \\(.updates // "-")`,
+        field: " BUMP UPDATES",
+        arg: ` --arg bump "$BUMP" --arg updates "$UPDATES"`,
+        entry: ` + (if $bump == "-" then {} else {bump: $bump} end) + (if $updates == "-" then {} else {updates: $updates} end)`,
+      }
     : { column: "", field: "", arg: "", entry: "" };
   // Some node's dispatch= names this sweep: a run may be started for one PR.
   const only = dispatchedSweepsOf(ctx.nodes ?? []).some((s) => s.id === node.id);
@@ -1170,11 +1175,12 @@ export function emitBotPassSelect(ctx: EmitContext): WorkflowJobFragment {
     `STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`,
     ...(unchangedDiff ? [`unchanged_diff() {`, ...diffLines.map((l) => (l ? `  ${l}` : l)), `}`] : []),
     `SELECTED='[]'`,
-    `while IFS=$'\\t' read -r NUM SHA BASE BUMP SINCE; do`,
+    `while IFS=$'\\t' read -r NUM SHA BASE BUMP UPDATES SINCE; do`,
     `  [ -n "$NUM" ] || continue`,
     `  # SINCE: when a re-review was requested ("-": none). Records from before it do not count.`,
     `  [ "$SINCE" = "-" ] && SINCE=""`,
     `  [ "$BUMP" = "-" ] && BUMP=""`,
+    `  [ "$UPDATES" = "-" ] && UPDATES=""`,
     `  export SINCE SHA`,
     `  # The pass's own record of its runs on this head: done, or failed too often.`,
     `  # filter=all: the default keeps only the newest run per name, hiding the count.`,
@@ -1206,13 +1212,13 @@ export function emitBotPassSelect(ctx: EmitContext): WorkflowJobFragment {
         ]
       : []),
     `  echo "#$NUM: selected at $SHA"`,
-    `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg bump "$BUMP" --arg since "$SINCE" --arg h "$DIFF_HASH" --arg t "$STARTED_AT" \\`,
-    `    '. + [{number: $n, sha: $s, base: $b, diff_hash: $h, started_at: $t} + (if $bump == "" then {} else {bump: $bump} end) + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")`,
+    `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg bump "$BUMP" --arg updates "$UPDATES" --arg since "$SINCE" --arg h "$DIFF_HASH" --arg t "$STARTED_AT" \\`,
+    `    '. + [{number: $n, sha: $s, base: $b, diff_hash: $h, started_at: $t} + (if $bump == "" then {} else {bump: $bump} end) + (if $updates == "" then {} else {updates: $updates} end) + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")`,
     `  if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then`,
     `    echo "limit of $LIMIT reached — the rest wait for the next run"`,
     `    break`,
     `  fi`,
-    `done < <(jq -r '.[] | [.number, .sha, .base, (.bump // "-"), (.since // "-")] | @tsv' <<< "$SCOPED")`,
+    `done < <(jq -r '.[] | [.number, .sha, .base, (.bump // "-"), (.updates // "-"), (.since // "-")] | @tsv' <<< "$SCOPED")`,
     `{ echo "prs=$SELECTED"; echo "count=$(jq 'length' <<< "$SELECTED")"; } >> "$GITHUB_OUTPUT"`,
   ].join("\n");
   const app = unchangedDiff ? appTokenStep(ctx, { "pull-requests": "write" }) : undefined;
