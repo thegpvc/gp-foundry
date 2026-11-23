@@ -128,7 +128,20 @@ from a branch prefix: a draft never, a PR with the skip label never, a PR
 `bot-login` opened always, another bot only if named in `authors`, then a listed
 author or the opt-in label. With no rollout, every remaining PR. The policy's
 `branchPrefix` clause is not applied. If the policy enables the dependabot lane,
-dependabot's PRs are judged and merged on that lane as before.
+dependabot's PRs are judged and merged on that lane as before — except one the
+rollout admits through `botAuthors` while every commit on it is authored by the
+bot and committed and signed by GitHub (web-flow, verified): that PR is judged on
+the approver's verdict like any PR in scope (**the verdict wins** over the lane).
+Any other commit on it returns it to the lane (or out of scope, without the
+lane); commits that cannot be read, or 250 or more of them, leave it unevaluated
+that tick. The lane's semver level reads the `updated-dependencies` block of
+dependabot's own GitHub-signed commits and the title, whichever is higher.
+
+**Who may merge.** `merge: agent-only` merges the PRs the pipeline wrote itself.
+`merge-bots` (the compiler writes it from `merge_bots=`) merges the named bots'
+own PRs once ready, whatever the bump level — a separate grant, independent of
+`merge`. A bot in `botAuthors` that `merge-bots` does not name is never merged by
+the gate: its check says a person merges it.
 
 `check-app` names the app whose runs the gate adopts. Leave it empty when the
 check is published with `GITHUB_TOKEN`; pass the harness App's slug when

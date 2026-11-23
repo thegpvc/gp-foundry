@@ -286,3 +286,169 @@ describe("pr-scope: listing only PRs the bot has reviewed", () => {
     expect(await listInScope(searcher([new Error("rate limit"), new Error("rate limit")]), opts)).toBeUndefined();
   });
 });
+
+// rollout.bot_authors (#55): a named bot's PRs beside every person's.
+describe("pr-scope: rollout.bot_authors", () => {
+  const DEP = "dependabot[bot]";
+  const rollout = { skipLabel: "no-agent-review", botAuthors: [DEP] };
+
+  it("a guard hands a listed bot's PR to the scheduled bot pass: in scope, not run, the reason given", async () => {
+    const o = octokit(by(DEP, "Bot"));
+    const r = await decide(o, { ...base, rollout, requireAgentWritten: false });
+    expect(r).toMatchObject({ inScope: true, run: false });
+    expect(r.reason).toContain("rollout.bot_authors");
+    expect(r.reason).toContain("bot pass");
+    // No commit read: the event's read-only token is all a Dependabot run has.
+    expect(o.calls).toEqual(["pulls.get"]);
+  });
+
+  it("people's PRs still run; another bot stays out", async () => {
+    expect((await decide(octokit(by("alice")), { ...base, rollout, requireAgentWritten: false })).run).toBe(true);
+    const other = await decide(octokit(by("renovate[bot]", "Bot")), { ...base, rollout, requireAgentWritten: false });
+    expect(other).toMatchObject({ inScope: false, run: false });
+    expect(other.reason).toContain("bot_authors");
+  });
+
+  it("a writing lane never runs on it", async () => {
+    const r = await decide(octokit(by(DEP, "Bot"), [DEP]), { ...base, rollout, requireAgentWritten: true });
+    expect(r.run).toBe(false);
+  });
+
+  describe("listing", () => {
+    const NOW = Date.parse("2026-01-01T01:00:00Z");
+    const open = (number: number, login: string, over: Record<string, unknown> = {}) => ({
+      number,
+      draft: false,
+      labels: [],
+      title: `PR ${number}`,
+      user: { login, type: login.endsWith("[bot]") ? "Bot" : "User" },
+      head: { sha: `sha${number}` },
+      base: { ref: "main" },
+      requested_reviewers: [],
+      requested_teams: [],
+      updated_at: "2026-01-01T00:59:00Z",
+      ...over,
+    });
+    const GROUPED_MAJOR = ["Bump the npm group with 2 updates", "", "---", "updated-dependencies:", "- dependency-name: a", "  update-type: version-update:semver-patch", "- dependency-name: b", "  update-type: version-update:semver-major", "...", ""].join("\n");
+    type C = { login: string | null; message?: string; signed?: boolean; sha?: string };
+    function lister(prs: unknown[], commits: Record<number, C[] | Error>, checkRuns: Record<string, unknown[] | Error> = {}) {
+      const reads: number[] = [];
+      const o = {
+        reads,
+        paginate: async (fn: (p: unknown) => Promise<{ data: unknown }>, params: unknown) => (await fn(params)).data,
+        rest: {
+          checks: {
+            listForRef: async ({ ref }: { ref: string }) => {
+              const c = checkRuns[ref] ?? [];
+              if (c instanceof Error) throw c;
+              return { data: c };
+            },
+          },
+          pulls: {
+            list: async () => ({ data: prs }),
+            listCommits: async ({ pull_number }: { pull_number: number }) => {
+              reads.push(pull_number);
+              const c = commits[pull_number] ?? [];
+              if (c instanceof Error) throw c;
+              // Signed by GitHub unless said otherwise; the last commit is the listed head.
+              return {
+                data: c.map(({ login, message, signed = true, sha }, i) => ({
+                  sha: sha ?? (i === c.length - 1 ? `sha${pull_number}` : `c${i}`),
+                  author: login ? { login } : null,
+                  committer: { login: signed ? "web-flow" : (login ?? "x") },
+                  commit: { message: message ?? "", verification: { verified: signed } },
+                })),
+              };
+            },
+          },
+        },
+      };
+      return o as unknown as Parameters<typeof listInScope>[0] & { reads: number[] };
+    }
+    const opts = { owner: "o", repo: "r", baseBranch: "main", botLogin: BOT, nowMs: NOW, retryDelayMs: 0, rollout };
+    const prs = [
+      open(1, "alice"),
+      open(2, DEP, { title: "Bump the npm group with 2 updates" }),
+      open(3, DEP),
+      open(4, DEP),
+      open(5, "renovate[bot]"),
+      open(6, DEP, { labels: [{ name: "no-agent-review" }] }),
+      open(7, DEP, { draft: true }),
+    ];
+    const commits = {
+      2: [{ login: DEP, message: GROUPED_MAJOR }],
+      3: [{ login: DEP }, { login: "mallory" }],
+      4: new Error("HTTP 502"),
+    };
+
+    it("keeps the bot's own PRs with the update level; drops one a person pushed to, or whose commits cannot be read", async () => {
+      const o = lister(prs, commits);
+      const got = await listInScope(o, opts);
+      expect(got?.map((p) => p.number)).toEqual([1, 2]);
+      expect(got?.[0]).not.toHaveProperty("bump");
+      expect(got?.[1]).toMatchObject({ number: 2, bump: "major" });
+      // Commits are read only for the bot's PRs in scope.
+      expect(o.reads.sort()).toEqual([2, 3, 4]);
+    });
+
+    describe("reviewed-check: a head the bot pass has recorded", () => {
+      const pass = { ...opts, botAuthorsOnly: true, reviewedCheck: "gp-foundry/swept (reviewer)", rereviewLabel: "re-review" };
+      const mark = (slug = "github-actions") => [{ name: "gp-foundry/swept (reviewer)", app: { slug } }];
+
+      it("is left out before its commits are read", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: mark() });
+        expect(await listInScope(o, pass)).toEqual([]);
+        expect(o.reads).toEqual([]);
+      });
+
+      it("only on the mark job's own check: another App's of that name changes nothing", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: mark("some-app") });
+        expect((await listInScope(o, pass))?.map((p) => p.number)).toEqual([2]);
+        expect(o.reads).toEqual([2]);
+      });
+
+      it("checks that cannot be read: the commits are read, as without it", async () => {
+        const o = lister([open(2, DEP)], { 2: [{ login: DEP }] }, { sha2: new Error("HTTP 502") });
+        expect((await listInScope(o, pass))?.map((p) => p.number)).toEqual([2]);
+      });
+
+      it("not while a re-review is requested: the select job says which records still count", async () => {
+        const o = lister([open(2, DEP, { labels: [{ name: "re-review" }] })], { 2: [{ login: DEP }] }, { sha2: mark() });
+        await listInScope(o, pass).catch(() => undefined);
+        expect(o.reads).toEqual([2]);
+      });
+    });
+
+    it("bot-authors-only lists just the bot's own PRs, for the bot pass", async () => {
+      const got = await listInScope(lister(prs, commits), { ...opts, botAuthorsOnly: true });
+      expect(got?.map((p) => p.number)).toEqual([2]);
+    });
+
+    it("drops a bot's PR with a commit in its name GitHub did not make, at the commit cap, or whose head moved", async () => {
+      const one = [open(2, DEP)];
+      const forged = await listInScope(lister(one, { 2: [{ login: DEP }, { login: DEP, signed: false }] }), opts);
+      expect(forged).toEqual([]);
+      const capped = await listInScope(lister(one, { 2: Array.from({ length: 250 }, () => ({ login: DEP })) }), opts);
+      expect(capped).toEqual([]);
+      const moved = await listInScope(lister(one, { 2: [{ login: DEP, sha: "newer" }] }), opts);
+      expect(moved).toEqual([]);
+      const fine = await listInScope(lister(one, { 2: [{ login: DEP }] }), opts);
+      expect(fine?.map((p) => p.number)).toEqual([2]);
+    });
+
+    it("a person's PR gets no level, whatever its title claims: only the bot's is taken at its word", async () => {
+      const o = lister([open(1, "alice", { title: "Bump x from 1.2.3 to 1.3.0" })], {});
+      const got = await listInScope(o, opts);
+      expect(got?.map((p) => p.number)).toEqual([1]);
+      expect(got?.[0]).not.toHaveProperty("bump");
+      expect(o.reads).toEqual([]);
+    });
+
+    it("without bot_authors in the rollout, the bot's PRs are another bot's: out", async () => {
+      const o = lister(prs, commits);
+      const got = await listInScope(o, { ...opts, rollout: { skipLabel: "no-agent-review" } });
+      expect(got?.map((p) => p.number)).toEqual([1]);
+      expect(o.reads).toEqual([]);
+    });
+  });
+});

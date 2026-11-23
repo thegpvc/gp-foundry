@@ -91,11 +91,13 @@ rollout:                       # `rollout: {}` = every PR
   authors: [alice, bob]        # human PRs by these people are in scope
   opt_in_label: agent-review   # ...or any PR carrying this label
   skip_label: no-agent-review  # never these
+  bot_authors: ["dependabot[bot]"]  # ...and these bots' PRs, without an allowlist
 ```
 
 - **Scope is the rollout, not the branch prefix.** In order: a draft never; a PR with the
-  skip label never; a PR `identity.bot_login` opened always; another bot only if named in
-  `authors`; then a listed author or the opt-in label. A block naming neither `authors` nor
+  skip label never; a PR `identity.bot_login` opened always; a bot named in `bot_authors`
+  (exact login) always, though lanes act on it only while every commit on the head is that
+  bot's; another bot only if named in `authors`; then a listed author or the opt-in label. A block naming neither `authors` nor
   `opt_in_label` admits everyone. Finish a rollout by emptying the block, not deleting it:
   without the key the harness is not hybrid.
 - **One implementation.** Each event-driven PR lane gets a `<node>_guard` job that runs the
@@ -109,6 +111,53 @@ rollout:                       # `rollout: {}` = every PR
   `unchanged-diff`, which is a lane's own behaviour) and `repo.authors`. Lanes always listen
   for `ready_for_review`, and for `labeled` when there is an opt-in label.
 - Needs `identity.bot_login` wherever a writing lane or `merge="agent-only"` is used.
+- **`bot_authors`: a bot's PRs beside people's.** Its logins must end in `[bot]`, and may not
+  repeat `authors` or name `identity.bot_login`. A bot's PR is judged with the same role files
+  as anyone's: the verdict is authorship-blind. Only three things depend on who opened it:
+  admission, the scheduled path below, and the gate's `merge_bots=`. The bot path holds only
+  while every commit on the head is authored by that login **and** committed and signed by
+  GitHub (`committer.login == "web-flow"`, `commit.verification.verified`); a commit's author
+  email can be written by anyone who can push, so the author alone is not trusted. A commit
+  list of 250 or more (the API's cap), or one that cannot be read or does not end at the
+  head, fails closed. (`merge="agent-only"`'s agent-written test now fails closed at that cap
+  too.)
+- **The bot pass.** Each PR-reading lane with a guard, entered on `pull_request` opened,
+  synchronize or ready_for_review (or `push`), gets one in its workflow:
+  `<node>_bots_select`, `<node>_bots` (a matrix, one job per PR, named `<node> bots #<n>`) and
+  `<node>_bots_mark`, on `schedule` (`bot_schedule="<cron>"`, default `*/15 * * * *`) and
+  `workflow_dispatch` (input `pr`), added to the lane's own triggers. The scheduled pass
+  shares one concurrency slot; a dispatch for one PR gets its own. The lane's guard hands a
+  listed bot's PR to it without minting a token (the bot's own PR events carry no secrets).
+  The lane's jobs run the agent with the repo's secrets on the bot's head, so nothing from
+  that checkout should be executed there (no installs, builds or tests of the bumped
+  dependencies in `agent-setup` or the roles): CI does that without the secrets. The mark job
+  records a head only once the lane's review is on it (`post="review"`); a run that posted
+  none counts as a failed run.
+  The select job lists the bot's PRs that pass the test above (`pr-scope`,
+  `bot-authors-only`; a head carrying the pass's record is dropped before its commits are
+  read, `reviewed-check`), skips a head the pass recorded (`gp-foundry/swept (<node>)`) or that
+  this lane posted a review on or marked as covered, applies `skip="unchanged-diff"` with the
+  guard's own script, gives up on a head after 3 failed runs (retry with the re-review label,
+  or by asking the bot for a new head), and honours the re-review label. A lane also entered
+  on `workflow_dispatch` keeps that trigger; its pass then runs on dispatch only for a `pr`.
+  A sweep (the approver) needs no bot pass. The agent's context states the update's semver
+  level for a bot's own PR: from its commits' `updated-dependencies` block and its title
+  (the higher). A person's PR gets none, whatever its title says.
+- **Who may merge.** `merge="agent-only"` merges the PRs the pipeline wrote itself.
+  `merge_bots="<login>,…"` on the single gate merges the named bots' own PRs once the
+  approver's verdict is ready, whatever the bump level: a change a named bot sends is taken
+  as within policy, and only who sent it decides. The two are independent (`merge="off",
+  merge_bots=…` merges only bots' PRs). Every login must be in `rollout.bot_authors`
+  (`node.merge-bots-not-bot-author`). A bot in `bot_authors` but not in `merge_bots` is
+  reviewed and approved, and a person merges it.
+- **The gate and the dependabot lane.** A PR admitted through `bot_authors` is judged on the
+  approver's verdict, never on the policy's dependabot lane, which still judges the dependabot
+  PRs `bot_authors` does not admit (a commit failed the test above, or dependabot is not
+  named): **the verdict wins**. The lane's level now reads the `updated-dependencies` block of
+  dependabot's own GitHub-signed commits as well as the title (the higher). Commits the gate
+  cannot read: not evaluated that tick.
+- **Known gap:** review panels (parallel → fan_in) have no bot pass; their prefilter leaves
+  the listed bots' PRs out.
 
 **Asking for a fresh review.** Name a label under `labels.re_review` and adding it to a PR
 asks the pipeline to look again at the head as it stands, without a new push:

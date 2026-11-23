@@ -1,0 +1,65 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: gate
+"on":
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+      - review_requested
+      - review_request_removed
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
+concurrency:
+  group: ${{ github.event.pull_request.number && format('gate-pr-{0}', github.event.pull_request.number) || 'gate' }}
+  cancel-in-progress: ${{ github.event.pull_request.number != null }}
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.state == 'open' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-agent-review') && (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'agent-app[bot]' || github.event.pull_request.user.login == 'dependabot[bot]'))
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 10
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ github.token }}
+          ref: main
+          persist-credentials: false
+      - name: Evaluate merge gate (publish check, merge agent-written and named bots' PRs)
+        uses: thegpvc/gp-foundry/actions/merge-gate@fixture-ref
+        with:
+          merge: agent-only
+          merge-bots: dependabot[bot]
+          check-name: gp-foundry/approval (gate)
+          job-check-name: gate
+          gate-workflow: .github/workflows/gate.yml
+          token: ${{ steps.app-token.outputs.token }}
+          checks-token: ${{ steps.app-token.outputs.token }}
+          check-app: ${{ steps.app-token.outputs.app-slug }}
+          policy-path: .github/agents/policy/merge.yaml
+          base-branch: main
+          bot-login: agent-app[bot]
+          rollout: "{\"botAuthors\":[\"dependabot[bot]\"],\"skipLabel\":\"no-agent-review\"}"
+          rereview-label: re-review
+          pr-number: ${{ github.event.pull_request.number }}
+          rotation-period-seconds: "600"
+          time-budget-seconds: "480"

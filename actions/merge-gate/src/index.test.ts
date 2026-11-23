@@ -56,6 +56,18 @@ interface World {
   headRef?: string;
   /** Who authored each commit on the head, as GitHub attributes it (default: all the bot's). */
   commits?: (string | null)[];
+  /** Each commit's message, in the same order (default: empty). */
+  commitMessages?: string[];
+  /** Reading the commits fails. */
+  commitsFail?: boolean;
+  /** Per commit: was it committed (web-flow) and signed by GitHub? (default: yes for every commit) */
+  commitsSigned?: boolean[];
+  /** How many commits the list returns, when it is to be padded (the API's cap). */
+  commitCount?: number;
+  /** The listed commits end before the head (a push landed between the two reads). */
+  staleCommits?: boolean;
+  /** The PR's title (default: "Add widget"). */
+  title?: string;
   /** The merge call fails; with `mergedElsewhere`, because another run merged the PR first. */
   mergeFails?: boolean;
   mergedElsewhere?: boolean;
@@ -81,7 +93,7 @@ function makeOctokit(world: World) {
   const pr = {
     number: 7,
     state: "open",
-    title: "Add widget",
+    title: world.title ?? "Add widget",
     draft: world.draft ?? false,
     head: { sha: HEAD, ref: world.headRef ?? "agent/widget" },
     base: { ref: "main" },
@@ -130,7 +142,23 @@ function makeOctokit(world: World) {
               : []),
         ),
         listFiles: rec("pulls.listFiles", [{ filename: "src/w.ts", additions: 10, deletions: 0 }]),
-        listCommits: rec("pulls.listCommits", (world.commits ?? [BOT]).map((login) => ({ author: login ? { login } : null }))),
+        listCommits: async (params: any) => {
+          calls.push({ method: "pulls.listCommits", params });
+          if (world.commitsFail) throw new Error("HTTP 502");
+          const authors = world.commits ?? [BOT];
+          const logins = world.commitCount ? Array.from({ length: world.commitCount }, (_, i) => authors[i % authors.length]!) : authors;
+          return {
+            data: logins.map((login, i) => {
+              const signed = world.commitsSigned?.[i] ?? true;
+              return {
+                sha: i === logins.length - 1 && !world.staleCommits ? HEAD : `c${i}`,
+                author: login ? { login } : null,
+                committer: { login: signed ? "web-flow" : login ?? "someone" },
+                commit: { message: world.commitMessages?.[i] ?? "", verification: { verified: signed } },
+              };
+            }),
+          };
+        },
         merge: async (params: any) => {
           calls.push({ method: "pulls.merge", params });
           if (world.mergeFails) {
@@ -532,13 +560,15 @@ describe("escalation labels and standing change requests, end to end", () => {
 // Every PR in scope gets the check; only a PR the pipeline wrote is ever merged.
 describe("the single gate (merge=)", () => {
   const ALICE = { login: "alice", type: "User" };
-  const gate = (merge: string, world: Partial<World> = {}, rollout?: object, policyYaml = "") => {
+  const gate = (merge: string, world: Partial<World> = {}, rollout?: object, policyYaml = "", mergeBots?: string) => {
     setup(world, policyYaml);
     delete inputs.mode;
     inputs.merge = merge;
     if (rollout) inputs.rollout = JSON.stringify(rollout);
+    if (mergeBots !== undefined) inputs["merge-bots"] = mergeBots;
   };
   const check = () => stub.calls.find((c) => c.method === "checks.create")?.params;
+  const shown = () => JSON.stringify(check()?.output ?? {});
 
   describe('merge="off"', () => {
     it("publishes the check on an agent PR and on a person's PR, and merges neither", async () => {
@@ -672,6 +702,194 @@ describe("the single gate (merge=)", () => {
       gate("off", { author: { login: "anyone", type: "User" } });
       await run();
       expect(evaluated()).toBe("1");
+    });
+  });
+
+  // rollout.bot_authors (#55): a named bot's PRs beside every person's, judged on
+  // the approver's verdict while every commit on them is the bot's.
+  describe("rollout.bot_authors", () => {
+    const DEP = { login: "dependabot[bot]", type: "Bot" };
+    const rollout = { skipLabel: "no-agent-review", botAuthors: ["dependabot[bot]"] };
+    const dep = (over: Partial<World> = {}): Partial<World> => ({ author: DEP, headRef: "dependabot/npm/x-2.0.0", commits: ["dependabot[bot]"], ...over });
+    const LANE = "dependabot:\n  auto_merge: [patch, minor]\n";
+    const MAJOR = "Bump x from 1.2.3 to 2.0.0";
+
+    it("judges the bot's own PR on the verdict, like any PR in scope", async () => {
+      gate("off", dep(), rollout);
+      await run();
+      expect(outputs.evaluated).toBe("1");
+      expect(check()?.conclusion).toBe("success");
+    });
+
+    it("with no verdict on the head, publishes no result: the deterministic lane does not stand in", async () => {
+      gate("off", dep({ approved: false, title: "Bump x from 1.2.3 to 1.2.4" }), rollout, LANE);
+      await run();
+      expect(outputs.evaluated).toBe("1");
+      expect(writes()).toEqual([]);
+    });
+
+    it("the verdict outranks the policy's dependabot lane: an approved major is ready", async () => {
+      gate("off", dep({ title: MAJOR }), rollout, LANE);
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(shown()).not.toContain("needs a human");
+      // Without bot_authors the same PR is the lane's, which hands a major to a person.
+      gate("off", dep({ title: MAJOR }), { skipLabel: "no-agent-review" }, LANE);
+      await run();
+      expect(check()?.conclusion).not.toBe("success");
+      expect(shown()).toContain("dependabot `major` update needs a human");
+    });
+
+    // Who may merge: the pipeline's own PRs (merge="agent-only") and the bots
+    // merge_bots names are separate grants.
+    it('merge="agent-only" alone does not merge a ready bot PR — a person merges it', async () => {
+      gate("agent-only", dep(), rollout);
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
+      expect(check()?.output.text).toContain("a person merges this PR");
+    });
+
+    it("a bot merge-bots names is merged when ready, whatever the bump level, even with merge=off", async () => {
+      gate("off", dep({ title: MAJOR }), rollout, LANE, "dependabot[bot]");
+      await run();
+      expect(methods()).toContain("pulls.merge");
+      expect(check()?.output.text).toContain("merge_bots names it");
+    });
+
+    it("a listed bot that merge-bots does not name is not merged", async () => {
+      const both = { ...rollout, botAuthors: ["dependabot[bot]", "renovate[bot]"] };
+      gate("agent-only", dep(), both, "", "renovate[bot]");
+      await run();
+      expect(check()?.conclusion).toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("merge-bots naming a bot the rollout does not admit is refused", async () => {
+      gate("off", dep(), rollout, "", "renovate[bot]");
+      await run();
+      expect(failures.join(" ")).toContain("merge-bots names renovate[bot]");
+    });
+
+    it("a commit in the bot's name that GitHub did not make (a forged author email) is never merged, nor judged as the bot's", async () => {
+      gate("agent-only", dep({ commits: ["dependabot[bot]", "dependabot[bot]"], commitsSigned: [true, false] }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      expect(methods()).not.toContain("pulls.merge");
+      expect(writes()).toEqual([]);
+    });
+
+    it("commits that do not end at the head read as unread: not judged, never merged", async () => {
+      gate("agent-only", dep({ staleCommits: true }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("a commit list at the API's cap cannot show every commit: never merged", async () => {
+      gate("agent-only", dep({ commitCount: 250 }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("…and the pipeline's own PR at the cap is not merged either", async () => {
+      gate("agent-only", { commitCount: 250 });
+      await run();
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("an escalate verdict is not ready and is never merged", async () => {
+      gate("agent-only", dep({ verdictBody: "Major update.\n\n**Verdict:** ESCALATE\n" }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(check()?.conclusion).not.toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("a person's commit takes it out of the bot's lane: out of scope, its approval does not count", async () => {
+      gate("agent-only", dep({ commits: ["dependabot[bot]", "mallory"] }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      expect(writes()).toEqual([]);
+    });
+
+    it("…back to the policy's dependabot lane when that is on", async () => {
+      gate("agent-only", dep({ commits: ["dependabot[bot]", "mallory"], title: MAJOR }), rollout, LANE);
+      await run();
+      expect(outputs.evaluated).toBe("1");
+      expect(shown()).toContain("dependabot `major` update needs a human");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("commits that cannot be read: not evaluated, nothing written (fail closed)", async () => {
+      gate("agent-only", dep({ commitsFail: true }), rollout, "", "dependabot[bot]");
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      expect(writes()).toEqual([]);
+    });
+
+    it("matches the exact login: another bot, or a dependabot/ branch by someone else, stays out", async () => {
+      gate("agent-only", dep({ author: { login: "renovate[bot]", type: "Bot" }, commits: ["renovate[bot]"] }), rollout);
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      gate("agent-only", dep({ author: { login: "mallory", type: "User" }, commits: ["mallory"] }), { ...rollout, authors: [] });
+      await run();
+      expect(outputs.evaluated).toBe("0");
+    });
+
+    it("the skip label and drafts still win", async () => {
+      gate("off", dep({ labels: ["no-agent-review"] }), rollout);
+      await run();
+      expect(outputs.evaluated).toBe("0");
+      gate("off", dep({ draft: true }), rollout);
+      await run();
+      expect(outputs.evaluated).toBe("0");
+    });
+  });
+
+  // (e) The dependabot lane classifies a grouped update from its commits.
+  describe("the dependabot lane reads the update level from the commits", () => {
+    const DEP = { login: "dependabot[bot]", type: "Bot" };
+    const LANE = "dependabot:\n  auto_merge: [patch, minor]\n";
+    const grouped = (types: string[]) =>
+      [
+        "Bump the npm group with " + types.length + " updates",
+        "",
+        "---",
+        "updated-dependencies:",
+        ...types.flatMap((t, i) => [`- dependency-name: dep${i}`, "  dependency-type: direct:production", `  update-type: version-update:semver-${t}`]),
+        "...",
+        "",
+        "Signed-off-by: dependabot[bot] <support@github.com>",
+      ].join("\n");
+    const run1 = async (types: string[]) => {
+      gate("agent-only", { author: DEP, headRef: "dependabot/npm/group", commits: ["dependabot[bot]"], commitMessages: [grouped(types)], title: "Bump the npm group with 3 updates" }, undefined, LANE);
+      await run();
+    };
+
+    it("a grouped update of patches and minors is ready on the lane", async () => {
+      await run1(["patch", "minor", "patch"]);
+      expect(check()?.conclusion).toBe("success");
+      expect(methods()).toContain("pulls.merge");
+    });
+
+    it("one major among them makes it a major, which goes to a person", async () => {
+      await run1(["patch", "major", "minor"]);
+      expect(shown()).toContain("dependabot `major` update needs a human");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("a block in a commit GitHub did not make for dependabot is not read", async () => {
+      gate("agent-only", { author: DEP, headRef: "dependabot/npm/group", commits: ["dependabot[bot]"], commitsSigned: [false], commitMessages: [grouped(["patch"])], title: "Bump the npm group with 3 updates" }, undefined, LANE);
+      await run();
+      expect(shown()).toContain("dependabot `unknown` update needs a human");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+
+    it("the title counts too: the higher of the block's level and the title's", async () => {
+      gate("agent-only", { author: DEP, headRef: "dependabot/npm/x", commits: ["dependabot[bot]"], commitMessages: [grouped(["patch"])], title: "Bump x from 1.2.3 to 2.0.0" }, undefined, LANE);
+      await run();
+      expect(shown()).toContain("dependabot `major` update needs a human");
     });
   });
 

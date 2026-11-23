@@ -5,7 +5,7 @@
  * value; validate() turns that into an error diagnostic, and the emitters catch
  * it and fall back to "attribute absent" so assemble stays non-throwing.
  */
-import type { FoundryConfig, HarnessNode } from "../ir/types.js";
+import type { FoundryConfig, HarnessEdge, HarnessNode } from "../ir/types.js";
 import { parseRollout, type Rollout } from "../shared/scope.js";
 import { parseVerdictWords, verdictLine, verdictLinesEnv } from "../shared/verdicts.js";
 
@@ -25,7 +25,7 @@ export const KNOWN_NODE_ATTRS: ReadonlySet<string> = new Set([
   "permissions", "on_complete_label", "cancel_in_progress", "checkout",
   "title", "harness_ref", "persist_credentials", "repo_guides", "runs_on", "opt_in_label",
   "mode", "merge", "check_name", "requires_review", "post", "post_marker", "quiet_verdicts", "verdict_check", "no_changes_comment", "comment_target", "dispatch",
-  "hold_on_review_requests", "explain_on",
+  "hold_on_review_requests", "explain_on", "bot_schedule", "merge_bots",
 ]);
 
 /** Every attribute an edge may carry. */
@@ -716,7 +716,7 @@ const PR = "github.event.pull_request";
  * against the live PR — so where the two could differ it errs towards letting
  * the event through (another bot's PR, which only the guard turns away).
  */
-export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, writing: boolean): string {
+export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, writing: boolean, admitBotAuthors = true): string {
   const clauses = [`${PR}.draft == false`];
   if (rollout.skipLabel) clauses.push(`!contains(${PR}.labels.*.name, ${exprString(rollout.skipLabel)})`);
   const by = (login: string) => `${PR}.user.login == ${exprString(login)}`;
@@ -724,9 +724,20 @@ export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, w
     // Only the pipeline's own PRs; with no bot login there are none (validate errors).
     clauses.push(by(botLogin ?? NO_AUTHOR));
   } else if (rollout.authors !== undefined || rollout.optInLabel !== undefined) {
-    const admit = [...(botLogin ? [by(botLogin)] : []), ...(rollout.authors ?? []).map(by)];
+    // rollout.bot_authors' events reach a guard, which hands the PR to the lane's
+    // bot pass and says so; a lane with no guard (a review panel) leaves them out.
+    const admit = [
+      ...(botLogin ? [by(botLogin)] : []),
+      ...(rollout.authors ?? []).map(by),
+      ...(admitBotAuthors ? (rollout.botAuthors ?? []).map(by) : []),
+    ];
     if (rollout.optInLabel) admit.push(`contains(${PR}.labels.*.name, ${exprString(rollout.optInLabel)})`);
     clauses.push(admit.length === 1 ? admit[0]! : `(${admit.length ? admit.join(" || ") : by(NO_AUTHOR)})`);
+  }
+  // A lane with no guard (a review panel) has no bot pass: it leaves the listed
+  // bots' PRs alone, whose own events would fail its token mint.
+  if (!writing && !admitBotAuthors) {
+    for (const b of rollout.botAuthors ?? []) clauses.push(`${PR}.user.login != ${exprString(b)}`);
   }
   return clauses.join(" && ");
 }
@@ -743,13 +754,97 @@ export function scopePrefilter(rollout: Rollout, botLogin: string | undefined, w
  */
 export function singleGatePrefilter(rollout: Rollout, botLogin: string | undefined): string {
   const by = (login: string) => `${PR}.user.login == ${exprString(login)}`;
-  const bots = [...(botLogin ? [botLogin] : []), ...(rollout.authors ?? [])].filter((a, i, all) => all.indexOf(a) === i);
+  // rollout.bot_authors too: an event on their PR from a person or the harness
+  // (a label, the approver's verdict) runs with secrets. Their own events are
+  // turned away by the gate's `github.actor` clause, as Dependabot's always were.
+  const bots = [...(botLogin ? [botLogin] : []), ...(rollout.authors ?? []), ...(rollout.botAuthors ?? [])].filter((a, i, all) => all.indexOf(a) === i);
   const scope = scopePrefilter(rollout, botLogin, false);
   // Admission by login alone (authors, no opt-in label) already names every
   // author it lets in, bots included: nothing to add.
   if (rollout.authors !== undefined && rollout.optInLabel === undefined) return scope;
   const notOtherBot = `(${[`${PR}.user.type != 'Bot'`, ...bots.map(by)].join(" || ")})`;
   return `${scope} && ${notOtherBot}`;
+}
+
+// ── rollout.bot_authors: the scheduled bot pass ─────────────────────────────
+
+/**
+ * merge_bots="dependabot[bot],…" on a single gate: the bots whose own PRs it
+ * merges once ready (lower-cased; each must be in rollout.bot_authors). A grant
+ * separate from merge="agent-only". Throws on a malformed list (validate reports it).
+ */
+export function parseMergeBots(node: HarnessNode): string[] {
+  const raw = node.attrs.merge_bots;
+  if (raw === undefined) return [];
+  if (typeof raw !== "string") throw new Error(`merge_bots= on '${node.id}' must be a comma-separated list of bot logins`);
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const login = part.trim().toLowerCase();
+    if (!login) continue;
+    if (!LOGIN.test(login) || !login.endsWith("[bot]")) throw new Error(`merge_bots= on '${node.id}': '${login}' is not a bot login (a bot's login ends in [bot])`);
+    if (!out.includes(login)) out.push(login);
+  }
+  return out;
+}
+
+/** merge_bots=, or none when malformed (validate reports it): a gate never merges on a list it could not read. */
+export function mergeBotsOf(node: HarnessNode): string[] {
+  try {
+    return parseMergeBots(node);
+  } catch {
+    return [];
+  }
+}
+
+/** How often a lane's bot pass runs when the node names no bot_schedule=. */
+export const DEFAULT_BOT_SCHEDULE = "*/15 * * * *";
+
+/** The entry events after which a lane reviews a PR's new head (`push` reaches a PR lane as synchronize). */
+const BOT_PASS_EVENTS = new Set(["pull_request", "pull_request.opened", "pull_request.synchronize", "pull_request.ready_for_review", "push"]);
+
+function entryEvents(inEdges: HarnessEdge[]): string[] {
+  return inEdges.flatMap((e) => (e.on ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+/**
+ * Does this lane get a scheduled bot pass? An event-driven reading PR lane of a
+ * hybrid harness whose rollout names bot_authors, entered when a PR opens or
+ * its head moves. Those bots' own PR events carry none of the repo's secrets
+ * (Dependabot's never do), so the lane's guard hands their PRs over (pr-scope)
+ * and the pass reviews their heads on a schedule, or when dispatched for one
+ * PR. A lane entered on anything else (a review, a label) would never have
+ * reviewed a head unprompted, so it gets none; nor does a sweep, already
+ * scheduled. The compiler, the wiring and validate() all ask this.
+ */
+export function botPassOf(node: HarnessNode, cfg: FoundryConfig, inEdges: HarnessEdge[]): boolean {
+  return (
+    !!rolloutOf(cfg)?.botAuthors?.length &&
+    isReadingPrLane(node) &&
+    !isSweep(node) &&
+    hasSkipGuard(node, cfg) &&
+    entryEvents(inEdges).some((ev) => BOT_PASS_EVENTS.has(ev))
+  );
+}
+
+/** Is the lane started by hand too (`on="workflow_dispatch"`)? Its bot pass then runs on dispatch only for a `pr`. */
+export function listensToDispatch(inEdges: HarnessEdge[]): boolean {
+  return entryEvents(inEdges).some((ev) => ev === "workflow_dispatch" || ev.startsWith("workflow_dispatch."));
+}
+
+/** The bot pass's cron: bot_schedule=, else DEFAULT_BOT_SCHEDULE. */
+export function botScheduleOf(node: HarnessNode): string {
+  const s = node.attrs.bot_schedule;
+  return typeof s === "string" && s.trim() ? s.trim() : DEFAULT_BOT_SCHEDULE;
+}
+
+/** The bot pass's job ids: select, the lane (a matrix), and its record of the heads it covered. */
+export function botPassJobIds(node: HarnessNode): { select: string; lane: string; mark: string } {
+  return { select: `${node.id}_bots_select`, lane: `${node.id}_bots`, mark: `${node.id}_bots_mark` };
+}
+
+/** The bot pass's matrix jobs are named per PR, so its mark job can tell which succeeded. */
+export function botPassJobNamePrefix(node: HarnessNode): string {
+  return `${node.id} bots #`;
 }
 
 /** The job that decides whether (or for which PRs) the node's own job runs. */

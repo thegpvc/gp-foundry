@@ -41,7 +41,8 @@ Confirm with the user, then edit:
 - **`.github/agents/foundry.config.yaml`** — set `identity.bot_login` to the account the
   pipeline posts as (under PAT auth, the PAT's owner): it is how the pipeline recognizes its
   own PRs. Leave `rollout: { authors: [] }` to start with the pipeline's own PRs only; add
-  logins (or an `opt_in_label`) to have it review people's PRs too.
+  logins (or an `opt_in_label`) to have it review people's PRs too, and
+  `bot_authors: ["dependabot[bot]"]` to have it judge a dependency bot's PRs as well.
 - **`.github/agents/scope.yaml`** — what must agents NEVER touch (`immutable_paths`)?
   Add the repo's build/test commands to `guidance:` (e.g. "run `make test` before any PR").
 - **`.github/agents/roles/*.md`** — the "Repo-specific guidance" of `builder.md`,

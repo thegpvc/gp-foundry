@@ -144,7 +144,7 @@ export interface FoundryConfig {
    * The rollout dial: which human PRs the pipeline looks at while it is being
    * brought to a repo. Absent means every PR. See src/shared/scope.ts.
    */
-  rollout?: { authors?: string[]; opt_in_label?: string; skip_label?: string };
+  rollout?: { authors?: string[]; bot_authors?: string[]; opt_in_label?: string; skip_label?: string };
   /** semantic role -> repo label (the drift-killer). */
   labels: Record<string, string>;
   /** parseable markers shared by prompts + guards + enforcers. */
@@ -286,6 +286,12 @@ export interface EmitContext {
   specFile?: string;
   /** The `tools:` front-matter of a node's role, when the compiler could read it. */
   roleTools?: (nodeId: string) => string | undefined;
+  /**
+   * Emit the lane's scheduled bot pass instead of its event job: the PRs come
+   * from the bot-pass select job's matrix (rollout.bot_authors), and the agent
+   * runs with the lane's own role. See botPassOf.
+   */
+  botPass?: boolean;
 }
 
 export interface Handler {

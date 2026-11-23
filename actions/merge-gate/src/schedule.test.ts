@@ -179,7 +179,10 @@ class World {
             ];
           }),
           listFiles: call("pulls.listFiles", () => [{ filename: "src/a.ts", additions: 10, deletions: 0 }]),
-          listCommits: call("pulls.listCommits", () => [{ author: { login: BOT } }]),
+          listCommits: call("pulls.listCommits", ({ pull_number }: any) => {
+            const p = w.prs.get(pull_number)!;
+            return [{ sha: sha(p.number, p.head), author: { login: BOT } }];
+          }),
           merge: call("pulls.merge", ({ pull_number, sha: s }: any) => {
             w.merged.push({ pr: pull_number, sha: s });
             return {};

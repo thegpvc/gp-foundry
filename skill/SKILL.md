@@ -99,9 +99,12 @@ Listen for:
 - **People and agents share the repo** → ask two things and write them down. *Whose PRs
   should the pipeline review, besides its own?* → the `rollout` block in
   `foundry.config.yaml` (`authors: []` to start with only its own; add logins or an
-  `opt_in_label` to widen; `rollout: {}` for everyone). *Should it merge what it writes?* →
-  `merge="off"` (publish the gate's verdict as a check, a person merges — the default) or
-  `merge="agent-only"` on the gate. It never merges or pushes to a person's PR. See
+  `opt_in_label` to widen; `rollout: {}` for everyone; `bot_authors: ["dependabot[bot]"]` to
+  have it judge a dependency bot's PRs too, with the same roles as anyone's). *Should it
+  merge what it writes?* → `merge="off"` (publish the gate's verdict as a check, a person
+  merges — the default) or `merge="agent-only"` on the gate. *Should it merge a bot's PRs?* →
+  a separate grant, `merge_bots="dependabot[bot]"` on the gate. It never merges or pushes to a
+  person's PR. See
   "Hybrid harnesses" in `reference/node-types.md`.
 - **Invariants** → `scope.yaml`'s `immutable_paths` (enforced three ways by the generated
   output: a PR guard workflow, the pre-push strip, and the merge gate; agents can never modify —

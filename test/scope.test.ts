@@ -4,7 +4,7 @@
  * guard, the sweep and the gate — see src/shared/scope.ts.
  */
 import { describe, it, expect } from "vitest";
-import { inScope, isAgentWritten, parseRollout, type Rollout, type ScopePr } from "../src/shared/scope.js";
+import { inScope, isAgentWritten, isBotWritten, parseRollout, type Rollout, type ScopePr } from "../src/shared/scope.js";
 import { parseDot } from "../src/parser/parse.js";
 import { loadConfig } from "../src/config/load.js";
 import { validate } from "../src/validate/validate.js";
@@ -178,3 +178,108 @@ describe("isAgentWritten: may a writing lane act on this PR", () => {
     expect(isAgentWritten(byBot, [commit(BOT)], "").agentWritten).toBe(false);
   });
 });
+
+// rollout.bot_authors (#55): named bots beside every person, without an allowlist.
+describe("rollout.bot_authors", () => {
+  const DEP = "dependabot[bot]";
+
+  describe("parseRollout", () => {
+    it("reads bot logins, lower-cased and de-duplicated", () => {
+      expect(parseRollout({ skip_label: "no-agent-review", bot_authors: ["Dependabot[bot]", "dependabot[bot]"] })).toEqual({
+        skipLabel: "no-agent-review",
+        botAuthors: [DEP],
+      });
+    });
+
+    it("an empty list is left out, so it compiles as no key at all", () => {
+      expect(parseRollout({ bot_authors: [] })).toEqual({});
+    });
+
+    it.each([
+      ["a person's login", { bot_authors: ["alice"] }],
+      ["something that is not a login", { bot_authors: ["dependabot[bot] x"] }],
+      ["a login carrying an expression", { bot_authors: ["a' || true || '[bot]"] }],
+      ["a list in neither form", { bot_authors: "dependabot[bot]" }],
+      ["a login in both lists", { authors: ["dependabot[bot]"], bot_authors: ["dependabot[bot]"] }],
+    ])("rejects %s", (_name, raw) => {
+      expect(() => parseRollout(raw)).toThrow();
+    });
+  });
+
+  describe("inScope — the regression cases", () => {
+    const rollout: Rollout = { skipLabel: "no-agent-review", botAuthors: [DEP] };
+    const decide = (pr: ScopePr, r: Rollout = rollout) => inScope(pr, r, BOT);
+
+    it("skip_label + bot_authors: a person's PR is in scope, as without bot_authors", () => {
+      expect(decide(human("bob"))).toMatchObject({ inScope: true, reason: "no-rollout" });
+    });
+
+    it("the listed bot's PR is in scope (bot-author)", () => {
+      expect(decide(bot(DEP))).toMatchObject({ inScope: true, reason: "bot-author" });
+      expect(decide(bot("Dependabot[bot]")).reason).toBe("bot-author");
+    });
+
+    it("another bot's PR is out (other-bot)", () => {
+      expect(decide(bot("renovate[bot]"))).toMatchObject({ inScope: false, reason: "other-bot" });
+    });
+
+    it("the skip label and drafts still win over bot_authors", () => {
+      expect(decide(bot(DEP, { labels: ["no-agent-review"] })).reason).toBe("skip-label");
+      expect(decide(bot(DEP, { draft: true })).reason).toBe("draft");
+    });
+
+    it("with authors too: people only by authors or the opt-in label; the listed bot still admitted", () => {
+      const r: Rollout = { authors: ["alice"], optInLabel: "agent-review", botAuthors: [DEP] };
+      expect(decide(human("alice"), r).reason).toBe("author");
+      expect(decide(human("bob"), r)).toMatchObject({ inScope: false, reason: "not-in-rollout" });
+      expect(decide(human("bob", { labels: ["agent-review"] }), r).reason).toBe("opt-in-label");
+      expect(decide(bot(DEP), r).reason).toBe("bot-author");
+      expect(decide(bot("renovate[bot]"), r).reason).toBe("other-bot");
+    });
+
+    it("matches the exact login: a person is not a bot author for having one in the name", () => {
+      expect(decide(human("dependabot"))).toMatchObject({ reason: "no-rollout" });
+      expect(decide(human("bob"), { authors: [], botAuthors: [DEP] })).toMatchObject({ inScope: false, reason: "not-in-rollout" });
+    });
+  });
+
+  describe("isBotWritten", () => {
+    const r: Rollout = { botAuthors: [DEP] };
+    // A commit GitHub made for the bot: authored by it, committed by web-flow, signature verified.
+    const signed = (login: string) => ({ authorLogin: login, verified: true, committerLogin: "web-flow" });
+
+    it("only while every commit on the head is the bot's, made and signed by GitHub", () => {
+      expect(isBotWritten({ authorLogin: DEP }, [signed(DEP), signed(DEP)], r).botWritten).toBe(true);
+      const pushed = isBotWritten({ authorLogin: DEP }, [signed(DEP), { authorLogin: "mallory" }], r);
+      expect(pushed).toMatchObject({ botWritten: false });
+      expect(pushed.detail).toContain("mallory");
+    });
+
+    it("a forged author email is not enough: the commit must be GitHub's, and verified", () => {
+      // Anyone who can push may write the bot's noreply address as the author.
+      expect(isBotWritten({ authorLogin: DEP }, [signed(DEP), { authorLogin: DEP, verified: true, committerLogin: "mallory" }], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, [signed(DEP), { authorLogin: DEP, verified: false, committerLogin: "web-flow" }], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, [{ authorLogin: DEP }], r).botWritten).toBe(false);
+    });
+
+    it("fails closed: unreadable, empty, unattributed, or a list at the API's cap", () => {
+      expect(isBotWritten({ authorLogin: DEP }, undefined, r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, [], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, [signed(DEP), { authorLogin: null }], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, Array.from({ length: 250 }, () => signed(DEP)), r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, Array.from({ length: 249 }, () => signed(DEP)), r).botWritten).toBe(true);
+    });
+
+    it("never for an author bot_authors does not name, whoever wrote the commits", () => {
+      expect(isBotWritten({ authorLogin: "renovate[bot]" }, [signed("renovate[bot]")], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: "mallory" }, [signed(DEP)], r).botWritten).toBe(false);
+      expect(isBotWritten({ authorLogin: DEP }, [signed(DEP)], undefined).botWritten).toBe(false);
+    });
+  });
+
+  it("isAgentWritten: a commit list at the API's cap answers no", () => {
+    expect(isAgentWritten({ authorLogin: BOT }, Array.from({ length: 250 }, () => ({ authorLogin: BOT })), BOT).agentWritten).toBe(false);
+    expect(isAgentWritten({ authorLogin: BOT }, Array.from({ length: 249 }, () => ({ authorLogin: BOT })), BOT).agentWritten).toBe(true);
+  });
+});
+

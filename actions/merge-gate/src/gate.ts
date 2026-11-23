@@ -15,6 +15,9 @@
  *     are all policy-driven.
  */
 
+import { DEPENDABOT_LOGIN, type DependabotBump } from "../../../src/shared/dependabot.js";
+import type { CommitAuthor } from "../../../src/shared/scope.js";
+
 // ────────────────────────────────────────────────────────────────────────────
 // Inputs
 // ────────────────────────────────────────────────────────────────────────────
@@ -67,9 +70,23 @@ export interface PullRequestFacts {
   authorLogin?: string;
   /**
    * For a dependabot PR, the semver level of the bump parsed from the title
-   * (see parseDependabotBump). `undefined` for non-dependabot PRs.
+   * (see parseDependabotUpdateType). `undefined` for non-dependabot PRs.
    */
   dependabotUpdateType?: DependabotBump;
+  /**
+   * The single gate admitted this PR through `rollout.bot_authors`, and every
+   * commit on its head is its author's (src/shared/scope.ts isBotWritten). It is
+   * judged on the approver's verdict like any PR in scope — never on the
+   * dependabot lane, even when its author is dependabot[bot] and the policy
+   * turns that lane on: an agent's verdict outranks the deterministic lane.
+   */
+  botWritten?: boolean;
+  /**
+   * The head's commits, read when the caller asked (a bot's PR, or the pipeline's
+   * own under merge="agent-only") and always for dependabot's. Undefined when they
+   * could not be read, or the list read was not the head's.
+   */
+  headCommits?: (CommitAuthor & { message: string; sha: string })[];
   /** Base branch name, e.g. "main" (used in operator-facing messages). */
   baseRefName?: string;
   /** Labels currently on the PR (names only). */
@@ -264,7 +281,6 @@ export interface MergePolicy {
   };
 }
 
-/** Semver level of a dependabot bump; "unknown" when the title can't be parsed. */
 /**
  * Keep only the LATEST attempt of each check (same name, same publishing app).
  *
@@ -288,26 +304,7 @@ export function latestAttemptPerCheck<T extends { id?: number | null; name?: str
   return [...latest.values()];
 }
 
-export type DependabotBump = "patch" | "minor" | "major" | "unknown";
-
-/** The exact author login a genuine dependabot PR carries. */
-export const DEPENDABOT_LOGIN = "dependabot[bot]";
-
-/**
- * Classify a dependabot PR title ("Bump X from 1.2.3 to 1.3.0") by semver level.
- * Group/monorepo updates and non-semver versions yield "unknown", which the lane
- * treats as needs-a-human — the safe default.
- */
-export function parseDependabotBump(title?: string): DependabotBump {
-  if (!title) return "unknown";
-  const m = /\bfrom\s+v?(\d+)\.(\d+)\.(\d+)[^\s]*\s+to\s+v?(\d+)\.(\d+)\.(\d+)/i.exec(title);
-  if (!m) return "unknown";
-  const from = [Number(m[1]), Number(m[2]), Number(m[3])];
-  const to = [Number(m[4]), Number(m[5]), Number(m[6])];
-  if (to[0] !== from[0]) return "major";
-  if (to[1] !== from[1]) return "minor";
-  return "patch";
-}
+export { DEPENDABOT_LOGIN, parseDependabotBump, parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Output
@@ -1296,7 +1293,8 @@ export function evaluateMergeGate(
 
   // Lane split: a genuine dependabot PR is scored on its own track (no human
   // approval, but only safe semver bumps). Author, not branch name, is the gate.
-  if (pr.authorLogin === DEPENDABOT_LOGIN) {
+  // Not one the rollout admits as a bot author: its verdict decides (botWritten).
+  if (pr.authorLogin === DEPENDABOT_LOGIN && !pr.botWritten) {
     return evaluateDependabotLane(pr, policy, policy.labels?.needsHuman, policy.labels?.rebaseNeeded);
   }
 
@@ -1333,7 +1331,7 @@ export function failingClauses(
   if (blocked) failing.push(blocked);
   const escalated = escalationLabelClause(pr, policy);
   if (escalated) failing.push(escalated);
-  if (pr.authorLogin === DEPENDABOT_LOGIN) {
+  if (pr.authorLogin === DEPENDABOT_LOGIN && !pr.botWritten) {
     const d = evaluateDependabotLane(pr, policy, policy.labels?.needsHuman, policy.labels?.rebaseNeeded);
     if (d.action !== "merge") failing.push(d);
     return failing;

@@ -13,8 +13,9 @@
  */
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { inScope, isAgentWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
-import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
+import { commitAuthorOf, inScope, isAgentWritten, isBotWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
+import { parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
+import { excludeLabelQualifier, MARK_APP, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 import { requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -57,6 +58,17 @@ export async function decide(
     const explain = scope.reason === "not-in-rollout" || scope.reason === "other-bot" ? hint : "";
     return { inScope: false, run: false, reason: scope.detail + explain };
   }
+  // rollout.bot_authors: the bot's own PR events carry none of the repo's
+  // secrets (Dependabot's never do), so a lane cannot mint its token on them.
+  // Every guard is an event's, so it hands the PR to the lane's scheduled bot
+  // pass, which runs with secrets and checks that every commit is the bot's.
+  if (scope.reason === "bot-author" && !opts.requireAgentWritten) {
+    return {
+      inScope: true,
+      run: false,
+      reason: `${scope.detail} — its events carry no secrets, so this lane reviews it from its scheduled bot pass, not from this event`,
+    };
+  }
   if (!opts.requireAgentWritten) return { inScope: true, run: true, reason: scope.detail };
 
   // Commits are only worth reading for a PR the bot opened; anything else is
@@ -91,6 +103,13 @@ export interface ScopedPr {
   quiet: number;
   /** When a re-review was requested (the re-review label last added), if the PR carries it. */
   since?: string;
+  /**
+   * The update's semver level when one can be told, as context for the agent:
+   * for a bot's own PR (rollout.bot_authors) only, from its commits'
+   * `updated-dependencies` block and its title. Never for anyone else's: a
+   * title is its author's claim, and only the bot's is taken at its word.
+   */
+  bump?: Exclude<DependabotBump, "unknown">;
 }
 
 /**
@@ -101,7 +120,7 @@ export interface ScopedPr {
  */
 export async function listInScope(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
 ): Promise<ScopedPr[] | undefined> {
   const out = await listCandidates(octokit, opts);
   if (!out || !opts.rereviewLabel) return out?.map(({ labels: _l, ...p }) => p);
@@ -130,21 +149,80 @@ export async function listInScope(
 
 async function listCandidates(
   octokit: Octokit,
-  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number },
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; rereviewLabel?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
 ): Promise<(ScopedPr & { labels: string[] })[] | undefined> {
+  const listed = await listScoped(octokit, opts);
+  if (!listed) return undefined;
+  // rollout.bot_authors: a bot's PR stays a candidate only while every commit on
+  // it is the bot's (one read per such PR). A person's push, or commits that
+  // cannot be read, leave it out — fail closed; the next tick reads again.
+  const out: (ScopedPr & { labels: string[] })[] = [];
+  for (const { botAuthor, author, title, ...p } of listed) {
+    if (!botAuthor) {
+      if (!opts.botAuthorsOnly) out.push(p);
+      continue;
+    }
+    // A head the lane's bot pass has recorded as reviewed needs no further look:
+    // one read instead of the commits' and the select job's two. Not while a
+    // re-review is requested — which records still count is then the select job's to say.
+    if (opts.reviewedCheck && !(opts.rereviewLabel && p.labels.includes(opts.rereviewLabel)) && (await carriesMark(octokit, opts.owner, opts.repo, p.sha, opts.reviewedCheck))) {
+      core.info(`#${p.number}: already reviewed at ${p.sha}`);
+      continue;
+    }
+    let commits: ReturnType<typeof commitAuthorOf>[];
+    try {
+      commits = (await octokit.paginate(octokit.rest.pulls.listCommits, { owner: opts.owner, repo: opts.repo, pull_number: p.number, per_page: 100 })).map(commitAuthorOf);
+    } catch (e) {
+      core.warning(`#${p.number}: could not read its commits (${(e as Error).message}) — left for the next tick`);
+      continue;
+    }
+    // The commits listed must be the listed head's: a push in between is judged next tick.
+    if (commits.length && commits[commits.length - 1]!.sha !== p.sha) {
+      core.info(`#${p.number}: its head moved while it was being read — left for the next tick`);
+      continue;
+    }
+    const written = isBotWritten({ authorLogin: author }, commits, opts.rollout);
+    if (!written.botWritten) {
+      core.info(`#${p.number}: out of scope — ${written.detail}; rollout.bot_authors admits a bot's PR only while every commit is its own, made by GitHub`);
+      continue;
+    }
+    const bump = parseDependabotUpdateType(commits.map((c) => c.message), title);
+    out.push({ ...p, ...(bump !== "unknown" ? { bump } : {}) });
+  }
+  return out;
+}
+
+/** Does `sha` carry the check `name`, published by a mark job? Unreadable: no (the caller reads on). */
+async function carriesMark(octokit: Octokit, owner: string, repo: string, sha: string, name: string): Promise<boolean> {
+  try {
+    const runs = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: sha, check_name: name, filter: "all", per_page: 100 });
+    return runs.some((c) => c.app?.slug === MARK_APP);
+  } catch {
+    return false;
+  }
+}
+
+async function listScoped(
+  octokit: Octokit,
+  opts: { owner: string; repo: string; baseBranch?: string; rollout?: Rollout; botLogin?: string; nowMs?: number; retryDelayMs?: number; reviewedBy?: string; only?: number; botAuthorsOnly?: boolean; reviewedCheck?: string },
+): Promise<(ScopedPr & { labels: string[]; botAuthor: boolean; author: string; title: string })[] | undefined> {
   const { owner, repo } = opts;
   const now = opts.nowMs ?? Date.now();
-  const toScoped = (c: Candidate): ScopedPr & { labels: string[] } => ({
+  const toScoped = (c: Candidate): ScopedPr & { labels: string[]; botAuthor: boolean; author: string; title: string } => ({
     number: c.number,
     sha: c.sha,
     base: c.base,
     requested: c.requested,
     quiet: Math.max(0, Math.floor((now - c.updatedAt) / 1000)),
     labels: c.labels,
+    botAuthor: inScope({ authorLogin: c.author, authorType: c.authorType, draft: c.draft, labels: c.labels }, opts.rollout, opts.botLogin).reason === "bot-author",
+    author: c.author,
+    title: c.title ?? "",
   });
   const keep = (c: Candidate) => {
     const scope = inScope({ authorLogin: c.author, authorType: c.authorType, draft: c.draft, labels: c.labels }, opts.rollout, opts.botLogin);
     if (!scope.inScope) core.info(`#${c.number}: out of scope — ${scope.detail}`);
+    else if (opts.botAuthorsOnly && scope.reason !== "bot-author") return false;
     return scope.inScope;
   };
 
@@ -232,6 +310,7 @@ type PullLike = {
   requested_reviewers?: unknown[] | null;
   requested_teams?: unknown[] | null;
   updated_at: string;
+  title?: string;
 };
 function candidateOf(p: PullLike): Candidate {
   return {
@@ -244,6 +323,7 @@ function candidateOf(p: PullLike): Candidate {
     labels: p.labels.map((l) => l.name ?? "").filter((l): l is string => !!l),
     requested: (p.requested_reviewers?.length ?? 0) + (p.requested_teams?.length ?? 0),
     updatedAt: Date.parse(p.updated_at) || 0,
+    title: p.title,
   };
 }
 
@@ -277,6 +357,8 @@ export async function run(): Promise<void> {
         reviewedBy: core.getInput("reviewed-by").trim() || undefined,
         rereviewLabel: core.getInput("rereview-label").trim() || undefined,
         only: onlyInput(core.getInput("only")),
+        botAuthorsOnly: core.getInput("bot-authors-only").trim() === "true",
+        reviewedCheck: core.getInput("reviewed-check").trim() || undefined,
       });
       core.setOutput("listed", String(prs !== undefined));
       core.setOutput("prs", JSON.stringify(prs ?? []));

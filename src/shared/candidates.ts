@@ -30,7 +30,15 @@ export interface Candidate {
   requested: number;
   /** When the PR last changed (ms). */
   updatedAt: number;
+  /** The PR's title. */
+  title?: string;
 }
+
+/**
+ * The App whose check runs the mark jobs publish (GITHUB_TOKEN's): a lane's
+ * record of the heads it has covered counts only from it.
+ */
+export const MARK_APP = "github-actions";
 
 export type GraphqlFn = <T>(query: string, vars: Record<string, unknown>) => Promise<T>;
 
@@ -40,7 +48,7 @@ const SEARCH = `query($q: String!, $cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        number headRefOid baseRefName isDraft updatedAt
+        number title headRefOid baseRefName isDraft updatedAt
         author { __typename login }
         labels(first: 50) { nodes { name } }
         reviewRequests { totalCount }
@@ -55,6 +63,7 @@ interface SearchPage {
     pageInfo: { hasNextPage: boolean; endCursor: string | null };
     nodes: ({
       number?: number;
+      title?: string;
       headRefOid?: string;
       baseRefName?: string;
       isDraft?: boolean;
@@ -123,6 +132,7 @@ export async function searchCandidates(
           labels: (n.labels?.nodes ?? []).map((l) => l.name),
           requested: n.reviewRequests?.totalCount ?? 0,
           updatedAt: Date.parse(n.updatedAt ?? "") || 0,
+          ...(n.title !== undefined ? { title: n.title } : {}),
         });
       }
       if (!r.search.pageInfo.hasNextPage) break;

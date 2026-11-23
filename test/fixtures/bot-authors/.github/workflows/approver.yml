@@ -1,0 +1,606 @@
+# GENERATED FROM harness.dot — DO NOT EDIT.
+# Edit harness.dot / roles / foundry.config.yaml and run `gp-foundry build`.
+name: approver
+"on":
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: approver
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  approver_select:
+    name: approver select
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    timeout-minutes: 10
+    outputs:
+      prs: ${{ steps.select.outputs.prs }}
+      count: ${{ steps.select.outputs.count }}
+    steps:
+      - name: List the pull requests in scope
+        id: scope
+        uses: thegpvc/gp-foundry/actions/pr-scope@fixture-ref
+        with:
+          list: "true"
+          token: ${{ github.token }}
+          base-branch: main
+          reviewed-by: agent-app[bot]
+          rereview-label: re-review
+          rollout: "{\"botAuthors\":[\"dependabot[bot]\"],\"skipLabel\":\"no-agent-review\"}"
+          bot-login: agent-app[bot]
+      - name: Select pull requests ready for a decision
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCOPED: ${{ steps.scope.outputs.prs }}
+          SCOPE_LISTED: ${{ steps.scope.outputs.listed }}
+          PREFIX: agent/
+          BOT_LOGIN: agent-app[bot]
+          VERDICT_LINES: |-
+            **Verdict:** APPROVE
+            **Verdict:** REQUEST_CHANGES
+            **Verdict:** ESCALATE
+          REQUIRES_REVIEW: "true"
+          ALSO_HEAD_PATTERN: "<!-- gp-foundry:also-head:[^:\\s]+:"
+          SWEPT_CHECK: gp-foundry/swept (approver)
+          FAILED_CHECK: gp-foundry/sweep-failed (approver)
+          IDLE_CHECK: gp-foundry/sweep-idle (approver)
+          MAX_IDLE: "3"
+          MARK_APP: github-actions
+          LIMIT: "10"
+          MAX_FAILURES: "3"
+          SETTLE_SECONDS: "600"
+          GATE_CHECKS: gp-foundry/approval (gate)
+        run: |-
+          # Pick the PR heads that are ready for a decision. Selection is a pure
+          # function of repo state — no agent, no randomness — and every read fails
+          # CLOSED: a head whose state cannot be read is left for the next sweep.
+          #
+          #   candidate   open and in scope by the rollout (decided by the step above)
+          #   reviews in  no review is still being waited on (no pending review request)
+          #   checks in   every check-run on the head is completed (the gate's own result
+          #               aside: it waits on this lane's verdict), no commit status
+          #               pending — and at least one check-run exists, unless the PR has
+          #               been quiet for $SETTLE_SECONDS s (a repo with no CI still gets swept)
+          #   undecided   no verdict review on this exact head yet, and no earlier
+          #               sweep has marked it delivered (the swept check)
+          #   reviewed    a non-verdict review by the bot covers the head (on it, or marked also-head)
+          #   not spent   fewer than $MAX_FAILURES failed lane runs on this head, and fewer
+          #               than $MAX_IDLE runs that succeeded without leaving a verdict
+          # The candidates were listed and scoped by the step above: the rollout rule
+          # every lane and the gate share, not a copy of it here.
+          if [ "$SCOPE_LISTED" != "true" ]; then
+            echo "::notice::could not list open pull requests this tick — nothing selected; the next sweep tries again"
+            { echo "prs=[]"; echo "count=0"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LIST=$(jq -r '.[] | "\(.number) \(.sha) \(.requested) \(.quiet) \(.base) \(.since // "-") \(.bump // "-")"' <<< "$SCOPED")
+          SELECTED='[]'
+          while read -r NUM SHA REQUESTED QUIET BASE SINCE BUMP; do
+            [ -n "$NUM" ] || continue
+            # SINCE: when a re-review was requested on this PR ("-": none). Records from
+            # before it — verdicts, reviews, the sweep's own check-runs — do not count.
+            [ "${SINCE:-}" = "-" ] && SINCE=""
+            export SINCE="${SINCE:-}"
+            if [ "$REQUESTED" != "0" ]; then echo "#$NUM: $REQUESTED review request(s) outstanding"; continue; fi
+            # One read of the head's check-runs answers four questions: how many exist,
+            # how many are still running, has the lane already run here, how often has it failed.
+            # filter=all: the default (latest) keeps only the newest run per check name, which
+            # hides all but one sweep-failed record and lets a newer skipped run of a job mask
+            # an older one still in progress.
+            CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '
+              .check_runs | [ length,
+                ([.[] | select(.status != "completed" and (.name as $n | (env.GATE_CHECKS // "") | split("\n") | index($n) | not))] | length),
+                ([.[] | select(.name == env.SWEPT_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
+                ([.[] | select(.name == env.FAILED_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length),
+                ([.[] | select(.name == env.IDLE_CHECK and .app.slug == env.MARK_APP and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length) ] | @tsv' \
+              | awk '{t+=$1; r+=$2; s+=$3; f+=$4; i+=$5} END {print t+0, r+0, s+0, f+0, i+0}') || { echo "#$NUM: could not read check-runs"; continue; }
+            read -r TOTAL RUNNING SWEPT FAILURES IDLE <<< "$CHECKS"
+            if [ "$RUNNING" != "0" ]; then echo "#$NUM: $RUNNING check-run(s) still running"; continue; fi
+            if [ "$TOTAL" = "0" ] && [ "$QUIET" -lt "$SETTLE_SECONDS" ]; then
+              echo "#$NUM: no check-run on $SHA yet and the PR changed ${QUIET}s ago — waiting for CI to register"
+              continue
+            fi
+            # The lane's own record that it ran here and delivered a verdict (the mark
+            # job publishes it only then). Normally redundant with the verdict test below;
+            # it still holds if the verdict review's body is later edited.
+            if [ "$SWEPT" != "0" ]; then echo "#$NUM: already swept at $SHA"; continue; fi
+            # …and a lane that keeps FAILING on a head is not retried forever either.
+            if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then echo "#$NUM: gave up on $SHA after $FAILURES failed runs"; continue; fi
+            # …nor is one that keeps succeeding without ever leaving a verdict.
+            if [ "$IDLE" -ge "$MAX_IDLE" ]; then echo "#$NUM: gave up on $SHA after $IDLE runs that posted no verdict"; continue; fi
+            STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" --jq '
+              if .total_count == 0 then "none" else .state end') || { echo "#$NUM: could not read commit status"; continue; }
+            if [ "$STATUS" = "pending" ]; then echo "#$NUM: a commit status is pending"; continue; fi
+            REVIEWS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '
+              [ .[] | select((env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE) | (((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.VERDICT_LINES | split("\n") | any(.[]; . == $line)) as $verdict
+                | { decided: (.commit_id == env.SHA and $verdict),
+                    reviewed: ((.commit_id == env.SHA or ((.body // "") | test(env.ALSO_HEAD_PATTERN + env.SHA + " -->"))) and ($verdict | not)) } ]
+              | [ (map(select(.decided)) | length), (map(select(.reviewed)) | length) ] | @tsv
+            ' | awk '{d+=$1; r+=$2} END {print d+0, r+0}') || { echo "#$NUM: could not read reviews"; continue; }
+            read -r DECIDED REVIEWED <<< "$REVIEWS"
+            if [ "$DECIDED" != "0" ]; then echo "#$NUM: already decided at $SHA"; continue; fi
+            # requires_review: the lane acts on an upstream review, so a head no review covers is still waiting.
+            if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi
+            echo "#$NUM: selected at $SHA"
+            SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE" --arg bump "$BUMP" '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end) + (if $bump == "-" then {} else {bump: $bump} end)]' <<< "$SELECTED")
+            if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then
+              echo "limit of $LIMIT reached — the rest wait for the next sweep"
+              break
+            fi
+          done <<< "$LIST"
+          { echo "prs=$SELECTED"; echo "count=$(jq 'length' <<< "$SELECTED")"; } >> "$GITHUB_OUTPUT"
+  approver:
+    name: "approver #${{ matrix.pr.number }}"
+    runs-on: ubuntu-latest
+    if: needs.approver_select.outputs.count != '0'
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    timeout-minutes: 25
+    needs:
+      - approver_select
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.approver_select.outputs.prs) }}
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-checks: read
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ matrix.pr.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Checkout harness files (base ref)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.pr.base }}
+          path: .gp-foundry/harness
+          fetch-depth: 1
+          sparse-checkout: |-
+            .github/agent-setup
+            .github/agents
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+      - name: Keep the harness copy out of the working tree
+        shell: bash
+        run: |-
+          mkdir -p .git/info
+          echo "/.gp-foundry/" >> .git/info/exclude
+      - name: Use this PR's harness files if the base ref has no harness yet
+        shell: bash
+        env:
+          HARNESS: .gp-foundry/harness
+          SPEC: .github/harness.dot
+          DIRS: |-
+            .github/agent-setup
+            .github/agents
+        run: |-
+          if [ -f "$HARNESS/$SPEC" ]; then exit 0; fi
+          echo "::notice::the base ref has no harness yet ($SPEC) — using this pull request's own harness files. This only happens while the harness itself is being installed."
+          while IFS= read -r D; do
+            [ -n "$D" ] && [ -d "$D" ] || continue
+            mkdir -p "$HARNESS/$(dirname "$D")"
+            rm -rf "${HARNESS:?}/$D"
+            cp -R "$D" "$HARNESS/$D"
+          done <<< "$DIRS"
+      - name: Setup agent toolchain
+        uses: ./.gp-foundry/harness/.github/agent-setup
+      - name: Fetch context
+        id: ctx
+        uses: thegpvc/gp-foundry/actions/agent-context@fixture-ref
+        with:
+          type: pr-review
+          number: ${{ matrix.pr.number }}
+          token: ${{ steps.app-token.outputs.token }}
+          checks-token: ${{ github.token }}
+          trusted-authors: agent-app[bot]
+          trusted-framing: baseline
+      - name: Note the dependency update's level
+        shell: bash
+        env:
+          CONTEXT_FILE: ${{ steps.ctx.outputs.context-file }}
+          BUMP: ${{ matrix.pr.bump }}
+        run: |-
+          case "$BUMP" in patch|minor|major) ;; *) exit 0 ;; esac
+          [ -n "$CONTEXT_FILE" ] || exit 0
+          {
+            printf '\n## Dependency update\n\n'
+            printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\n' "$BUMP"
+          } >> "$CONTEXT_FILE"
+      - name: Run agent
+        id: agent
+        timeout-minutes: 15
+        uses: thegpvc/gp-foundry/actions/run-agent@fixture-ref
+        with:
+          role-file: .gp-foundry/harness/.github/agents/roles/approver.md
+          model: claude-opus-4-8
+          comms-file: .gp-foundry/harness/.github/agents/communication.md
+          scope-path: .gp-foundry/harness/.github/agents/scope.yaml
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          output-contract: |-
+            Do not post anything to GitHub yourself, and do not run `gh`: a workflow step posts your review for you.
+            End your final message with exactly one fenced code block tagged `json` holding one object:
+
+            ```json
+            {"body": "<the whole review, in markdown>", "comments": [{"path": "src/file.ts", "line": 42, "side": "RIGHT", "body": "<one finding>"}], "event": "COMMENT"}
+            ```
+
+            - `body`: the review. Do not add a heading with the PR number or commit; the step adds it.
+            - `comments`: optional inline findings, each on a line of the diff (`side` RIGHT is the new file, LEFT the old). Use `[]` for none.
+            - `event`: always `"COMMENT"`. Do not include a `commit_id`; the step sets it to the head you reviewed.
+            - The LAST line of `body` must be exactly one of: `**Verdict:** APPROVE`, `**Verdict:** REQUEST_CHANGES`, `**Verdict:** ESCALATE`. Anything else, and nothing is posted.
+            The fence is required: a bare object at the very end is accepted as a fallback, but always use the fence.
+            If the block is missing or is not valid JSON, nothing is posted.
+          context-file: ${{ steps.ctx.outputs.context-file }}
+      - name: Post the review
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE: approver
+          POSTED_PREFIX: "<!-- gp-foundry:posted:"
+          PR: ${{ matrix.pr.number }}
+          HEAD_SHA: ${{ matrix.pr.sha }}
+          STDOUT_FILE: ${{ steps.agent.outputs.stdout-file }}
+          BOT_LOGIN: agent-app[bot]
+          POST_MARKER: "PR #<n> head <sha>"
+          REQUIRE_VERDICT: "true"
+          VERDICT_LINES: |-
+            **Verdict:** APPROVE
+            **Verdict:** REQUEST_CHANGES
+            **Verdict:** ESCALATE
+          REREVIEW_LABEL: re-review
+        run: |
+          set -euo pipefail
+          # post="review": the agent printed its review; this step posts it with the lane's
+          # token. The agent's output is DATA — nothing here evaluates it, and it reaches gh
+          # only as a JSON file built by jq.
+          preview() { head -c 200 "$STDOUT_FILE" | tr '\n\r' '  '; }
+          # One line in the job summary saying what became of the review, under the agent's
+          # output: a link to it when posted, and a plain statement when not — so nobody
+          # has to read the log to learn whether the text above ever reached the PR.
+          note() { if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '\n%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; fi; }
+          if [ -z "${STDOUT_FILE:-}" ] || [ ! -s "$STDOUT_FILE" ]; then
+            echo "::warning::the agent printed nothing — no review posted"
+            note "_No review was posted: the agent printed nothing._"
+            exit 0
+          fi
+
+          # The LAST fenced json block in the output. A json string cannot hold a raw
+          # newline, so a fence inside the review's own markdown never closes this block.
+          BLOCK=$(awk '
+            /^[ \t]*```[ \t]*json[ \t]*$/ { inb = 1; buf = ""; next }
+            inb && /^[ \t]*```[ \t]*$/ { inb = 0; last = buf; found = 1; next }
+            inb { buf = buf $0 "\n" }
+            END { if (found) printf "%s", last }' "$STDOUT_FILE")
+
+          # No fence: fall back to a BARE object at the end of the output, which models
+          # print often enough. It ends on the last line ending in "}" (anything after it
+          # is ignored) and starts on a line beginning with "{"; the start is the latest
+          # such line from which the slice parses as exactly one object with a string
+          # body. A line inside a pretty-printed object (a comment's "{") leaves the rest
+          # of the object behind it, so it never parses alone and the scan moves up. A
+          # fenced block, when there is one, always wins.
+          if [ -z "$BLOCK" ]; then
+            END_LINE=$(awk '/}[ \t\r]*$/ { e = NR } END { print e + 0 }' "$STDOUT_FILE")
+            if [ "$END_LINE" -gt 0 ]; then
+              for START in $(awk -v e="$END_LINE" 'NR <= e && /^[ \t]*[{]/ { print NR }' "$STDOUT_FILE" | tail -n 200 | sort -rn); do
+                SLICE=$(sed -n "${START},${END_LINE}p" "$STDOUT_FILE")
+                if jq -se 'length == 1 and (.[0] | type == "object" and (.body | type) == "string")' <<< "$SLICE" > /dev/null 2>&1; then
+                  BLOCK=$SLICE
+                  echo "::notice::no fenced json block in the agent's output — using the bare JSON object at its end"
+                  break
+                fi
+              done
+            fi
+          fi
+          if [ -z "$BLOCK" ]; then
+            echo "::warning::no review in the agent's output: neither a fenced json block nor a bare JSON object with a string body at its end — nothing posted. It began: $(preview)"
+            note "_No review was posted: the agent's output held no review block._"
+            exit 0
+          fi
+
+          ERR=$(mktemp)
+          if ! REVIEW=$(jq -c '
+            def fail(m): error(m);
+            if type != "object" then fail("the block is not a JSON object") else . end
+            | if ((.body | type) != "string") or ((.body | length) == 0) then fail("body must be a non-empty string") else . end
+            | if (.event // "COMMENT") != "COMMENT" then fail("event must be COMMENT") else . end
+            | (.comments // []) as $c
+            | if ($c | type) != "array" then fail("comments must be an array") else . end
+            | if any($c[]; (type != "object") or ((.path | type) != "string") or ((.line | type) != "number")
+                  or (.line != (.line | floor)) or (.line < 1) or ((.body | type) != "string"))
+              then fail("each comment needs a string path, a positive integer line and a string body") else . end
+            | {body, event: "COMMENT", comments: [$c[] | {path, line, side: (if .side == "LEFT" then "LEFT" else "RIGHT" end), body}]}
+          ' <<< "$BLOCK" 2> "$ERR"); then
+            echo "::warning::the review block is not a valid review — nothing posted: $(head -c 300 "$ERR" | tr '\n\r' '  ')"
+            note "_No review was posted: the review block was not valid._"
+            exit 0
+          fi
+
+          # A verdict lane's review IS its verdict: the last visible line must be one of
+          # the exact verdict lines, or the sweep and the gate would read it differently.
+          if [ "$REQUIRE_VERDICT" = "true" ] && ! jq -e '(((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.VERDICT_LINES | split("\n") | any(.[]; . == $line))' <<< "$REVIEW" > /dev/null; then
+            echo "::warning::the review's last line is not one of the verdict lines ($(tr '\n' '|' <<< "$VERDICT_LINES")) — nothing posted"
+            note "_No review was posted: its last line is not one of the verdict lines._"
+            exit 0
+          fi
+
+          # Idempotency: has THIS lane already posted on this head? Each review this step
+          # posts ends with a hidden marker naming the lane and the head, and that marker
+          # is what a re-run looks for. Several lanes post as one bot, often under one
+          # heading, so neither the heading nor the shape of the review says whose it is:
+          # a reviewer's review must not silence an approver, and a reviewer that posts
+          # its own verdict must still recognize its own review on a re-run.
+          #
+          # A review with no posted marker at all predates the marker. For those the old
+          # test stands in: the heading on line 1 — and, on a verdict lane, only a review
+          # that is itself a verdict, so a plain review under the same heading cannot
+          # stop the verdict being posted.
+          #
+          # A re-review request (the re-review label) asks for a FRESH review of the same
+          # head: a review posted before the label was last added no longer counts.
+          MARKER="${POST_MARKER//<n>/$PR}"
+          MARKER="${MARKER//<sha>/$HEAD_SHA}"
+          POSTED="$POSTED_PREFIX$NODE:$HEAD_SHA -->"
+          SINCE=""
+          if [ -n "${REREVIEW_LABEL:-}" ]; then
+            # Only a PR that carries the label has a request to answer.
+            if ! LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels?per_page=100" --paginate --jq '.[].name'); then
+              echo "::warning::could not read the PR's labels — any re-review request is left for the next run"
+            elif grep -qxF -- "$REREVIEW_LABEL" <<< "$LABELS"; then
+              # The request time: the label's latest event in the API's (chronological)
+              # order, if that is a "labeled" one. See src/shared/rereview.ts.
+              if LAST_EVENT=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events?per_page=100" --paginate --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == env.REREVIEW_LABEL) | "\(.created_at) \(.event)"' | tail -n 1); then
+                case "$LAST_EVENT" in
+                  *" labeled") SINCE="${LAST_EVENT%% *}" ;;
+                  # On, but undateable: the request stands; nothing earlier answers it.
+                  *) SINCE="9999" ;;
+                esac
+              else
+                # The label is on but its history is unreadable: post. The worst case is
+                # the review posted twice on a re-run, not a request dropped.
+                echo "::warning::could not read the PR's label history — posting without the re-review check"
+                SINCE="9999"
+              fi
+            fi
+          fi
+          export MARKER POSTED SINCE
+          if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews?per_page=100" --paginate --jq '
+            [.[] | select(.user.login == env.BOT_LOGIN and .commit_id == env.HEAD_SHA)
+             | select(env.SINCE == "" or (.submitted_at // "") > env.SINCE)
+             | (.body // "") as $b
+             | select(($b | contains(env.POSTED))
+                 or ((($b | contains(env.POSTED_PREFIX)) | not)
+                     and ((($b | split("\n") | .[0]) // "" | gsub("^\\s+|\\s+$"; "")) == env.MARKER)
+                     and (env.REQUIRE_VERDICT != "true" or (((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.VERDICT_LINES | split("\n") | any(.[]; . == $line)))))] | length' \
+            | awk '{s+=$1} END {print s+0}'); then
+            echo "::error::could not read the PR's reviews — not posting, so a re-run cannot post the review twice"
+            exit 1
+          fi
+          if [ "$EXISTING" != "0" ]; then
+            echo "$NODE has already posted its review on $HEAD_SHA — not posting it again"
+            note "_The review for this head was already posted; nothing new was posted._"
+            exit 0
+          fi
+
+          PAYLOAD=$(mktemp)
+          jq -c --arg sha "$HEAD_SHA" --arg head "$MARKER" \
+            '{commit_id: $sha, event, body: ($head + "\n\n" + .body), comments}' <<< "$REVIEW" > "$PAYLOAD"
+          # The posted marker goes on last, after any reshaping of the body below: it is
+          # an HTML comment, which every verdict test ignores, so a verdict line above it
+          # is still the review's last visible line.
+          RESP=$(mktemp)
+          post() {
+            jq -c --arg m "$POSTED" '.body += "\n\n" + $m' "$1" > "$1.out"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$1.out" > "$RESP" 2> "$ERR"
+          }
+          # Why a post failed, on one line. gh prints only "gh: <status> (HTTP <code>)" on
+          # stderr; GitHub's error body, with the reason, goes to stdout ($RESP).
+          why() {
+            local detail
+            detail=$(jq -r 'if type == "object" then [(.message // empty), ((.errors // [])[] | if type == "string" then . else (.message // tojson) end)] | join(" — ") else tojson end' "$RESP" 2> /dev/null) \
+              || detail=$(head -c 300 "$RESP")
+            printf '%s %s' "$(head -c 200 "$ERR")" "$detail" | tr '\n\r' '  ' | head -c 500 || true
+          }
+          # The review's own URL, from the API's response, for the job summary.
+          posted_note() {
+            URL=$(jq -r '.html_url // empty' "$RESP" 2> /dev/null || true)
+            if [ -n "$URL" ]; then note "**Review posted:** $URL"; else note "**Review posted** on $HEAD_SHA."; fi
+          }
+          # Move inline findings into the body, as a list before the verdict line (on a
+          # verdict lane) or at the end. $2 is a JSON array of the paths whose comments
+          # stay inline, or null to move every one. Nothing to move leaves the review as it is.
+          flatten() {
+            jq -c --argjson rv "$([ "$REQUIRE_VERDICT" = "true" ] && echo true || echo false)" --argjson keep "$2" '
+              def kept: $keep != null and (.path as $p | $keep | any(. == $p));
+              [.comments[] | select(kept | not)] as $moved
+              | if ($moved | length) == 0 then . else
+                  ("### Findings on unchanged lines\n\n" + ([$moved[] | "- `\(.path):\(.line)` — \(.body | gsub("\n"; " "))"] | join("\n"))) as $f
+                  | (.body | sub("\\s+$"; "") | split("\n")) as $l
+                  | .body = ((if $rv then ($l[:-1] + [$f, ""] + $l[-1:]) else ($l + ["", $f]) end) | join("\n"))
+                  | .comments = [.comments[] | select(kept)]
+                end' "$1"
+          }
+
+          # GitHub rejects the whole review when one inline comment is on a file outside
+          # the PR's diff. Move those into the body before posting, from one read of the
+          # changed files. If that read fails, post as is: the 422 retry below still holds.
+          if [ "$(jq '.comments | length' "$PAYLOAD")" != "0" ]; then
+            if FILES=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100" --paginate --jq '.[].filename' 2> "$ERR" \
+                | jq -R -s -c 'split("\n") | map(select(length > 0))'); then
+              flatten "$PAYLOAD" "$FILES" > "$PAYLOAD.post"
+              MOVED=$(( $(jq '.comments | length' "$PAYLOAD") - $(jq '.comments | length' "$PAYLOAD.post") ))
+              if [ "$MOVED" != "0" ]; then
+                echo "::notice::$MOVED inline comment(s) on files outside the PR's diff — posting them in the body instead"
+              fi
+            else
+              echo "::warning::could not read the PR's changed files ($(head -c 200 "$ERR" | tr '\n\r' '  ')) — posting the inline comments as they are"
+              cp "$PAYLOAD" "$PAYLOAD.post"
+            fi
+          else
+            cp "$PAYLOAD" "$PAYLOAD.post"
+          fi
+          if post "$PAYLOAD.post"; then
+            echo "posted the review on $HEAD_SHA"
+            posted_note
+            exit 0
+          fi
+
+          # A comment on a changed file but a line outside its hunks still gets the whole
+          # review rejected with a 422, and GitHub does not say which comment. Retry once
+          # with every inline finding moved into the body (built from the original, so the
+          # body holds one list). Any 422 with inline comments retries, whatever its
+          # wording ("Line could not be resolved", "Path could not be resolved", "must be
+          # part of the diff", ...): the retry posts the same findings unanchored, so the
+          # worst case is one more rejected POST. A 422 with no inline comments has
+          # nothing to move and fails below.
+          if grep -qs "HTTP 422" "$ERR" "$RESP" && [ "$(jq '.comments | length' "$PAYLOAD.post")" != "0" ]; then
+            echo "::warning::GitHub rejected an inline comment ($(why)) — posting the findings in the body instead"
+            flatten "$PAYLOAD" null > "$PAYLOAD.flat"
+            if post "$PAYLOAD.flat"; then
+              echo "posted the review on $HEAD_SHA, with its inline findings in the body"
+              posted_note
+              exit 0
+            fi
+          fi
+          echo "::error::could not post the review: $(why)"
+          note "_No review was posted: GitHub rejected it. See the job log._"
+          exit 1
+  approver_mark:
+    name: approver mark
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.approver_select.result == 'success' && needs.approver_select.outputs.count != '0' }}
+    permissions:
+      checks: write
+      actions: read
+      pull-requests: read
+    timeout-minutes: 5
+    needs:
+      - approver_select
+      - approver
+    steps:
+      - name: Mark the heads this sweep covered
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ needs.approver_select.outputs.prs }}
+          NODE: approver
+          BOT_LOGIN: agent-app[bot]
+          VERDICT_LINES: |-
+            **Verdict:** APPROVE
+            **Verdict:** REQUEST_CHANGES
+            **Verdict:** ESCALATE
+          JOB_PREFIX: "approver #"
+          SWEPT_CHECK: gp-foundry/swept (approver)
+          FAILED_CHECK: gp-foundry/sweep-failed (approver)
+          IDLE_CHECK: gp-foundry/sweep-idle (approver)
+          MAX_IDLE: "3"
+          MAX_FAILURES: "3"
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |-
+          JOBS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --paginate --jq '
+            .jobs[] | [(.conclusion // "none"), .name] | @tsv') || {
+            echo "::error::could not read this run's jobs — no head marked, so the next sweep will repeat them"
+            exit 1
+          }
+          publish() { # <check name> <sha> <title> <summary>
+            gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
+              -f name="$1" -f head_sha="$2" -f status=completed -f conclusion=neutral \
+              -f "output[title]=$3" -f "output[summary]=$4" >/dev/null
+          }
+          FAILED=0
+          while read -r NUM SHA SINCE; do
+            export SINCE="${SINCE:-}"
+            [ -n "$NUM" ] || continue
+            RESULT=$(awk -F'\t' -v n="$JOB_PREFIX$NUM" '$2 == n {print $1}' <<< "$JOBS" | tail -n 1)
+            case "$RESULT" in
+              success)
+                # The lane's post-condition: the bot's verdict on this head. A run that
+                # posted none had nothing to decide yet — leave it for the next sweep,
+                # not as a failure, but recorded: $MAX_FAILURES such runs on one head and
+                # the sweep stops (a role that always abstains would otherwise run every tick).
+                VERDICTS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '
+                  [ .[] | select(.commit_id == env.SHA)
+                    | select((env.BOT_LOGIN == "" or .user.login == env.BOT_LOGIN)) | select((env.SINCE // "") == "" or (.submitted_at // "") > env.SINCE)
+                    | select((((.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | (last // "")) as $line | env.VERDICT_LINES | split("\n") | any(.[]; . == $line))) ] | length
+                ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""
+                if [ -z "$VERDICTS" ]; then
+                  echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"
+                elif [ "$VERDICTS" = "0" ]; then
+                  # Retried — but counted, so a role that never posts a verdict is not
+                  # run on every tick forever. One check-run per such run; the selector
+                  # stops at $MAX_IDLE.
+                  PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '
+                    [.check_runs[] | select(.name == env.IDLE_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0
+                  N=$((PRIOR + 1))
+                  if [ "$N" -ge "$MAX_IDLE" ]; then
+                    TITLE="$NODE stopped after $N runs without a verdict"
+                    SUMMARY="The $NODE lane ran $N times on $SHA and never posted a verdict there. It will not be run on this head again; push a new commit, or re-run the lane by hand, to try again."
+                  else
+                    TITLE="$NODE run $N of $MAX_IDLE posted no verdict"
+                    SUMMARY="The $NODE lane ran on $SHA and posted no verdict. The next sweep retries it; after $MAX_IDLE such runs it stops."
+                  fi
+                  if publish "$IDLE_CHECK" "$SHA" "$TITLE" "$SUMMARY"; then
+                    echo "::notice::#$NUM: no verdict posted on $SHA — recorded run $N of $MAX_IDLE without one"
+                  else
+                    echo "::error::#$NUM: could not record the verdict-less run on $SHA — its retries are not being counted"
+                    FAILED=1
+                  fi
+                  if [ "$N" -ge "$MAX_IDLE" ]; then
+                    # Visible where a failed head shows: the same sweep-failed record as a failed run.
+                    publish "$FAILED_CHECK" "$SHA" "$NODE gave up after $N runs without a verdict" "$SUMMARY" \
+                      || { echo "::error::#$NUM: could not record giving up on $SHA"; FAILED=1; }
+                    echo "#$NUM: gave up on $SHA after $N runs without a verdict"
+                  fi
+                elif publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA and posted its verdict."; then
+                  echo "#$NUM: marked $SHA"
+                else
+                  echo "::error::#$NUM: could not publish the swept check on $SHA — the next sweep will repeat it"
+                  FAILED=1
+                fi ;;
+              failure|timed_out)
+                # One check-run per failed attempt; the selector counts them and stops at $MAX_FAILURES.
+                # filter=all, or GitHub returns only the newest one and the count never passes 1.
+                PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '
+                  [.check_runs[] | select(.name == env.FAILED_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0
+                N=$((PRIOR + 1))
+                if [ "$N" -ge "$MAX_FAILURES" ]; then
+                  TITLE="$NODE gave up after $N failed runs"
+                  SUMMARY="The $NODE lane failed $N times on $SHA and will not be run on this head again. Push a new commit, or re-run the lane by hand, to try again."
+                else
+                  TITLE="$NODE run $N of $MAX_FAILURES failed"
+                  SUMMARY="The $NODE lane failed on $SHA. The next sweep retries it; after $MAX_FAILURES failures it stops."
+                fi
+                if publish "$FAILED_CHECK" "$SHA" "$TITLE" "$SUMMARY"; then
+                  echo "#$NUM: lane $RESULT — recorded failed run $N of $MAX_FAILURES on $SHA"
+                else
+                  echo "::error::#$NUM: could not record the failed run on $SHA — its retries are not being counted"
+                  FAILED=1
+                fi ;;
+              *)
+                echo "#$NUM: lane did not finish (${RESULT:-no job}) — left for the next sweep, not counted as a failure" ;;
+            esac
+          done < <(jq -r '.[] | "\(.number) \(.sha) \(.since // "")"' <<< "$PRS")
+          exit "$FAILED"
