@@ -129,7 +129,8 @@ export interface PullRequestFacts {
   /**
    * A sign-off on a policy handoff: a standing formal APPROVED review on this
    * exact head from someone other than the harness's identity, with GitHub's own
-   * review decision met. Gathered only when the policy has handoff_clauses.
+   * review decision met. Gathered only when the policy has something for it to
+   * clear (handoff_clauses, or signoff_clears with an escalation on this head).
    */
   signoff?: { reviewer: string; sha: string };
   /** Why a sign-off that looked present could not be accepted (shown on the check). */
@@ -250,6 +251,13 @@ export interface MergePolicy {
    * off in the check (see PullRequestFacts.signoff). Never affects merging.
    */
   handoffClauses?: HandoffClause[];
+  /**
+   * Evaluate mode, opt-in: what a sign-off (PullRequestFacts.signoff) clears in
+   * the check. Default `["handoff-clauses"]`. `agent-escalate`: it also answers
+   * the reviewer's ESCALATE on that head. `escalation-label`: it also clears an
+   * escalation label. Never affects merging.
+   */
+  signoffClears?: SignoffClear[];
   /**
    * Labels to apply for a given skip outcome. Lets a consumer route skips to
    * the right agent (e.g. needsHuman -> "needs-human", rebase -> "rebase-needed").
@@ -864,48 +872,84 @@ export function validateHandoffClauses(raw: unknown): HandoffClause[] | undefine
   return raw as HandoffClause[];
 }
 
-/** What the evaluate check reports for a head: the result with any policy handoff taken into account. */
+/** What a sign-off may clear in the check (`signoff_clears`). */
+export const SIGNOFF_CLEARS = ["handoff-clauses", "agent-escalate", "escalation-label"] as const;
+export type SignoffClear = (typeof SIGNOFF_CLEARS)[number];
+
+/** Throws on a `signoff_clears` entry that is not one of SIGNOFF_CLEARS. */
+export function validateSignoffClears(raw: unknown): SignoffClear[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`signoff_clears must be a list, e.g. [handoff-clauses, agent-escalate]`);
+  for (const c of raw) {
+    if (!(SIGNOFF_CLEARS as readonly string[]).includes(String(c))) {
+      throw new Error(`signoff_clears: '${String(c)}' is not something a sign-off can clear — only ${SIGNOFF_CLEARS.join(", ")}`);
+    }
+  }
+  return raw as SignoffClear[];
+}
+
+/** What the evaluate check reports for a head: the result with any sign-off taken into account. */
 export interface CheckVerdict {
   /** The clause the check names: the first still failing, or ready. */
   decision: MergeDecision;
   conclusion: CheckConclusion;
   /** Handoff clauses failing on this head with no sign-off: a person decides. */
   outstanding: MergeDecision[];
-  /** Handoff clauses failing on this head that a sign-off has cleared. */
+  /** Clauses failing on this head that a sign-off has cleared: handoff clauses, an escalation label. */
   signedOff: MergeDecision[];
+  /** An escalation (the reviewer's verdict, a label) still holds this head: a person decides. */
+  escalated: boolean;
+  /** The reviewer's ESCALATE on this head, answered by the sign-off (`agent-escalate`). */
+  escalationSignedOff: boolean;
   /** For a neutral check: the other clauses still failing (see awaitingApprover). */
   alsoFailing?: MergeDecision[];
 }
 
 /**
- * The evaluate check's verdict on a head. Without `handoffClauses` in the policy
- * this is exactly the original rule (checkConclusion over evaluateMergeGate).
+ * The evaluate check's verdict on a head. Without `handoffClauses` or
+ * `signoffClears` in the policy this is exactly the original rule
+ * (checkConclusion over evaluateMergeGate).
  *
- * With it: a handoff clause failing on its own is `action_required` (a person
- * decides), not `failure`; a sign-off clears ONLY the handoff clauses, and the
- * check then reports whatever else the policy says. An escalation from the
- * agent, or an escalation label, is a judgment call or an explicit hold and is
- * never cleared by a sign-off. Merging never reads this: see evaluateMergeGate.
+ * With `handoffClauses`: a handoff clause failing on its own is
+ * `action_required` (a person decides), not `failure`, and a sign-off clears it.
+ *
+ * What a sign-off clears is `signoffClears` (default: the handoff clauses only,
+ * so an escalation from the agent or an escalation label is never cleared).
+ * `agent-escalate`: it answers the reviewer's ESCALATE on this head — only while
+ * the approval clause passes too, so the approval is one the policy trusts and
+ * no later change request stands against it. `escalation-label`: it clears the
+ * label's hold. Every other clause still decides the result.
+ * Merging never reads this: see evaluateMergeGate.
  */
 export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, nowMs: number = Date.now()): CheckVerdict {
   const handoff = new Set<string>(policy.handoffClauses ?? []);
+  const clears = new Set<SignoffClear>(pr.signoff ? (policy.signoffClears ?? ["handoff-clauses"]) : []);
   const failing = failingClauses(pr, policy, nowMs);
   const handoffs = failing.filter((d) => handoff.has(d.code));
-  const signedOff = pr.signoff ? handoffs : [];
-  const outstanding = pr.signoff ? [] : handoffs;
+  const label = failing.find((d) => d.code === "escalated");
+  const agentEscalated = pr.headVerdict === "escalate";
+  const escalationSignedOff = agentEscalated && clears.has("agent-escalate") && !failing.some((d) => d.code === "not-approved");
+  const signedOff = failing.filter(
+    (d) => (clears.has("handoff-clauses") && handoffs.includes(d)) || (clears.has("escalation-label") && d === label),
+  );
+  const outstanding = handoffs.filter((d) => !signedOff.includes(d));
   const remaining = failing.filter((d) => !signedOff.includes(d));
+  // Held unless every escalation on this head is one the sign-off cleared.
+  const escalated =
+    !!pr.escalated &&
+    !((agentEscalated || !!label) && (!agentEscalated || escalationSignedOff) && (!label || signedOff.includes(label)));
   const decision: MergeDecision = signedOff.length
-    ? (remaining[0] ?? { action: "merge", code: "ready-to-merge", reason: "every clause passes, the policy handoff signed off" })
+    ? (remaining[0] ?? { action: "merge", code: "ready-to-merge", reason: "every clause passes, the rest signed off" })
     : evaluateMergeGate(pr, policy, nowMs);
   const awaiting =
     policy.noVerdictConclusion === "neutral" ? awaitingApprover(pr, policy, nowMs)?.filter((d) => !signedOff.includes(d)) : undefined;
 
   let conclusion: CheckConclusion;
-  if (pr.escalated) conclusion = "action_required";
+  if (escalated) conclusion = "action_required";
   else if (remaining.length === 0) conclusion = "success";
   else if (outstanding.length && remaining.every((d) => handoff.has(d.code))) conclusion = "action_required";
   else conclusion = awaiting !== undefined ? "neutral" : "failure";
-  return { decision, conclusion, outstanding, signedOff, ...(awaiting !== undefined ? { alsoFailing: awaiting } : {}) };
+  return { decision, conclusion, outstanding, signedOff, escalated, escalationSignedOff, ...(awaiting !== undefined ? { alsoFailing: awaiting } : {}) };
 }
 
 /**

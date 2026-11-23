@@ -22,6 +22,7 @@ import {
   sameLogin,
   checkVerdict,
   validateHandoffClauses,
+  validateSignoffClears,
   parseTimestamp,
   standingChangeRequests,
   visibleBody,
@@ -589,11 +590,18 @@ export async function gatherFacts(
     markers,
   );
 
-  // A sign-off on a policy handoff. Only when the policy names handoff clauses,
-  // and GitHub's review decision is read only when there is a candidate.
+  // A sign-off. Only when the policy has something for it to clear on this head
+  // (handoff clauses; with signoff_clears, the reviewer's escalation or an
+  // escalation label), and GitHub's review decision is read only when there is
+  // a candidate.
   let signoff: PullRequestFacts["signoff"];
   let signoffUnavailable: string | undefined;
-  if (policy.handoffClauses?.length) {
+  const clears = policy.signoffClears ?? [];
+  if (
+    policy.handoffClauses?.length ||
+    (clears.includes("agent-escalate") && headVerdict === "escalate") ||
+    (clears.includes("escalation-label") && escalationLabel({ labels }, policy) !== undefined)
+  ) {
     const candidates = signoffCandidates(
       reviews.filter((r) => r.submitted_at).map((r) => ({ at: r.submitted_at!, author: r.user?.login, authorType: r.user?.type, association: r.author_association, state: r.state, sha: r.commit_id })),
       pr.head.sha,
@@ -788,15 +796,26 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
   const verdict = checkVerdict(facts, policy);
   const { decision, conclusion, outstanding, signedOff } = verdict;
   const alsoFailing = verdict.alsoFailing;
-  const handoffOnly = conclusion === "action_required" && !facts.escalated;
+  const handoffOnly = conclusion === "action_required" && !verdict.escalated;
   const ignore = new Set([...(policy.ciIgnoreCheckNames ?? []), ownCheck]);
   const gateLine = decision.action === "merge"
     ? "`ready-to-merge` — every clause of the merge policy passes on this head."
     : `\`${decision.code}\` — ${decision.reason}`;
-  const signed = signedOff.length && facts.signoff
-    ? `Policy handoff signed off: ${signedOff.map((d) => `\`${d.code}\``).join(", ")} by @${facts.signoff.reviewer} on \`${facts.signoff.sha.slice(0, 7)}\`.` +
-      (facts.headVerdict ? ` The reviewer's own verdict on this head stands: ${facts.headVerdict}.` : "")
-    : "";
+  const by = facts.signoff ? `by @${facts.signoff.reviewer} on \`${facts.signoff.sha.slice(0, 7)}\`` : "";
+  const handoffsSigned = signedOff.filter((d) => d.code !== "escalated");
+  const escalateWord = (policy.verdictWords ?? parseVerdictWords(undefined)).escalate;
+  const signed = [
+    handoffsSigned.length
+      ? `Policy handoff signed off: ${handoffsSigned.map((d) => `\`${d.code}\``).join(", ")} ${by}.` +
+        (facts.headVerdict ? ` The reviewer's own verdict on this head stands: ${facts.headVerdict}.` : "")
+      : "",
+    verdict.escalationSignedOff
+      ? `${escalateWord}, signed off ${by}: the reviewer escalated this head to a person, and a person approved it. The reviewer's reasons are in its review.`
+      : "",
+    signedOff.length > handoffsSigned.length ? `Escalation label \`${escalationLabel(facts, policy)}\` signed off ${by}.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
   const title = handoffOnly
     ? `A person decides: ${outstanding.map((d) => d.code).join(", ")}`
     : conclusion === "action_required"
@@ -812,15 +831,21 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
     `This change needs a person. A formal approval of this head from someone other than \`${policy.botLogin ?? "the pipeline"}\`, once GitHub's own review requirements are met, signs it off here.`,
     ...(facts.signoffUnavailable ? ["", `Not yet: ${facts.signoffUnavailable}.`] : []),
   ].join("\n");
+  // What would answer an escalation the policy lets a sign-off clear.
+  const clears = policy.signoffClears ?? [];
+  const answerable = escalationLabel(facts, policy) ? clears.includes("escalation-label") && (facts.headVerdict !== "escalate" || clears.includes("agent-escalate")) : clears.includes("agent-escalate");
+  const escalationAnswer = answerable
+    ? `\n\nA formal approval of this head from a person other than \`${policy.botLogin ?? "the pipeline"}\`, once GitHub's own review requirements are met, signs it off here.`
+    : "";
   const base =
     handoffOnly
       ? handoffSummary
       : conclusion === "action_required"
-      ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}`
+      ? `${escalationLabel(facts, policy) ? `Escalated to a human by the \`${escalationLabel(facts, policy)}\` label.` : "The reviewer escalated this head to a human."}\n\nGate: ${gateLine}${escalationAnswer}`
       : conclusion === "neutral"
         ? awaitingSummary(alsoFailing ?? [], facts, ignore)
         : gateLine;
-  const summary = [base, signed, !signed && !handoffOnly && facts.signoffUnavailable ? `Policy handoff not signed off: ${facts.signoffUnavailable}.` : ""]
+  const summary = [base, signed, !signed && !handoffOnly && facts.signoffUnavailable ? `${verdict.escalated && answerable ? "Escalation" : "Policy handoff"} not signed off: ${facts.signoffUnavailable}.` : ""]
     .filter(Boolean)
     .join("\n\n");
 
@@ -1299,8 +1324,13 @@ export async function runHybridGate(opts: {
         out.conclusion !== "success" &&
         checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion === "success";
       // Say, on the PR, who will merge it — the one thing the result alone does not.
+      // signoff_clears: agent-escalate — the reviewer asked for a person, so a
+      // person merges what they signed off; the pipeline does not.
+      const escalatedToPerson = facts.headVerdict === "escalate" && !!base.signoffClears?.includes("agent-escalate");
       if (opts.merge === "agent-only" || botWritten?.botWritten) {
-        const line = onDependabotLane
+        const line = escalatedToPerson
+          ? "Merge: a person merges this PR — the reviewer escalated this head, and the pipeline does not merge an escalation a person signed off."
+          : onDependabotLane
           ? "Merge: the pipeline merges this PR on the dependabot lane when it is ready."
           : botWritten?.botWritten
             ? botMerges
@@ -1332,6 +1362,7 @@ export async function runHybridGate(opts: {
 
       // Acting is for the pipeline's own PRs only, and one merge per run.
       if (mergedPr) continue;
+      if (escalatedToPerson) continue;
       if (botWritten?.botWritten) {
         // A separate grant from merge="agent-only": only the bots merge_bots names.
         if (!botMerges) continue;
@@ -1414,6 +1445,7 @@ export async function run(): Promise<void> {
     const policy = loadPolicy(policyPath);
     // Fail loudly on a policy handoff that is not one: it would otherwise be ignored.
     validateHandoffClauses(policy.handoffClauses);
+    validateSignoffClears(policy.signoffClears);
     if (branchPrefixInput) policy.branchPrefix = branchPrefixInput; // input overrides policy file
     // The compiler passes these from foundry.config.yaml / the graph, so a
     // consumer's identity and human-gate wiring don't have to be restated in the

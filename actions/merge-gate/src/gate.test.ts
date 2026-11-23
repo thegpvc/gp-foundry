@@ -4,6 +4,7 @@ import {
   evaluateMergeGate,
   checkVerdict,
   validateHandoffClauses,
+  validateSignoffClears,
   escalationLabel,
   standingChangeRequests,
   latestAttemptPerCheck,
@@ -1434,5 +1435,67 @@ describe("checkVerdict: policy handoffs", () => {
     expect(validateHandoffClauses(["too-large"])).toEqual(["too-large"]);
     expect(() => validateHandoffClauses(["not-approved"])).toThrow(/cannot be a handoff/);
     expect(() => validateHandoffClauses("protected-path")).toThrow(/must be a list/);
+  });
+});
+
+describe("checkVerdict: signoff_clears", () => {
+  const signoff = { reviewer: "bob", sha: "abc1234def" };
+  const escalate = (over: Partial<PullRequestFacts> = {}) => readyPr({ escalated: true, headVerdict: "escalate", ...over });
+  const on: MergePolicy = { ...policy, signoffClears: ["handoff-clauses", "agent-escalate"] };
+
+  it("by default a sign-off never answers the reviewer's escalation", () => {
+    const v = checkVerdict(escalate({ signoff }), policy, NOW);
+    expect(v.conclusion).toBe("action_required");
+    expect(v.escalated).toBe(true);
+    expect(v.escalationSignedOff).toBe(false);
+  });
+
+  it("agent-escalate: a sign-off answers it, and nothing else", () => {
+    const v = checkVerdict(escalate({ signoff }), on, NOW);
+    expect(v.conclusion).toBe("success");
+    expect(v.escalationSignedOff).toBe(true);
+    expect(checkVerdict(escalate(), on, NOW).conclusion).toBe("action_required");
+    const red = checkVerdict(escalate({ signoff, ciStatus: "failing" }), on, NOW);
+    expect(red.conclusion).toBe("failure");
+    expect(red.decision.code).toBe("ci-not-passing");
+  });
+
+  it("only while the approval clause passes: no trusted approval, no answer", () => {
+    const v = checkVerdict(escalate({ signoff, approvedAt: null }), on, NOW);
+    expect(v.conclusion).toBe("action_required");
+    expect(v.escalationSignedOff).toBe(false);
+  });
+
+  it("an escalation label holds unless escalation-label is listed", () => {
+    const labels: MergePolicy = { ...on, escalationLabels: ["hold"] };
+    const held = escalate({ signoff, labels: ["hold"] });
+    expect(checkVerdict(held, labels, NOW).conclusion).toBe("action_required");
+    const both = checkVerdict(held, { ...labels, signoffClears: ["agent-escalate", "escalation-label"] }, NOW);
+    expect(both.conclusion).toBe("success");
+    expect(both.signedOff.map((d) => d.code)).toEqual(["escalated"]);
+    // The label cleared, the reviewer's escalation not.
+    expect(checkVerdict(held, { ...labels, signoffClears: ["escalation-label"] }, NOW).conclusion).toBe("action_required");
+  });
+
+  it("an escalation of unknown origin is never cleared", () => {
+    expect(checkVerdict(readyPr({ escalated: true, signoff }), { ...on, signoffClears: ["agent-escalate", "escalation-label"] }, NOW).conclusion).toBe("action_required");
+  });
+
+  it("leaving handoff-clauses out stops a sign-off clearing a handoff", () => {
+    const p: MergePolicy = { ...policy, handoffClauses: ["protected-path"], signoffClears: ["agent-escalate"] };
+    const v = checkVerdict(readyPr({ files: [{ path: "db/migrations/1.sql", additions: 3, deletions: 0 }], signoff }), p, NOW);
+    expect(v.conclusion).toBe("action_required");
+    expect(v.outstanding.map((d) => d.code)).toEqual(["protected-path"]);
+  });
+
+  it("does not change the merge decision", () => {
+    expect(evaluateMergeGate(escalate({ signoff, approvedAt: null }), on, NOW).action).not.toBe("merge");
+  });
+
+  it("validates the list", () => {
+    expect(validateSignoffClears(undefined)).toBeUndefined();
+    expect(validateSignoffClears(["agent-escalate"])).toEqual(["agent-escalate"]);
+    expect(() => validateSignoffClears(["not-approved"])).toThrow(/not something a sign-off can clear/);
+    expect(() => validateSignoffClears("agent-escalate")).toThrow(/must be a list/);
   });
 });
