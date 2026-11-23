@@ -18,8 +18,8 @@ uses, so a lane and the gate cannot disagree about a PR.
    events carry no secrets — but hands it to the lane's scheduled bot pass.
    Listing keeps it only while every commit on it is authored by the bot and
    committed and signed by GitHub (web-flow, verified), fewer than 250 of them,
-   ending at the listed head. A listed PR carries the update's semver level as
-   `bump` when one can be told.
+   ending at the listed head. Such a PR carries the update's semver level as
+   `bump` when one can be told; a person's PR never does.
 5. Another bot's PR is out, unless that bot is named in the rollout's `authors`.
 6. With no rollout — or one naming neither authors nor an opt-in label — every
    remaining PR is in scope.

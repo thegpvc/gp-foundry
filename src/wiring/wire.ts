@@ -538,8 +538,13 @@ export function wire(ir: Harness): WiringPlan {
       nw.guard = nw.guard ? `${events} && (${nw.guard})` : events;
       const num = "github.event.pull_request.number";
       const { group, "cancel-in-progress": cancel } = nw.concurrency ?? { group: `${node.id}-\${{ ${num} }}`, "cancel-in-progress": false };
-      const plain = `${node.id}-\${{ ${num} }}`;
-      const inner = group === plain ? `format(${exprString(`${node.id}-{0}`)}, ${num})` : `(${group.replace(/^\$\{\{\s*|\s*\}\}$/g, "")})`;
+      // The event's own group, as an expression to nest: concurrencyKey writes it
+      // either as `<node>-${{ number }}` or as one whole `${{ … }}`.
+      const whole = /^\$\{\{\s*([\s\S]*?)\s*\}\}$/.exec(group);
+      let inner: string;
+      if (group === `${node.id}-\${{ ${num} }}`) inner = `format(${exprString(`${node.id}-{0}`)}, ${num})`;
+      else if (whole && !whole[1]!.includes("${{")) inner = `(${whole[1]})`;
+      else throw new Error(`cannot nest the concurrency group of '${node.id}' in its bot pass's: ${group}`);
       nw.concurrency = {
         // An event keeps its PR's slot; a dispatch for one PR gets that PR's own, so
         // a scheduled tick never replaces it while it waits; the scheduled pass shares one.

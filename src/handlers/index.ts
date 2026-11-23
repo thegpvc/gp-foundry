@@ -247,7 +247,7 @@ function emitAnalyst(ctxIn: EmitContext): WorkflowJobFragment {
   // at instructions: only the fixer treats the bot's posts as its work item.
   steps.push(contextStep(ctx, ctxType, isPr ? prNumber : ISSUE_NUMBER, { framing: "baseline", checks: isPr }));
   // rollout.bot_authors: the update's semver level, where the matrix carries it
-  // (a bot's own PR, or a person's whose title names versions), as context.
+  // (a bot's own PR), as context.
   if (isPr && fromMatrix && botAuthors) steps.push(bumpContextStep());
   // Waiting for a gate is not the same as reading it: wait-for-checks never fails
   // the step, so a red or timed-out gate used to be indistinguishable from a green
@@ -341,7 +341,7 @@ function bumpContextStep(): StepSpec {
       `[ -n "$CONTEXT_FILE" ] || exit 0`,
       `{`,
       `  printf '\\n## Dependency update\\n\\n'`,
-      `  printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata, else the PR title): **%s**.\\n' "$BUMP"`,
+      `  printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\\n' "$BUMP"`,
       `} >> "$CONTEXT_FILE"`,
     ].join("\n"),
   });

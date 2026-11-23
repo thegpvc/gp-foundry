@@ -14,7 +14,7 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { commitAuthorOf, inScope, isAgentWritten, isBotWritten, sameLogin, type Rollout } from "../../../src/shared/scope.js";
-import { parseDependabotBump, parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
+import { parseDependabotUpdateType, type DependabotBump } from "../../../src/shared/dependabot.js";
 import { excludeLabelQualifier, reviewedByQualifier, roundRobinByAuthor, searchCandidates, type Candidate } from "../../../src/shared/candidates.js";
 import { requestedAt, type LabelEvent } from "../../../src/shared/rereview.js";
 
@@ -105,8 +105,9 @@ export interface ScopedPr {
   since?: string;
   /**
    * The update's semver level when one can be told, as context for the agent:
-   * for a bot's own PR from its commits' `updated-dependencies` block and its
-   * title; for anyone else's from the title alone (no extra read).
+   * for a bot's own PR (rollout.bot_authors) only, from its commits'
+   * `updated-dependencies` block and its title. Never for anyone else's: a
+   * title is its author's claim, and only the bot's is taken at its word.
    */
   bump?: Exclude<DependabotBump, "unknown">;
 }
@@ -158,8 +159,7 @@ async function listCandidates(
   const out: (ScopedPr & { labels: string[] })[] = [];
   for (const { botAuthor, author, title, ...p } of listed) {
     if (!botAuthor) {
-      const bump = parseDependabotBump(title);
-      if (!opts.botAuthorsOnly) out.push({ ...p, ...(bump !== "unknown" ? { bump } : {}) });
+      if (!opts.botAuthorsOnly) out.push(p);
       continue;
     }
     let commits: ReturnType<typeof commitAuthorOf>[];

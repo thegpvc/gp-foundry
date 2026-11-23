@@ -401,9 +401,11 @@ describe("pr-scope: rollout.bot_authors", () => {
       expect(fine?.map((p) => p.number)).toEqual([2]);
     });
 
-    it("a person's PR whose title names versions gets the level too, without a read", async () => {
+    it("a person's PR gets no level, whatever its title claims: only the bot's is taken at its word", async () => {
       const o = lister([open(1, "alice", { title: "Bump x from 1.2.3 to 1.3.0" })], {});
-      expect(await listInScope(o, opts)).toMatchObject([{ number: 1, bump: "minor" }]);
+      const got = await listInScope(o, opts);
+      expect(got?.map((p) => p.number)).toEqual([1]);
+      expect(got?.[0]).not.toHaveProperty("bump");
       expect(o.reads).toEqual([]);
     });
 

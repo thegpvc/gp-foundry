@@ -726,7 +726,7 @@ jobs:
           [ -n "$CONTEXT_FILE" ] || exit 0
           {
             printf '\n## Dependency update\n\n'
-            printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata, else the PR title): **%s**.\n' "$BUMP"
+            printf 'Highest semver level among the updated dependencies (from the commits'"'"' updated-dependencies metadata and the PR title): **%s**.\n' "$BUMP"
           } >> "$CONTEXT_FILE"
       - name: Run agent
         id: agent

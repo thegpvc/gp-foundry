@@ -135,8 +135,8 @@ rollout:                       # `rollout: {}` = every PR
   or by asking the bot for a new head), and honours the re-review label. A lane also entered
   on `workflow_dispatch` keeps that trigger; its pass then runs on dispatch only for a `pr`.
   A sweep (the approver) needs no bot pass. The agent's context states the update's semver
-  level where the matrix carries it: from a bot's own commits' `updated-dependencies` block
-  and its title (the higher), or from a title alone.
+  level for a bot's own PR: from its commits' `updated-dependencies` block and its title
+  (the higher). A person's PR gets none, whatever its title says.
 - **Who may merge.** `merge="agent-only"` merges the PRs the pipeline wrote itself.
   `merge_bots="<login>,…"` on the single gate merges the named bots' own PRs once the
   approver's verdict is ready, whatever the bump level: a change a named bot sends is taken

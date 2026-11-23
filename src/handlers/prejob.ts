@@ -545,7 +545,12 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `}`,
   ];
   const hybrid = isHybrid(ctx.config);
-  const bots = !!rolloutOf(ctx.config)?.botAuthors?.length;
+  // rollout.bot_authors: a bot's PR carries its update's level (pr-scope's `bump`)
+  // through the list and into its matrix entry, as context for the agent. With
+  // no bot authors the script is as it was.
+  const bump = rolloutOf(ctx.config)?.botAuthors?.length
+    ? { column: ` \\(.bump // "-")`, field: " BUMP", arg: ` --arg bump "$BUMP"`, entry: ` + (if $bump == "-" then {} else {bump: $bump} end)` }
+    : { column: "", field: "", arg: "", entry: "" };
   // Some node's dispatch= names this sweep: a run may be started for one PR.
   const only = dispatchedSweepsOf(ctx.nodes ?? []).some((s) => s.id === node.id);
   // explain_on= (#52): each head left waiting carries the reason, for the gate's check.
@@ -572,10 +577,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
         `  { echo "prs=[]"; echo "count=0"; } >> "$GITHUB_OUTPUT"`,
         `  exit 0`,
         `fi`,
-        // rollout.bot_authors: the update's level, handed to the agent as context.
-        bots
-          ? `LIST=$(jq -r '.[] | "\\(.number) \\(.sha) \\(.requested) \\(.quiet) \\(.base) \\(.since // "-") \\(.bump // "-")"' <<< "$SCOPED")`
-          : `LIST=$(jq -r '.[] | "\\(.number) \\(.sha) \\(.requested) \\(.quiet) \\(.base) \\(.since // "-")"' <<< "$SCOPED")`,
+        `LIST=$(jq -r '.[] | "\\(.number) \\(.sha) \\(.requested) \\(.quiet) \\(.base) \\(.since // "-")${bump.column}"' <<< "$SCOPED")`,
       ]
     : [
         `list_prs() {`,
@@ -676,7 +678,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
           `}`,
         ]
       : []),
-    bots ? `while read -r NUM SHA REQUESTED QUIET BASE SINCE BUMP; do` : `while read -r NUM SHA REQUESTED QUIET BASE SINCE; do`,
+    `while read -r NUM SHA REQUESTED QUIET BASE SINCE${bump.field}; do`,
     `  [ -n "$NUM" ] || continue`,
     `  # SINCE: when a re-review was requested on this PR ("-": none). Records from`,
     `  # before it — verdicts, reviews, the sweep's own check-runs — do not count.`,
@@ -744,9 +746,7 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
     `  if [ "$REQUIRES_REVIEW" = "true" ] && [ "$REVIEWED" = "0" ]; then ${w("Waiting: the upstream review of this head")}echo "#$NUM: no review by $BOT_LOGIN covers $SHA yet"; continue; fi`,
     ...(explain ? [`  ${w(`${node.id} is deciding`)}`] : []),
     `  echo "#$NUM: selected at $SHA"`,
-    bots
-      ? `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE" --arg bump "$BUMP" '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end) + (if $bump == "-" then {} else {bump: $bump} end)]' <<< "$SELECTED")`
-      : `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE" '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end)]' <<< "$SELECTED")`,
+    `  SELECTED=$(jq -c --argjson n "$NUM" --arg s "$SHA" --arg b "$BASE" --arg since "$SINCE"${bump.arg} '. + [{number: $n, sha: $s, base: $b} + (if $since == "" then {} else {since: $since} end)${bump.entry}]' <<< "$SELECTED")`,
     `  if [ "$(jq 'length' <<< "$SELECTED")" -ge "$LIMIT" ]; then`,
     `    echo "limit of $LIMIT reached — the rest wait for the next sweep"`,
     `    break`,
@@ -829,45 +829,163 @@ function emitSweepSelect(ctx: EmitContext): WorkflowJobFragment {
  * cancelled one is neither marked nor counted. Either way the next sweep picks
  * the head up again.
  */
-export function emitSweepMark(ctx: EmitContext, botPass = false): WorkflowJobFragment {
-  const quiet = botPass ? undefined : quietVerdictsOf(ctx.node, ctx.config);
+function emitSweepMark(ctx: EmitContext): WorkflowJobFragment {
+  const node = ctx.node;
+  const quiet = quietVerdictsOf(node, ctx.config);
+  return markJob(ctx, {
+    jobId: `${node.id}_mark`,
+    name: `${node.id} sweep mark`,
+    displayName: `${node.id} mark`,
+    stepName: "Mark the heads this sweep covered",
+    select: preJobId(node),
+    lane: node.id,
+    // Reads the reviews: the lane's post-condition is the bot's verdict on the head.
+    permissions: { checks: "write", actions: "read", "pull-requests": "read" },
+    env: {
+      BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
+      VERDICT_LINES: verdictLinesOf(ctx.config),
+      JOB_PREFIX: sweepJobNamePrefix(node),
+      SWEPT_CHECK: sweptCheckName(node),
+      FAILED_CHECK: sweepFailedCheckName(node),
+      IDLE_CHECK: sweepIdleCheckName(node),
+      MAX_IDLE: String(SWEEP_MAX_IDLE),
+    },
+    envAfter: quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {},
+    failedBy: "",
+    retry: "Push a new commit, or re-run the lane by hand, to try again.",
+    onSuccess: [
+      `      # The lane's post-condition: the bot's verdict on this head. A run that`,
+      `      # posted none had nothing to decide yet — leave it for the next sweep,`,
+      `      # not as a failure, but recorded: $MAX_FAILURES such runs on one head and`,
+      `      # the sweep stops (a role that always abstains would otherwise run every tick).`,
+      `      VERDICTS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
+      ...VERDICT_REVIEWS_JQ.map((l) => `        ${l}`),
+      `      ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""`,
+      ...(quiet
+        ? [
+            `      # quiet_verdicts: a verdict delivered as the harness App's check run counts too.`,
+            `      if [ -n "$VERDICTS" ]; then`,
+            `        QUIET_VERDICTS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '`,
+            `          [.check_runs[] | select(${QUIET_CHECK_JQ})] | length' | awk '{s+=$1} END {print s+0}') || QUIET_VERDICTS=""`,
+            `        if [ -z "$QUIET_VERDICTS" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET_VERDICTS)); fi`,
+            `      fi`,
+          ]
+        : []),
+      `      if [ -z "$VERDICTS" ]; then`,
+      `        echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"`,
+      `      elif [ "$VERDICTS" = "0" ]; then`,
+      `        # Retried — but counted, so a role that never posts a verdict is not`,
+      `        # run on every tick forever. One check-run per such run; the selector`,
+      `        # stops at $MAX_IDLE.`,
+      `        PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
+      `          [.check_runs[] | select(.name == env.IDLE_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
+      `        N=$((PRIOR + 1))`,
+      `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
+      `          TITLE="$NODE stopped after $N runs without a verdict"`,
+      `          SUMMARY="The $NODE lane ran $N times on $SHA and never posted a verdict there. It will not be run on this head again; push a new commit, or re-run the lane by hand, to try again."`,
+      `        else`,
+      `          TITLE="$NODE run $N of $MAX_IDLE posted no verdict"`,
+      `          SUMMARY="The $NODE lane ran on $SHA and posted no verdict. The next sweep retries it; after $MAX_IDLE such runs it stops."`,
+      `        fi`,
+      `        if publish "$IDLE_CHECK" "$SHA" "$TITLE" "$SUMMARY"; then`,
+      `          echo "::notice::#$NUM: no verdict posted on $SHA — recorded run $N of $MAX_IDLE without one"`,
+      `        else`,
+      `          echo "::error::#$NUM: could not record the verdict-less run on $SHA — its retries are not being counted"`,
+      `          FAILED=1`,
+      `        fi`,
+      `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
+      `          # Visible where a failed head shows: the same sweep-failed record as a failed run.`,
+      `          publish "$FAILED_CHECK" "$SHA" "$NODE gave up after $N runs without a verdict" "$SUMMARY" \\`,
+      `            || { echo "::error::#$NUM: could not record giving up on $SHA"; FAILED=1; }`,
+      `          echo "#$NUM: gave up on $SHA after $N runs without a verdict"`,
+      `        fi`,
+      `      elif publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA and posted its verdict."; then`,
+      `        echo "#$NUM: marked $SHA"`,
+      `      else`,
+      `        echo "::error::#$NUM: could not publish the swept check on $SHA — the next sweep will repeat it"`,
+      `        FAILED=1`,
+      `      fi ;;`,
+    ],
+  });
+}
+
+/**
+ * `<node>_bots_mark` (rollout.bot_authors): the bot pass's record of the heads
+ * it reviewed. The same job as a sweep's mark, with a simpler post-condition:
+ * the pass's lane posts no verdict, so a run that succeeded reviewed the head.
+ * Only this job's own records count as failures (MARK_APP), as its select job reads them.
+ */
+export function emitBotPassMark(ctx: EmitContext): WorkflowJobFragment {
   const node = ctx.node;
   const ids = botPassJobIds(node);
-  const select = botPass ? ids.select : preJobId(node);
-  // The bot pass's lane posts no verdict: a run that succeeded reviewed the head.
-  const retry = botPass ? botPassRetryAdvice(ctx) : "Push a new commit, or re-run the lane by hand, to try again.";
-  const app = botPass ? " and .app.slug == env.MARK_APP" : "";
+  return markJob(ctx, {
+    jobId: ids.mark,
+    name: `${node.id} bot pass mark`,
+    displayName: `${node.id} bots mark`,
+    stepName: "Mark the heads this pass covered",
+    select: ids.select,
+    lane: ids.lane,
+    permissions: { checks: "write", actions: "read" },
+    env: { JOB_PREFIX: botPassJobNamePrefix(node), SWEPT_CHECK: sweptCheckName(node), FAILED_CHECK: sweepFailedCheckName(node), MARK_APP },
+    envAfter: {},
+    failedBy: " and .app.slug == env.MARK_APP",
+    retry: botPassRetryAdvice(ctx),
+    onSuccess: [
+      `      if publish "$SWEPT_CHECK" "$SHA" "Reviewed by $NODE" "The $NODE lane's bot pass reviewed $SHA."; then`,
+      `        echo "#$NUM: marked $SHA"`,
+      `      else`,
+      `        echo "::error::#$NUM: could not publish the swept check on $SHA — the next run will review it again"`,
+      `        FAILED=1`,
+      `      fi ;;`,
+    ],
+  });
+}
+
+/** What differs between a sweep's mark job and a bot pass's. */
+interface MarkJobSpec {
+  jobId: string;
+  name: string;
+  displayName: string;
+  stepName: string;
+  /** The job that chose the heads, and the matrix job that ran the lane on each. */
+  select: string;
+  lane: string;
+  permissions: NonNullable<WorkflowJobFragment["permissions"]>;
+  /** The step's own env, between the shared head and tail (key order is the generated file's). */
+  env: Record<string, string>;
+  envAfter: Record<string, string>;
+  /** A further jq test on the failed-run records counted (`" and …"`), or "". */
+  failedBy: string;
+  /** How to try a head again once the job has given up on it. */
+  retry: string;
+  /** The `success)` arm of the script: what to record for a lane job that succeeded. */
+  onSuccess: string[];
+}
+
+/** The mark job both callers share: read this run's lane jobs, record each head's outcome. */
+function markJob(ctx: EmitContext, spec: MarkJobSpec): WorkflowJobFragment {
+  const { select } = spec;
   return {
-    jobId: botPass ? ids.mark : `${node.id}_mark`,
-    name: botPass ? `${node.id} bot pass mark` : `${node.id} sweep mark`,
-    displayName: botPass ? `${node.id} bots mark` : `${node.id} mark`,
-    needs: botPass ? [ids.select, ids.lane] : [select, node.id],
+    jobId: spec.jobId,
+    name: spec.name,
+    displayName: spec.displayName,
+    needs: [select, spec.lane],
     // always(): the lanes that succeeded are marked even when a sibling failed.
     if: `\${{ always() && needs.${select}.result == 'success' && needs.${select}.outputs.count != '0' }}`,
-    permissions: botPass ? { checks: "write", actions: "read" } : { checks: "write", actions: "read", "pull-requests": "read" },
+    permissions: spec.permissions,
     timeoutMinutes: 5,
     steps: [
       runStep({
-        name: botPass ? "Mark the heads this pass covered" : "Mark the heads this sweep covered",
+        name: spec.stepName,
         env: {
           GH_TOKEN: "${{ github.token }}",
           PRS: `\${{ needs.${select}.outputs.prs }}`,
-          NODE: node.id,
-          ...(botPass
-            ? { JOB_PREFIX: botPassJobNamePrefix(node), SWEPT_CHECK: sweptCheckName(node), FAILED_CHECK: sweepFailedCheckName(node), MARK_APP }
-            : {
-                BOT_LOGIN: ctx.config.identity?.bot_login ?? "",
-                VERDICT_LINES: verdictLinesOf(ctx.config),
-                JOB_PREFIX: sweepJobNamePrefix(node),
-                SWEPT_CHECK: sweptCheckName(node),
-                FAILED_CHECK: sweepFailedCheckName(node),
-                IDLE_CHECK: sweepIdleCheckName(node),
-                MAX_IDLE: String(SWEEP_MAX_IDLE),
-              }),
+          NODE: ctx.node.id,
+          ...spec.env,
           MAX_FAILURES: String(SWEEP_MAX_FAILURES),
           RUN_ID: "${{ github.run_id }}",
           RUN_ATTEMPT: "${{ github.run_attempt }}",
-          ...(quiet ? { VERDICT_CHECK: quiet.check, BOT_APP: quiet.app } : {}),
+          ...spec.envAfter,
         },
         run: [
           `JOBS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --paginate --jq '`,
@@ -887,77 +1005,16 @@ export function emitSweepMark(ctx: EmitContext, botPass = false): WorkflowJobFra
           `  RESULT=$(awk -F'\\t' -v n="$JOB_PREFIX$NUM" '$2 == n {print $1}' <<< "$JOBS" | tail -n 1)`,
           `  case "$RESULT" in`,
           `    success)`,
-          ...(botPass
-            ? [
-                `      if publish "$SWEPT_CHECK" "$SHA" "Reviewed by $NODE" "The $NODE lane's bot pass reviewed $SHA."; then`,
-                `        echo "#$NUM: marked $SHA"`,
-                `      else`,
-                `        echo "::error::#$NUM: could not publish the swept check on $SHA — the next run will review it again"`,
-                `        FAILED=1`,
-                `      fi ;;`,
-              ]
-            : [
-              `      # The lane's post-condition: the bot's verdict on this head. A run that`,
-              `      # posted none had nothing to decide yet — leave it for the next sweep,`,
-              `      # not as a failure, but recorded: $MAX_FAILURES such runs on one head and`,
-              `      # the sweep stops (a role that always abstains would otherwise run every tick).`,
-              `      VERDICTS=$(SHA="$SHA" gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --paginate --jq '`,
-              ...VERDICT_REVIEWS_JQ.map((l) => `        ${l}`),
-              `      ' | awk '{s+=$1} END {print s+0}') || VERDICTS=""`,
-              ...(quiet
-                ? [
-                    `      # quiet_verdicts: a verdict delivered as the harness App's check run counts too.`,
-                    `      if [ -n "$VERDICTS" ]; then`,
-                    `        QUIET_VERDICTS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=$(jq -rn --arg n "$VERDICT_CHECK" '$n | @uri')&filter=all&per_page=100" --paginate --jq '`,
-                    `          [.check_runs[] | select(${QUIET_CHECK_JQ})] | length' | awk '{s+=$1} END {print s+0}') || QUIET_VERDICTS=""`,
-                    `        if [ -z "$QUIET_VERDICTS" ]; then VERDICTS=""; else VERDICTS=$((VERDICTS + QUIET_VERDICTS)); fi`,
-                    `      fi`,
-                  ]
-                : []),
-              `      if [ -z "$VERDICTS" ]; then`,
-              `        echo "::warning::#$NUM: could not read reviews on $SHA — left for the next sweep"`,
-              `      elif [ "$VERDICTS" = "0" ]; then`,
-              `        # Retried — but counted, so a role that never posts a verdict is not`,
-              `        # run on every tick forever. One check-run per such run; the selector`,
-              `        # stops at $MAX_IDLE.`,
-              `        PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-              `          [.check_runs[] | select(.name == env.IDLE_CHECK and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
-              `        N=$((PRIOR + 1))`,
-              `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
-              `          TITLE="$NODE stopped after $N runs without a verdict"`,
-              `          SUMMARY="The $NODE lane ran $N times on $SHA and never posted a verdict there. It will not be run on this head again; push a new commit, or re-run the lane by hand, to try again."`,
-              `        else`,
-              `          TITLE="$NODE run $N of $MAX_IDLE posted no verdict"`,
-              `          SUMMARY="The $NODE lane ran on $SHA and posted no verdict. The next sweep retries it; after $MAX_IDLE such runs it stops."`,
-              `        fi`,
-              `        if publish "$IDLE_CHECK" "$SHA" "$TITLE" "$SUMMARY"; then`,
-              `          echo "::notice::#$NUM: no verdict posted on $SHA — recorded run $N of $MAX_IDLE without one"`,
-              `        else`,
-              `          echo "::error::#$NUM: could not record the verdict-less run on $SHA — its retries are not being counted"`,
-              `          FAILED=1`,
-              `        fi`,
-              `        if [ "$N" -ge "$MAX_IDLE" ]; then`,
-              `          # Visible where a failed head shows: the same sweep-failed record as a failed run.`,
-              `          publish "$FAILED_CHECK" "$SHA" "$NODE gave up after $N runs without a verdict" "$SUMMARY" \\`,
-              `            || { echo "::error::#$NUM: could not record giving up on $SHA"; FAILED=1; }`,
-              `          echo "#$NUM: gave up on $SHA after $N runs without a verdict"`,
-              `        fi`,
-              `      elif publish "$SWEPT_CHECK" "$SHA" "Swept by $NODE" "The $NODE lane ran on $SHA and posted its verdict."; then`,
-              `        echo "#$NUM: marked $SHA"`,
-              `      else`,
-              `        echo "::error::#$NUM: could not publish the swept check on $SHA — the next sweep will repeat it"`,
-              `        FAILED=1`,
-              `      fi ;;`,
-              ]),
+          ...spec.onSuccess,
           `    failure|timed_out)`,
           `      # One check-run per failed attempt; the selector counts them and stops at $MAX_FAILURES.`,
           `      # filter=all, or GitHub returns only the newest one and the count never passes 1.`,
           `      PRIOR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100&filter=all" --paginate --jq '`,
-          `        [.check_runs[] | select(.name == env.FAILED_CHECK${app} and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
+          `        [.check_runs[] | select(.name == env.FAILED_CHECK${spec.failedBy} and ((env.SINCE // "") == "" or (.started_at // "") > env.SINCE))] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}') || PRIOR=0`,
           `      N=$((PRIOR + 1))`,
           `      if [ "$N" -ge "$MAX_FAILURES" ]; then`,
           `        TITLE="$NODE gave up after $N failed runs"`,
-          `        SUMMARY="The $NODE lane failed $N times on $SHA and will not be run on this head again. ${retry}"`,
+          `        SUMMARY="The $NODE lane failed $N times on $SHA and will not be run on this head again. ${spec.retry}"`,
           `      else`,
           `        TITLE="$NODE run $N of $MAX_FAILURES failed"`,
           `        SUMMARY="The $NODE lane failed on $SHA. The next sweep retries it; after $MAX_FAILURES failures it stops."`,

@@ -189,8 +189,13 @@ function runPost(
     writeFileSync(join(fx, "repos/o/r/issues/7/labels?per_page=100".replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify([...on].filter(([, v]) => v).map(([name]) => ({ name }))));
   }
   if (verdictChecks && step.env.VERDICT_CHECK) {
-    const q = `repos/o/r/commits/head1/check-runs?check_name=${encodeURIComponent(step.env.VERDICT_CHECK).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())}&filter=all&per_page=100`;
-    writeFileSync(join(fx, q.replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify({ check_runs: verdictChecks }));
+    // The step encodes the name with jq's @uri, which escapes !'()* from jq 1.7 on
+    // and leaves them as they are in 1.6. GitHub reads either; so does the stub.
+    const strict = encodeURIComponent(step.env.VERDICT_CHECK).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    for (const name of new Set([strict, encodeURIComponent(step.env.VERDICT_CHECK)])) {
+      const q = `repos/o/r/commits/head1/check-runs?check_name=${name}&filter=all&per_page=100`;
+      writeFileSync(join(fx, q.replace(/[^A-Za-z0-9]/g, "_")), JSON.stringify({ check_runs: verdictChecks }));
+    }
   }
   if (files) {
     writeFileSync(
