@@ -1205,6 +1205,156 @@ describe("sign-off on a policy handoff (handoff_clauses)", () => {
   });
 });
 
+// signoff_clears: the reviewer asked for a person; a person's formal approval of
+// that exact head is the answer, when the policy says so.
+describe("sign-off on an agent ESCALATE (signoff_clears)", () => {
+  const ON = "signoff_clears: [handoff-clauses, agent-escalate]\n";
+  const at = (n: number) => `2026-01-0${n}T00:00:00Z`;
+  const botVerdict = (word: string, n = 1) => ({ submitted_at: at(n), state: "COMMENTED", commit_id: HEAD, user: { login: BOT }, author_association: "NONE", body: `ok\n\n**Verdict:** ${word}` });
+  const formal = (login: string, state: string, n: number, sha = HEAD) => ({ submitted_at: at(n), state, commit_id: sha, user: { login }, author_association: "MEMBER", body: "" });
+  const evaluate = async (world: Partial<World>, policyYaml = ON, merge = "off") => {
+    setup(world, policyYaml);
+    delete inputs.mode;
+    inputs.merge = merge;
+    await run();
+    expect(failures).toEqual([]);
+    return stub.calls.find((c) => c.method === "checks.create")?.params;
+  };
+  const signedOffEscalate = [botVerdict("ESCALATE", 1), formal("bob", "APPROVED", 2)];
+
+  it("setting absent: a person's approval of an escalated head changes nothing, and no decision is read", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate }, "");
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.title).toBe("Escalated: a human decides");
+    expect(c.output.summary).not.toContain("signs it off");
+    expect(methods()).not.toContain("graphql.reviewDecision");
+  });
+
+  it("…and so does the default, [handoff-clauses], written out", async () => {
+    expect((await evaluate({ reviews: signedOffEscalate }, "signoff_clears: [handoff-clauses]\n")).conclusion).toBe("action_required");
+  });
+
+  it("agent-escalate: a trusted person's approval of the head answers it, and the check says who", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate });
+    expect(c.conclusion).toBe("success");
+    expect(c.output.title).toBe("Ready to merge — signed off by @bob");
+    expect(c.output.summary).toContain("ESCALATE, signed off by @bob on `aaaaaaa`");
+  });
+
+  it("an escalated head with no approval yet says what would answer it", async () => {
+    const c = await evaluate({ reviews: [botVerdict("ESCALATE")] });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).toContain(`A formal approval of this head from a person other than \`${BOT}\``);
+    expect(methods()).not.toContain("graphql.reviewDecision");
+  });
+
+  it("every other clause still decides: failing CI, an open thread", async () => {
+    const red = await evaluate({ reviews: signedOffEscalate, ci: [{ id: 1, name: "ci", status: "completed", conclusion: "failure", app: { slug: "github-actions" } }] });
+    expect(red.conclusion).toBe("failure");
+    expect(red.output.title).toBe("Not ready: ci-not-passing");
+    expect(red.output.summary).toContain("ESCALATE, signed off by @bob");
+    const thread = { isResolved: false, path: "src/w.ts", line: 4, originalLine: 4, firstComment: { nodes: [{ reactions: { nodes: [] } }] }, comments: { nodes: [{ author: { login: "carol" }, body: "Leaks." }] } };
+    const open = await evaluate({ reviews: signedOffEscalate, threads: [thread] });
+    expect(open.conclusion).toBe("failure");
+    expect(open.output.title).toBe("Not ready: open-threads");
+  });
+
+  it("an approval of an earlier head does not answer it", async () => {
+    const c = await evaluate({ reviews: [botVerdict("ESCALATE", 1), formal("bob", "APPROVED", 2, "b".repeat(40))] });
+    expect(c.conclusion).toBe("action_required");
+  });
+
+  it("nor does the harness's own approval, a person without a trusted association, or another bot", async () => {
+    expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), formal(BOT, "APPROVED", 2)] })).conclusion).toBe("action_required");
+    const outsider = { ...formal("stranger", "APPROVED", 2), author_association: "CONTRIBUTOR" };
+    expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), outsider], reviewDecision: null })).conclusion).toBe("action_required");
+    // Another bot can sign off a policy handoff, but its approval is not one the
+    // policy trusts as an approval, and an escalation asks for a person.
+    const app = { ...formal("review-app[bot]", "APPROVED", 2), author_association: "NONE" };
+    expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), app] })).conclusion).toBe("action_required");
+  });
+
+  it("a dismissed approval, or the reviewer's own later change request, does not stand", async () => {
+    expect((await evaluate({ reviews: [...signedOffEscalate, formal("bob", "DISMISSED", 3)] })).conclusion).toBe("action_required");
+    expect((await evaluate({ reviews: [...signedOffEscalate, formal("bob", "CHANGES_REQUESTED", 3)] })).conclusion).toBe("action_required");
+  });
+
+  it("someone else's later change request holds it", async () => {
+    const c = await evaluate({ reviews: [...signedOffEscalate, formal("carol", "CHANGES_REQUESTED", 3)], reviewDecision: "CHANGES_REQUESTED" });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).toContain("Escalation not signed off: bob approved this head, but GitHub's review requirements are not met yet");
+    // …and with no review rule on the branch, the gate's own latest-verdict rule does.
+    expect((await evaluate({ reviews: [...signedOffEscalate, formal("carol", "CHANGES_REQUESTED", 3)], reviewDecision: null })).conclusion).toBe("action_required");
+  });
+
+  it("GitHub's review requirements still apply: REVIEW_REQUIRED keeps it escalated", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate, reviewDecision: "REVIEW_REQUIRED" });
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.summary).toContain("review decision: REVIEW_REQUIRED");
+  });
+
+  it("a sign-off does not answer a request for changes", async () => {
+    const c = await evaluate({ reviews: [formal("bob", "APPROVED", 1), botVerdict("REQUEST_CHANGES", 2)] });
+    expect(c.conclusion).toBe("failure");
+    expect(c.output.title).toBe("Not ready: not-approved");
+  });
+
+  it("an escalation label still holds unless escalation-label is listed", async () => {
+    const labels = "escalation_labels: [hold]\n";
+    const world = { labels: ["hold"], reviews: signedOffEscalate };
+    const held = await evaluate(world, ON + labels);
+    expect(held.conclusion).toBe("action_required");
+    expect(held.output.summary).not.toContain("signs it off");
+    const cleared = await evaluate(world, "signoff_clears: [agent-escalate, escalation-label]\n" + labels);
+    expect(cleared.conclusion).toBe("success");
+    expect(cleared.output.summary).toContain("Escalation label `hold` signed off by @bob");
+    // The label alone, on a head the approver approved.
+    const labelOnly = await evaluate({ labels: ["hold"], reviews: [botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2)] }, "signoff_clears: [escalation-label]\n" + labels);
+    expect(labelOnly.conclusion).toBe("success");
+    // escalation-label without agent-escalate does not answer the reviewer.
+    expect((await evaluate(world, "signoff_clears: [escalation-label]\n" + labels)).conclusion).toBe("action_required");
+  });
+
+  it("omitting handoff-clauses stops a sign-off clearing a policy handoff", async () => {
+    const policy = "protected_paths: [src/]\nhandoff_clauses: [protected-path]\n";
+    const world = { reviews: [botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2)] };
+    expect((await evaluate(world, policy + ON)).conclusion).toBe("success");
+    expect((await evaluate(world, policy + "signoff_clears: [agent-escalate]\n")).conclusion).toBe("action_required");
+  });
+
+  it("the pipeline never merges a signed-off escalation", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate }, ON, "agent-only");
+    expect(c.conclusion).toBe("success");
+    expect(methods()).not.toContain("pulls.merge");
+    expect(c.output.text).toContain("Merge: a person merges this PR — the reviewer escalated this head");
+  });
+
+  it("…nor an escalated head a person approved, with or without the setting, in either gate", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate }, "", "agent-only");
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.text).toContain("the pipeline never merges an escalated head");
+    expect(methods()).not.toContain("pulls.merge");
+    // The original gate (no merge=, mode merge).
+    setup({ reviews: signedOffEscalate });
+    inputs.mode = "";
+    await run();
+    expect(failures).toEqual([]);
+    expect(methods()).not.toContain("pulls.merge");
+    // A later approval from the reviewer itself lifts it.
+    setup({ reviews: [...signedOffEscalate, botVerdict("APPROVE", 3)] });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+
+  it("rejects an entry a sign-off cannot clear", async () => {
+    setup({}, "signoff_clears: [ci-not-passing]\n");
+    delete inputs.mode;
+    inputs.merge = "off";
+    await run();
+    expect(failures.join(" ")).toContain("'ci-not-passing' is not something a sign-off can clear");
+  });
+});
 
 describe("a merge another run got to first", () => {
   it("is not reported as a rejected merge: no rebase label, no comment", async () => {

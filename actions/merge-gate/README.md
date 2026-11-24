@@ -46,6 +46,14 @@ disqualifying first:
    review is "changes requested", else `changes-requested`. Without it the latest
    verdict wins, so the bot's later approval overrides a teammate's block.
 
+<a id="escalated-heads-are-never-merged"></a>
+**Escalated heads are never merged.** When the trusted reviewer's latest verdict on
+the head is an escalation, the gate does not merge it in any mode (`mode: merge`,
+`merge: agent-only`, `merge_bots`), even after a trusted person formally approves
+that head: the reviewer asked for a person, and that person merges. A new head, or
+a later verdict from the reviewer, lifts it. (Before 0.9.0 a trusted person's
+approval of an escalated head let the pipeline merge its own PR.)
+
 An **escalation label** (`escalationLabels: [...]`) is checked first, right after
 blocking labels and in both lanes: a PR carrying one is never merged (`escalated`),
 and in evaluate mode its check is `action_required` whether or not the approver
@@ -217,10 +225,43 @@ Opt-in, and only for the check (`merge`, or mode evaluate). `handoffClauses:
   read, the handoff stays outstanding and the check says why.
 - A sign-off clears **only** the handoff clauses. CI, open threads, review requests,
   change requests and holds still decide the result. An agent `ESCALATE` (a judgment
-  call) and an escalation label (an explicit hold) are never cleared by it.
+  call) and an escalation label (an explicit hold) are never cleared by it, unless
+  the policy says so: see [What a sign-off clears](#what-a-sign-off-clears-signoffclears).
 - The check names who signed off and on which commit, and keeps the agent's verdict.
 - Merging never reads a sign-off: with `merge: agent-only` a handoff clause still
   holds the merge, and the gate posts no review of its own.
+
+## What a sign-off clears (`signoffClears`)
+
+Opt-in, and only for the check. The default is `signoffClears: [handoff-clauses]`:
+a sign-off clears the policy handoffs above and nothing else. Two more values let
+it answer an escalation, so the check stops contradicting the review once the
+person the reviewer asked for has approved:
+
+```yaml
+signoff_clears: [handoff-clauses, agent-escalate]   # optionally also: escalation-label
+```
+
+- `agent-escalate` — the reviewer's `ESCALATE` on a head is answered by a sign-off
+  on that head. The rule is the handoff sign-off rule, with one more condition: the
+  approval must also satisfy the gate's own approval clause. So it has to come from
+  a person with a trusted association (another bot's approval can sign off a policy
+  handoff, but does not answer an escalation), and it stops counting when anyone
+  requests changes after it. A new head needs a new sign-off.
+- `escalation-label` — a sign-off also clears an escalation label (`escalationLabels`).
+  Left out, the label holds until it is removed, sign-off or not. List it when
+  automation applies the label on every `ESCALATE`.
+- `handoff-clauses` — the handoffs. Leave it out and a sign-off no longer clears them.
+
+A sign-off clears only what is listed. CI, open threads, review requests, change
+requests and blocking labels still decide the result, and a `REQUEST_CHANGES`
+verdict is never answered by an approval. The check keeps the verdict and names
+the sign-off ("ESCALATE, signed off by @person on abc1234"); the reviewer's reasons
+stay in its review. An unknown entry fails the run.
+
+Merging never reads this either: the gate never merges an escalated head (see
+[Escalated heads are never merged](#escalated-heads-are-never-merged)). The person
+who signed it off merges it.
 
 ## Evaluate mode
 
@@ -233,7 +274,7 @@ every open, non-draft PR on a `branchPrefix` branch (narrowed by `authors`,
 | conclusion | when |
 | --- | --- |
 | `success` | the gate's decision is `merge` |
-| `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`) |
+| `action_required` | the trusted reviewer's latest verdict on the head is an escalation (`**Verdict:** ESCALATE`, or `escalationBodyRegex`), unless a sign-off answers it (`signoffClears`) |
 | `neutral` | `noVerdictConclusion: neutral` and the trusted approver has given no verdict (approve, reject or escalate) on the head yet ("Awaiting the approver"), whatever else fails; `output.summary` lists every other clause still failing (CI counts, unanswered threads, review requests, size, protected paths) |
 | `failure` | anything else (a rejected head, an approved head with a clause failing, or any unverdicted head without `noVerdictConclusion: neutral`); `output.summary` carries the gate's first failing `code` and `reason` |
 

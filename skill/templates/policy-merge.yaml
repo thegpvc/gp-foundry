@@ -115,6 +115,13 @@ labels:
 # the check reports whatever else the policy says. The gate never merges on a sign-off.
 # handoff_clauses: [protected-path, too-large]
 #
+# What that sign-off clears (the gate's check only). Default: the handoff clauses.
+# Add `agent-escalate` and a trusted person's formal approval of the head also answers
+# the reviewer's ESCALATE on it: the check stops saying "a human decides" once one has,
+# and names who. Every other clause still decides, and the gate itself never merges
+# such a head. Add `escalation-label` to let it clear an escalation label too.
+# signoff_clears: [handoff-clauses, agent-escalate]
+#
 # The trusted reviewer's latest verdict on the head being an escalation turns the check
 # `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`
 # line; this key only overrides it.
