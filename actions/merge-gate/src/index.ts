@@ -645,6 +645,14 @@ async function actOnDecision(octokit: Octokit, owner: string, repo: string, prNu
   core.info(`PR #${prNumber}: ${decision.action} (${decision.code}) — ${decision.reason}`);
   if (dryRun) return false;
 
+  // The reviewer's latest verdict on this head is an escalation: it asked for a
+  // person, so the pipeline never merges it, whoever has approved it since. A
+  // new head, or a later verdict from the reviewer, lifts this.
+  if (decision.action === "merge" && facts.headVerdict === "escalate") {
+    core.info(`PR #${prNumber}: not merged — the reviewer escalated this head to a person, and the pipeline never merges an escalated head`);
+    return false;
+  }
+
   // Reconcile the awaiting-approval label: it is a non-blocking "ready, please
   // approve" marker, so it must come off the moment that stops being true (the
   // PR got approved and moved on, or another reason now applies). Runs before the
@@ -1324,12 +1332,11 @@ export async function runHybridGate(opts: {
         out.conclusion !== "success" &&
         checkVerdict({ ...facts, ciStatus: "passing" }, checkPolicy).conclusion === "success";
       // Say, on the PR, who will merge it — the one thing the result alone does not.
-      // signoff_clears: agent-escalate — the reviewer asked for a person, so a
-      // person merges what they signed off; the pipeline does not.
-      const escalatedToPerson = facts.headVerdict === "escalate" && !!base.signoffClears?.includes("agent-escalate");
+      // The reviewer asked for a person, so a person merges this head (see actOnDecision).
+      const escalatedToPerson = facts.headVerdict === "escalate";
       if (opts.merge === "agent-only" || botWritten?.botWritten) {
         const line = escalatedToPerson
-          ? "Merge: a person merges this PR — the reviewer escalated this head, and the pipeline does not merge an escalation a person signed off."
+          ? "Merge: a person merges this PR — the reviewer escalated this head, and the pipeline never merges an escalated head."
           : onDependabotLane
           ? "Merge: the pipeline merges this PR on the dependabot lane when it is ready."
           : botWritten?.botWritten
@@ -1362,7 +1369,6 @@ export async function runHybridGate(opts: {
 
       // Acting is for the pipeline's own PRs only, and one merge per run.
       if (mergedPr) continue;
-      if (escalatedToPerson) continue;
       if (botWritten?.botWritten) {
         // A separate grant from merge="agent-only": only the bots merge_bots names.
         if (!botMerges) continue;

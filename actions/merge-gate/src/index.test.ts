@@ -1329,6 +1329,24 @@ describe("sign-off on an agent ESCALATE (signoff_clears)", () => {
     expect(c.output.text).toContain("Merge: a person merges this PR — the reviewer escalated this head");
   });
 
+  it("…nor an escalated head a person approved, with or without the setting, in either gate", async () => {
+    const c = await evaluate({ reviews: signedOffEscalate }, "", "agent-only");
+    expect(c.conclusion).toBe("action_required");
+    expect(c.output.text).toContain("the pipeline never merges an escalated head");
+    expect(methods()).not.toContain("pulls.merge");
+    // The original gate (no merge=, mode merge).
+    setup({ reviews: signedOffEscalate });
+    inputs.mode = "";
+    await run();
+    expect(failures).toEqual([]);
+    expect(methods()).not.toContain("pulls.merge");
+    // A later approval from the reviewer itself lifts it.
+    setup({ reviews: [...signedOffEscalate, botVerdict("APPROVE", 3)] });
+    inputs.mode = "";
+    await run();
+    expect(methods()).toContain("pulls.merge");
+  });
+
   it("rejects an entry a sign-off cannot clear", async () => {
     setup({}, "signoff_clears: [ci-not-passing]\n");
     delete inputs.mode;

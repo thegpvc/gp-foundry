@@ -46,6 +46,14 @@ disqualifying first:
    review is "changes requested", else `changes-requested`. Without it the latest
    verdict wins, so the bot's later approval overrides a teammate's block.
 
+<a id="escalated-heads-are-never-merged"></a>
+**Escalated heads are never merged.** When the trusted reviewer's latest verdict on
+the head is an escalation, the gate does not merge it in any mode (`mode: merge`,
+`merge: agent-only`, `merge_bots`), even after a trusted person formally approves
+that head: the reviewer asked for a person, and that person merges. A new head, or
+a later verdict from the reviewer, lifts it. (Before 0.9.0 a trusted person's
+approval of an escalated head let the pipeline merge its own PR.)
+
 An **escalation label** (`escalationLabels: [...]`) is checked first, right after
 blocking labels and in both lanes: a PR carrying one is never merged (`escalated`),
 and in evaluate mode its check is `action_required` whether or not the approver
@@ -251,9 +259,9 @@ verdict is never answered by an approval. The check keeps the verdict and names
 the sign-off ("ESCALATE, signed off by @person on abc1234"); the reviewer's reasons
 stay in its review. An unknown entry fails the run.
 
-Merging: with `agent-escalate` listed, the gate does not merge a head whose latest
-verdict is an escalation, under `merge: agent-only` or `merge_bots`. The person who
-signed it off merges it.
+Merging never reads this either: the gate never merges an escalated head (see
+[Escalated heads are never merged](#escalated-heads-are-never-merged)). The person
+who signed it off merges it.
 
 ## Evaluate mode
 
