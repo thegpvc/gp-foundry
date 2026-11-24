@@ -136,8 +136,8 @@ export interface PullRequestFacts {
     reviewer: string;
     sha: string;
     /**
-     * The most recent of those approvals that can answer the reviewer's
-     * escalation: from a person with a sign-off association (not another bot),
+     * The most recent of those approvals that can answer an escalation (the
+     * reviewer's verdict, or an escalation label): from a person with a sign-off association (not another bot),
      * with no change request from anyone after it.
      */
     person?: string;
@@ -933,8 +933,10 @@ export interface CheckVerdict {
  * `agent-escalate`: a person's sign-off (PullRequestFacts.signoff.person) answers
  * the reviewer's ESCALATE on this head, and stands in for the approval the
  * reviewer withheld: `not-approved` is cleared with it, on the sign-off's own
- * trust rule, whoever the approval clause trusts. `escalation-label`: it clears
- * the label's hold. Every other clause still decides the result.
+ * trust rule, whoever the approval clause trusts. `escalation-label`: a person's
+ * sign-off clears the label's hold too. Both say "a person must look", so both
+ * need a person; another bot's approval signs off a handoff clause only.
+ * Every other clause still decides the result.
  * Merging never reads this: see evaluateMergeGate.
  */
 export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, nowMs: number = Date.now()): CheckVerdict {
@@ -946,7 +948,7 @@ export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, now
   const agentEscalated = pr.headVerdict === "escalate";
   const escalationSignedOff = agentEscalated && clears.has("agent-escalate") && !!pr.signoff?.person;
   const signedOff = failing.filter(
-    (d) => (clears.has("handoff-clauses") && handoffs.includes(d)) || (clears.has("escalation-label") && d === label),
+    (d) => (clears.has("handoff-clauses") && handoffs.includes(d)) || (clears.has("escalation-label") && d === label && !!pr.signoff?.person),
   );
   const outstanding = handoffs.filter((d) => !signedOff.includes(d));
   // An answered escalation is the approval for this head.
