@@ -829,7 +829,7 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
     verdict.escalationSignedOff
       ? `${escalateWord}, signed off by @${facts.signoff!.person} on \`${facts.signoff!.sha.slice(0, 7)}\`: the reviewer escalated this head to a person, and a person approved it. The reviewer's reasons are in its review.`
       : "",
-    signedOff.length > handoffsSigned.length ? `Escalation label \`${escalationLabel(facts, policy)}\` signed off ${by}.` : "",
+    signedOff.length > handoffsSigned.length ? `Escalation label \`${escalationLabel(facts, policy)}\` signed off by @${facts.signoff!.person} on \`${facts.signoff!.sha.slice(0, 7)}\`.` : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -838,7 +838,7 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
     : conclusion === "action_required"
       ? "Escalated: a human decides"
       : conclusion === "success"
-        ? signed ? `Ready to merge — signed off by @${(verdict.escalationSignedOff && facts.signoff!.person) || facts.signoff!.reviewer}` : "Ready to merge"
+        ? signed ? `Ready to merge — signed off by @${((verdict.escalationSignedOff || signedOff.length > handoffsSigned.length) && facts.signoff!.person) || facts.signoff!.reviewer}` : "Ready to merge"
         : conclusion === "neutral"
           ? "Awaiting the approver"
           : `Not ready: ${decision.code}`;

@@ -1488,6 +1488,11 @@ describe("checkVerdict: signoff_clears", () => {
     const both = checkVerdict(held, { ...labels, signoffClears: ["agent-escalate", "escalation-label"] }, NOW);
     expect(both.conclusion).toBe("success");
     expect(both.signedOff.map((d) => d.code)).toEqual(["escalated"]);
+    // Another bot's sign-off (no person) clears neither (#63).
+    const app = escalate({ signoff: { reviewer: "review-app[bot]", sha: "abc1234def" }, labels: ["hold"], headVerdict: "approve" });
+    const byApp = checkVerdict(app, { ...labels, signoffClears: ["agent-escalate", "escalation-label"] }, NOW);
+    expect(byApp.conclusion).toBe("action_required");
+    expect(byApp.signedOff).toEqual([]);
     // The label cleared, the reviewer's escalation not.
     expect(checkVerdict(held, { ...labels, signoffClears: ["escalation-label"] }, NOW).conclusion).toBe("action_required");
   });

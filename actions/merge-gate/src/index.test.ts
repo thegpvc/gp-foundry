@@ -1315,6 +1315,38 @@ describe("sign-off on an agent ESCALATE (signoff_clears)", () => {
     expect((await evaluate(world, "signoff_clears: [escalation-label]\n" + labels)).conclusion).toBe("action_required");
   });
 
+  // #63: the label and the verdict both say "a person must look" — same bar.
+  describe("escalation-label needs a person, like agent-escalate", () => {
+    const BOTH = "signoff_clears: [agent-escalate, escalation-label]\nescalation_labels: [hold]\n";
+    const app = (n: number) => ({ ...formal("review-app[bot]", "APPROVED", n), author_association: "NONE" });
+    const labelled = (reviews: object[]) => evaluate({ labels: ["hold"], reviews, reviewDecision: null } as Partial<World>, BOTH);
+
+    it("another App's approval does not clear the label, on an approved or an escalated head", async () => {
+      const c = await labelled([botVerdict("APPROVE", 1), app(2)]);
+      expect(c.conclusion).toBe("action_required");
+      expect(c.output.summary).not.toContain("signed off by");
+      expect((await labelled([botVerdict("ESCALATE", 1), app(2)])).conclusion).toBe("action_required");
+    });
+
+    it("a trusted person's approval does, and the check names the person even when an App approved later", async () => {
+      const c = await labelled([botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2), app(3)]);
+      expect(c.conclusion).toBe("success");
+      expect(c.output.title).toBe("Ready to merge — signed off by @bob");
+      expect(c.output.summary).toContain("Escalation label `hold` signed off by @bob on `aaaaaaa`");
+      expect((await labelled([botVerdict("ESCALATE", 1), formal("bob", "APPROVED", 2)])).conclusion).toBe("success");
+    });
+
+    it("a change request from anyone after it withdraws it", async () => {
+      const c = await labelled([botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2), { ...formal("stranger", "CHANGES_REQUESTED", 3), author_association: "NONE" }]);
+      expect(c.conclusion).not.toBe("success");
+    });
+
+    it("a person without a sign-off association does not clear it", async () => {
+      const outsider = { ...formal("stranger", "APPROVED", 2), author_association: "CONTRIBUTOR" };
+      expect((await labelled([botVerdict("APPROVE", 1), outsider])).conclusion).toBe("action_required");
+    });
+  });
+
   it("omitting handoff-clauses stops a sign-off clearing a policy handoff", async () => {
     const policy = "protected_paths: [src/]\nhandoff_clauses: [protected-path]\n";
     const world = { reviews: [botVerdict("APPROVE", 1), formal("bob", "APPROVED", 2)] };

@@ -252,10 +252,16 @@ signoff_clears: [handoff-clauses, agent-escalate]   # optionally also: escalatio
   `trustedAuthorAssociations: []` (only the agent's verdict is an approval) a
   person can still answer an escalation, and still cannot override the agent's
   `REQUEST_CHANGES`.
-- `escalation-label` — a sign-off also clears an escalation label (`escalationLabels`).
-  Left out, the label holds until it is removed, sign-off or not. List it when
+- `escalation-label` — a sign-off also clears an escalation label (`escalationLabels`),
+  under the same two conditions as `agent-escalate`: a person's, with no change
+  request from anyone after it. Left out, the label holds until it is removed,
+  sign-off or not. List it when
   automation applies the label on every `ESCALATE`.
 - `handoff-clauses` — the handoffs. Leave it out and a sign-off no longer clears them.
+  This is the one thing another bot can sign off: a formal approval of the head from
+  any other App on the repo clears a handoff clause, and a later change request
+  does not withdraw it (GitHub's review decision still has to be met). An
+  escalation, by verdict or by label, always needs a person.
 
 Who may sign off is `signoffAuthorAssociations`. Unset, it is
 `trustedAuthorAssociations` when that names any association, else OWNER, MEMBER,
