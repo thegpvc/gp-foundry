@@ -1347,6 +1347,58 @@ describe("sign-off on an agent ESCALATE (signoff_clears)", () => {
     expect(methods()).toContain("pulls.merge");
   });
 
+  // #61: a consumer where only the agent's verdict is an approval
+  // (trusted_author_associations: []) can still let a person answer an escalation.
+  describe("with trusted_author_associations: [] — only the agent's verdict approves", () => {
+    const ONLY_AGENT = "trusted_author_associations: []\nsignoff_clears: [agent-escalate]\n";
+
+    it("a member's formal approval of the escalated head answers it", async () => {
+      const c = await evaluate({ reviews: signedOffEscalate }, ONLY_AGENT);
+      expect(c.conclusion).toBe("success");
+      expect(c.output.title).toBe("Ready to merge — signed off by @bob");
+      expect(c.output.summary).toContain("ESCALATE, signed off by @bob on `aaaaaaa`");
+    });
+
+    it("…not one of an earlier head, nor from the harness, the PR's author, or a non-member", async () => {
+      expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), formal("bob", "APPROVED", 2, "b".repeat(40))] }, ONLY_AGENT)).conclusion).toBe("action_required");
+      expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), formal(BOT, "APPROVED", 2)] }, ONLY_AGENT)).conclusion).toBe("action_required");
+      expect((await evaluate({ author: { login: "alice", type: "User" }, reviews: [botVerdict("ESCALATE", 1), formal("alice", "APPROVED", 2)] }, ONLY_AGENT)).conclusion).toBe("action_required");
+      const outsider = { ...formal("stranger", "APPROVED", 2), author_association: "CONTRIBUTOR" };
+      expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), outsider], reviewDecision: null }, ONLY_AGENT)).conclusion).toBe("action_required");
+    });
+
+    it("someone's later change request withdraws the answer; an earlier one does not", async () => {
+      const later = await evaluate({ reviews: [...signedOffEscalate, formal("carol", "CHANGES_REQUESTED", 3)], reviewDecision: null }, ONLY_AGENT);
+      expect(later.conclusion).not.toBe("success");
+      const earlier = await evaluate({ reviews: [formal("carol", "CHANGES_REQUESTED", 1), botVerdict("ESCALATE", 2), formal("bob", "APPROVED", 3)], reviewDecision: null }, ONLY_AGENT);
+      expect(earlier.conclusion).toBe("success");
+    });
+
+    it("a sign-off does not answer the agent's request for changes, and a member's approval is not an approval", async () => {
+      const c = await evaluate({ reviews: [botVerdict("REQUEST_CHANGES", 1), formal("bob", "APPROVED", 2)] }, ONLY_AGENT);
+      expect(c.conclusion).toBe("failure");
+      expect(c.output.title).toBe("Not ready: not-approved");
+    });
+
+    it("the agent's own approval still passes, and the setting without agent-escalate changes nothing", async () => {
+      expect((await evaluate({ reviews: [botVerdict("APPROVE", 1)] }, ONLY_AGENT)).conclusion).toBe("success");
+      expect((await evaluate({ reviews: signedOffEscalate }, "trusted_author_associations: []\nsignoff_clears: [handoff-clauses]\n")).conclusion).toBe("action_required");
+    });
+
+    it("still never merged by the gate", async () => {
+      const c = await evaluate({ reviews: signedOffEscalate }, ONLY_AGENT, "agent-only");
+      expect(c.conclusion).toBe("success");
+      expect(methods()).not.toContain("pulls.merge");
+    });
+  });
+
+  it("signoff_author_associations chooses who may sign off, apart from who may approve", async () => {
+    const owners = "signoff_clears: [agent-escalate]\nsignoff_author_associations: [OWNER]\n";
+    expect((await evaluate({ reviews: signedOffEscalate }, owners)).conclusion).toBe("action_required");
+    const owner = { ...formal("dana", "APPROVED", 2), author_association: "OWNER" };
+    expect((await evaluate({ reviews: [botVerdict("ESCALATE", 1), owner] }, "trusted_author_associations: []\n" + owners)).conclusion).toBe("success");
+  });
+
   it("rejects an entry a sign-off cannot clear", async () => {
     setup({}, "signoff_clears: [ci-not-passing]\n");
     delete inputs.mode;

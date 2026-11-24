@@ -1439,7 +1439,7 @@ describe("checkVerdict: policy handoffs", () => {
 });
 
 describe("checkVerdict: signoff_clears", () => {
-  const signoff = { reviewer: "bob", sha: "abc1234def" };
+  const signoff = { reviewer: "bob", sha: "abc1234def", person: "bob" };
   const escalate = (over: Partial<PullRequestFacts> = {}) => readyPr({ escalated: true, headVerdict: "escalate", ...over });
   const on: MergePolicy = { ...policy, signoffClears: ["handoff-clauses", "agent-escalate"] };
 
@@ -1460,10 +1460,25 @@ describe("checkVerdict: signoff_clears", () => {
     expect(red.decision.code).toBe("ci-not-passing");
   });
 
-  it("only while the approval clause passes: no trusted approval, no answer", () => {
+  it("stands in for the approval the reviewer withheld, whoever the approval clause trusts (#61)", () => {
     const v = checkVerdict(escalate({ signoff, approvedAt: null }), on, NOW);
+    expect(v.conclusion).toBe("success");
+    expect(v.decision.code).toBe("ready-to-merge");
+    const red = checkVerdict(escalate({ signoff, approvedAt: null, ciStatus: "failing" }), on, NOW);
+    expect(red.decision.code).toBe("ci-not-passing");
+  });
+
+  it("only a person's sign-off answers it: another bot's, or one with a later change request, does not", () => {
+    const v = checkVerdict(escalate({ signoff: { reviewer: "review-app[bot]", sha: "abc1234def" } }), on, NOW);
     expect(v.conclusion).toBe("action_required");
     expect(v.escalationSignedOff).toBe(false);
+  });
+
+  it("never stands in for an approval on a head the reviewer did not escalate", () => {
+    const rejected = checkVerdict(readyPr({ headVerdict: "reject", approvedAt: null, signoff }), on, NOW);
+    expect(rejected.conclusion).toBe("failure");
+    expect(rejected.decision.code).toBe("not-approved");
+    expect(checkVerdict(readyPr({ approvedAt: null, signoff }), on, NOW).decision.code).toBe("not-approved");
   });
 
   it("an escalation label holds unless escalation-label is listed", () => {

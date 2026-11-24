@@ -122,6 +122,13 @@ labels:
 # such a head. Add `escalation-label` to let it clear an escalation label too.
 # signoff_clears: [handoff-clauses, agent-escalate]
 #
+# Who may sign off (a person's association with the repo). Unset: the
+# trusted_author_associations above when it names any, else OWNER, MEMBER,
+# COLLABORATOR. It is separate from who may approve: with
+# `trusted_author_associations: []` only the agent's verdict is an approval, and a
+# person can still sign off a handoff or answer an escalation.
+# signoff_author_associations: [OWNER, MEMBER, COLLABORATOR]
+#
 # The trusted reviewer's latest verdict on the head being an escalation turns the check
 # `action_required` (a human decides). Defaults to the exact `**Verdict:** ESCALATE`
 # line; this key only overrides it.

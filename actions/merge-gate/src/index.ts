@@ -306,10 +306,10 @@ export function signoffCandidates(
   // or another bot (an App installed on the repo). Without this, anyone who can
   // review — read access is enough — could sign off a branch with no review rule.
   trustedAssociations: string[] = ["OWNER", "MEMBER", "COLLABORATOR"],
-): { reviewer: string; at: string }[] {
+): { reviewer: string; at: string; person: boolean }[] {
   const trusted = new Set(trustedAssociations.map((a) => a.toUpperCase()));
-  const eligible = (r: SignoffReview & { login: string }) =>
-    (r.authorType ?? "").toLowerCase() === "bot" || r.login.toLowerCase().endsWith("[bot]") || trusted.has((r.association ?? "").toUpperCase());
+  const isBot = (r: SignoffReview & { login: string }) => (r.authorType ?? "").toLowerCase() === "bot" || r.login.toLowerCase().endsWith("[bot]");
+  const eligible = (r: SignoffReview & { login: string }) => isBot(r) || trusted.has((r.association ?? "").toUpperCase());
   const latest = new Map<string, SignoffReview & { login: string }>();
   for (const r of reviews) {
     const state = (r.state ?? "").toUpperCase();
@@ -321,7 +321,7 @@ export function signoffCandidates(
   return [...latest.values()]
     .filter((r) => r.state === "APPROVED" && r.sha === headSha && !sameLogin(r.login, harness) && !sameLogin(r.login, prAuthor) && eligible(r))
     .sort((a, b) => parseTimestamp(b.at) - parseTimestamp(a.at))
-    .map((r) => ({ reviewer: r.login, at: r.at }));
+    .map((r) => ({ reviewer: r.login, at: r.at, person: !isBot(r) }));
 }
 
 const REVIEW_DECISION_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
@@ -607,7 +607,9 @@ export async function gatherFacts(
       pr.head.sha,
       policy.botLogin,
       authorLogin,
-      policy.trustedAuthorAssociations?.length ? policy.trustedAuthorAssociations : undefined,
+      // Who may sign off is the sign-off's own rule: an empty trusted list means
+      // "only the agent's verdict is an approval", not "nobody may sign off".
+      policy.signoffAuthorAssociations ?? (policy.trustedAuthorAssociations?.length ? policy.trustedAuthorAssociations : undefined),
     );
     if (candidates.length) {
       let decision: string | null | undefined;
@@ -616,7 +618,14 @@ export async function gatherFacts(
       } catch (e) {
         signoffUnavailable = `GitHub's review decision for this PR could not be read (${(e as Error).message}), so ${candidates[0]!.reviewer}'s approval cannot be accepted as a sign-off yet`;
       }
-      if (decision === null || decision === "APPROVED") signoff = { reviewer: candidates[0]!.reviewer, sha: pr.head.sha };
+      if (decision === null || decision === "APPROVED") {
+        // The one that can answer an escalation: a person's, with no change
+        // request (a formal one, or a rejection verdict) from anyone after it.
+        const person = candidates.find(
+          (c) => c.person && !events.some((e) => e.kind === "reject" && parseTimestamp(e.at) > parseTimestamp(c.at)),
+        )?.reviewer;
+        signoff = { reviewer: candidates[0]!.reviewer, sha: pr.head.sha, ...(person ? { person } : {}) };
+      }
       else if (decision !== undefined) {
         signoffUnavailable = `${candidates[0]!.reviewer} approved this head, but GitHub's review requirements are not met yet (review decision: ${decision})`;
       }
@@ -818,7 +827,7 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
         (facts.headVerdict ? ` The reviewer's own verdict on this head stands: ${facts.headVerdict}.` : "")
       : "",
     verdict.escalationSignedOff
-      ? `${escalateWord}, signed off ${by}: the reviewer escalated this head to a person, and a person approved it. The reviewer's reasons are in its review.`
+      ? `${escalateWord}, signed off by @${facts.signoff!.person} on \`${facts.signoff!.sha.slice(0, 7)}\`: the reviewer escalated this head to a person, and a person approved it. The reviewer's reasons are in its review.`
       : "",
     signedOff.length > handoffsSigned.length ? `Escalation label \`${escalationLabel(facts, policy)}\` signed off ${by}.` : "",
   ]
@@ -829,7 +838,7 @@ export function renderCheckOutput(_decision: MergeDecision, facts: PullRequestFa
     : conclusion === "action_required"
       ? "Escalated: a human decides"
       : conclusion === "success"
-        ? signed ? `Ready to merge — signed off by @${facts.signoff!.reviewer}` : "Ready to merge"
+        ? signed ? `Ready to merge — signed off by @${(verdict.escalationSignedOff && facts.signoff!.person) || facts.signoff!.reviewer}` : "Ready to merge"
         : conclusion === "neutral"
           ? "Awaiting the approver"
           : `Not ready: ${decision.code}`;
