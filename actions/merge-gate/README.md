@@ -218,7 +218,7 @@ Opt-in, and only for the check (`merge`, or mode evaluate). `handoffClauses:
 - A **sign-off** clears it: a standing formal `APPROVED` review of the exact head
   commit (that reviewer's latest decisive review — not dismissed, not followed by
   their own change request) from anyone other than `bot-login` — a person with a
-  trusted association (`trustedAuthorAssociations`, by default OWNER, MEMBER,
+  trusted association (`signoffAuthorAssociations`, else `trustedAuthorAssociations`, by default OWNER, MEMBER,
   COLLABORATOR), or another bot — with GitHub's own
   review decision `APPROVED`, or empty where the branch requires no review. That
   decision is how required approvals and code owners are respected. If it cannot be
@@ -243,15 +243,24 @@ signoff_clears: [handoff-clauses, agent-escalate]   # optionally also: escalatio
 ```
 
 - `agent-escalate` — the reviewer's `ESCALATE` on a head is answered by a sign-off
-  on that head. The rule is the handoff sign-off rule, with one more condition: the
-  approval must also satisfy the gate's own approval clause. So it has to come from
-  a person with a trusted association (another bot's approval can sign off a policy
-  handoff, but does not answer an escalation), and it stops counting when anyone
-  requests changes after it. A new head needs a new sign-off.
+  on that head, and the sign-off stands in for the approval the reviewer withheld
+  (`not-approved` is cleared with it). The rule is the handoff sign-off rule, with
+  two more conditions: it has to come from a person (another bot's approval can
+  sign off a policy handoff, but does not answer an escalation), and it stops
+  counting when anyone requests changes after it. A new head needs a new sign-off.
+  This is the sign-off's own trust rule, separate from the approval clause: with
+  `trustedAuthorAssociations: []` (only the agent's verdict is an approval) a
+  person can still answer an escalation, and still cannot override the agent's
+  `REQUEST_CHANGES`.
 - `escalation-label` — a sign-off also clears an escalation label (`escalationLabels`).
   Left out, the label holds until it is removed, sign-off or not. List it when
   automation applies the label on every `ESCALATE`.
 - `handoff-clauses` — the handoffs. Leave it out and a sign-off no longer clears them.
+
+Who may sign off is `signoffAuthorAssociations`. Unset, it is
+`trustedAuthorAssociations` when that names any association, else OWNER, MEMBER,
+COLLABORATOR. Set it to choose who signs off separately from whose approval
+satisfies the approval clause.
 
 A sign-off clears only what is listed. CI, open threads, review requests, change
 requests and blocking labels still decide the result, and a `REQUEST_CHANGES`

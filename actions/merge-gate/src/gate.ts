@@ -132,7 +132,16 @@ export interface PullRequestFacts {
    * review decision met. Gathered only when the policy has something for it to
    * clear (handoff_clauses, or signoff_clears with an escalation on this head).
    */
-  signoff?: { reviewer: string; sha: string };
+  signoff?: {
+    reviewer: string;
+    sha: string;
+    /**
+     * The most recent of those approvals that can answer the reviewer's
+     * escalation: from a person with a sign-off association (not another bot),
+     * with no change request from anyone after it.
+     */
+    person?: string;
+  };
   /** Why a sign-off that looked present could not be accepted (shown on the check). */
   signoffUnavailable?: string;
   /**
@@ -258,6 +267,12 @@ export interface MergePolicy {
    * escalation label. Never affects merging.
    */
   signoffClears?: SignoffClear[];
+  /**
+   * Whose formal approval is a sign-off. Unset: `trustedAuthorAssociations` when
+   * that names any, else OWNER, MEMBER, COLLABORATOR. Set it to choose who may
+   * sign off separately from whose approval satisfies the approval clause.
+   */
+  signoffAuthorAssociations?: string[];
   /**
    * Labels to apply for a given skip outcome. Lets a consumer route skips to
    * the right agent (e.g. needsHuman -> "needs-human", rebase -> "rebase-needed").
@@ -915,10 +930,11 @@ export interface CheckVerdict {
  *
  * What a sign-off clears is `signoffClears` (default: the handoff clauses only,
  * so an escalation from the agent or an escalation label is never cleared).
- * `agent-escalate`: it answers the reviewer's ESCALATE on this head — only while
- * the approval clause passes too, so the approval is one the policy trusts and
- * no later change request stands against it. `escalation-label`: it clears the
- * label's hold. Every other clause still decides the result.
+ * `agent-escalate`: a person's sign-off (PullRequestFacts.signoff.person) answers
+ * the reviewer's ESCALATE on this head, and stands in for the approval the
+ * reviewer withheld: `not-approved` is cleared with it, on the sign-off's own
+ * trust rule, whoever the approval clause trusts. `escalation-label`: it clears
+ * the label's hold. Every other clause still decides the result.
  * Merging never reads this: see evaluateMergeGate.
  */
 export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, nowMs: number = Date.now()): CheckVerdict {
@@ -928,17 +944,18 @@ export function checkVerdict(pr: PullRequestFacts, policy: MergePolicy = {}, now
   const handoffs = failing.filter((d) => handoff.has(d.code));
   const label = failing.find((d) => d.code === "escalated");
   const agentEscalated = pr.headVerdict === "escalate";
-  const escalationSignedOff = agentEscalated && clears.has("agent-escalate") && !failing.some((d) => d.code === "not-approved");
+  const escalationSignedOff = agentEscalated && clears.has("agent-escalate") && !!pr.signoff?.person;
   const signedOff = failing.filter(
     (d) => (clears.has("handoff-clauses") && handoffs.includes(d)) || (clears.has("escalation-label") && d === label),
   );
   const outstanding = handoffs.filter((d) => !signedOff.includes(d));
-  const remaining = failing.filter((d) => !signedOff.includes(d));
+  // An answered escalation is the approval for this head.
+  const remaining = failing.filter((d) => !signedOff.includes(d) && !(escalationSignedOff && d.code === "not-approved"));
   // Held unless every escalation on this head is one the sign-off cleared.
   const escalated =
     !!pr.escalated &&
     !((agentEscalated || !!label) && (!agentEscalated || escalationSignedOff) && (!label || signedOff.includes(label)));
-  const decision: MergeDecision = signedOff.length
+  const decision: MergeDecision = remaining.length < failing.length
     ? (remaining[0] ?? { action: "merge", code: "ready-to-merge", reason: "every clause passes, the rest signed off" })
     : evaluateMergeGate(pr, policy, nowMs);
   const awaiting =
