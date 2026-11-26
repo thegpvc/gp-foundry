@@ -75,9 +75,9 @@ describe("translateApprovals", () => {
   it("the starter policy: every change needs a person, and the losses are named", () => {
     const t = translate(STARTER);
     expect(t.policy).toEqual({ protected_paths: ["**", "**/.claude/**"], handoff_clauses: ["protected-path"] });
-    expect(levels(t, "lossy").join("\n")).toContain("mode: observe has no switch");
-    expect(levels(t, "lossy").join("\n")).toContain("without a passing review Ship falls back to 2 people");
-    expect(levels(t, "lossy").join("\n")).toContain("2 people: gp-foundry's sign-off is one person");
+    expect(levels(t, "stricter").join("\n")).toContain("mode: observe has no switch");
+    expect(levels(t, "looser").join("\n")).toContain("without a passing review Ship falls back to 2 people");
+    expect(levels(t, "looser").join("\n")).toContain("2 people: gp-foundry's sign-off is one person");
     expect(levels(t, "unsupported").join("\n")).toContain("nested: subdirectory policy files");
   });
 
@@ -112,7 +112,7 @@ rules:
       protected_path_exclude_globs: ["services/payments/**/*.md"],
       handoff_clauses: ["protected-path"],
     });
-    expect(levels(t, "lossy").join("\n")).toContain("seats from acme/payments");
+    expect(levels(t, "looser").join("\n")).toContain("seats from acme/payments");
   });
 
   it("size and bot conditions map to max_additions and rollout.bot_authors", () => {
@@ -133,23 +133,54 @@ rules:
     expect(t.config).toEqual({ rollout: { bot_authors: ["dependabot[bot]"] } });
   });
 
-  it("blocks becomes immutable_paths; a condition it cannot read drops the rule and says so", () => {
+  // Fail closed: what gp-foundry cannot read goes to a person, it is not dropped.
+  it("a rule conditioned on a classifier sends its paths to a person, always", () => {
     const t = translate(`
 version: 1
 rules:
-  - purpose: "Nobody edits vendored code through a PR."
-    paths: ["vendor/**"]
-    verdict: { claude: blocks }
-  - purpose: "Risky changes take two."
-    paths: ["**"]
+  - purpose: "Risky billing changes take two."
+    paths: ["services/billing/**"]
     if: "repo/change_risk >= high"
     verdict: { claude: comments, seats: 2 }
     advisory: [repo/change_risk]
 `);
+    expect(t.policy).toEqual({ protected_paths: ["services/billing/**"], handoff_clauses: ["protected-path"] });
+    expect(levels(t, "stricter").join("\n")).toContain('if "repo/change_risk >= high": gp-foundry cannot read that, so any change under services/billing/** goes to a person');
+    expect(levels(t, "looser")).toEqual([]);
+  });
+
+  it("…and so does an unreadable override that raises the bar; one that only relaxes is left out", () => {
+    const raises = translate(`
+version: 1
+rules:
+  - purpose: "Claude approves, unless the change is risky."
+    paths: ["**"]
+    verdict: { claude: approves, seats: 0 }
+    override:
+      - { if: "repo/change_risk >= high", verdict: { claude: comments, seats: 1 } }
+`);
+    expect(raises.policy).toEqual({ protected_paths: ["**"], handoff_clauses: ["protected-path"] });
+    const relaxes = translate(`
+version: 1
+rules:
+  - purpose: "Low-risk docs need nobody."
+    paths: ["docs/**"]
+    if: "repo/change_risk = low"
+    verdict: { claude: approves, seats: 0 }
+`);
+    expect(relaxes.policy).toEqual({});
+    expect(relaxes.notes.map((n) => n.level)).toEqual(["unsupported"]);
+  });
+
+  it("blocks goes to a person and to immutable_paths, and is marked looser: an approval passes what Ship would block", () => {
+    const t = translate(`version: 1\nrules:\n  - { purpose: "Nobody edits vendored code through a PR.", paths: ["vendor/**"], verdict: { claude: blocks } }\n`);
     expect(t.immutablePaths).toEqual(["vendor/**"]);
-    expect(t.policy).toEqual({});
-    expect(levels(t, "unsupported").join("\n")).toContain('if "repo/change_risk >= high"');
-    expect(levels(t, "unsupported").join("\n")).toContain("advisory repo/change_risk");
+    expect(t.policy).toEqual({ protected_paths: ["vendor/**"], handoff_clauses: ["protected-path"] });
+    expect(t.notes.map((n) => n.level)).toEqual(["looser"]);
+  });
+
+  it("every note says which way it differs", () => {
+    for (const n of translate(STARTER).notes) expect(["mapped", "stricter", "looser", "unsupported"]).toContain(n.level);
   });
 });
 

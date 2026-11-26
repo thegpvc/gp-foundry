@@ -8,7 +8,12 @@
  * (`seats`) and whether Claude may (`verdict.claude`), from rules with
  * conditions. gp-foundry has one policy for the PR: the approver's verdict, a
  * size limit, protected paths, and a person's sign-off on a handoff. So this is
- * a translation with losses, and every loss is reported — see docs/plans/
+ * a translation with losses, and every loss is reported.
+ *
+ * The rule for a loss: fail closed. A rule gp-foundry cannot read (a classifier,
+ * a compound condition) is not dropped — its paths go to a person, always. The
+ * result may ask for more than the Ship policy; it should not ask for less. The
+ * places where it still can are marked `looser`. See docs/plans/
  * 2026-11-26-claude-ship-inputs.md for the mapping and what a native evaluator
  * would take.
  */
@@ -173,8 +178,13 @@ export function classifyCondition(text: string): Condition {
 // ── the translation ──
 
 export interface ShipNote {
-  /** `mapped`: carried over. `lossy`: carried over with a stated difference. `unsupported`: dropped. */
-  level: "mapped" | "lossy" | "unsupported";
+  /**
+   * `mapped`: carried over. `stricter`: carried over failing closed — gp-foundry
+   * asks for at least what the rule does, sometimes more. `looser`: gp-foundry
+   * can ask for less than the rule; needs something outside the policy to close.
+   * `unsupported`: not carried over, and safe to leave out.
+   */
+  level: "mapped" | "stricter" | "looser" | "unsupported";
   /** The rule's purpose, or `policy` for a file-level note. */
   where: string;
   message: string;
@@ -211,7 +221,7 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
 
   if (ship.mode === "observe") {
     notes.push({
-      level: "lossy",
+      level: "stricter",
       where: "policy",
       message:
         "mode: observe has no switch in gp-foundry. The equivalent is to run the gate with merge=\"off\" and leave its check out of the branch's required checks: it reports and blocks nothing.",
@@ -230,7 +240,7 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
       note(
         "unsupported",
         key === "reuse"
-          ? "reuse: gp-foundry never carries a verdict or a sign-off across a push — both are for the exact head. Stricter than this rule asks."
+          ? "reuse: gp-foundry never carries a verdict or a sign-off across a push — both are for the exact head, which is at least what this rule asks."
           : key === "findings"
             ? "findings: who may close a finding has no equivalent. The nearest clause is require_no_open_threads, which holds a PR while any review thread is unanswered."
             : `${key}: subdirectory policy files and classifier start order are not read.`,
@@ -251,15 +261,23 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
     const needsPerson = people(settled) > 0;
 
     const ruleCondition = rule.if ? classifyCondition(rule.if) : undefined;
+    const rulePatterns = rule.paths.filter((p) => !p.startsWith("!"));
+    /** Fail closed: these paths go to a person whenever they change. */
+    const toAPerson = (why: string) => {
+      rulePatterns.forEach((p) => protectedPaths.add(p));
+      handoffs.add("protected-path");
+      note("stricter", `${why} gp-foundry cannot read that, so ${isCatchAll(rule) ? "every change" : `any change under ${rulePatterns.join(", ")}`} goes to a person (protected_paths + the protected-path handoff), whether or not the condition holds.`);
+    };
     if (ruleCondition?.kind === "other") {
-      note("unsupported", `if "${ruleCondition.text}": gp-foundry's policy cannot read this condition, so the rule is left out. Until it is expressed some other way the translated policy asks for less than this one.`);
+      if (needsPerson || settled.claude !== "approves") toAPerson(`if "${ruleCondition.text}":`);
+      else note("unsupported", `if "${ruleCondition.text}": gp-foundry cannot read this condition. The rule only lets Claude approve alone, so leaving it out asks for nothing less.`);
       continue;
     }
 
     if (ruleCondition?.kind === "bot-authored") {
       bots.add(ruleCondition.bot);
       note(
-        needsPerson ? "lossy" : "mapped",
+        needsPerson ? "looser" : "mapped",
         needsPerson
           ? `PRs written by ${ruleCondition.bot} come into scope (rollout.bot_authors). This rule also asks for a person on them, which gp-foundry cannot require for one author only.`
           : `PRs written by ${ruleCondition.bot} come into scope (rollout.bot_authors): the approver's verdict decides them, with no person required. Merging them is a separate grant, merge_bots= on the gate.`,
@@ -271,7 +289,7 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
       if (needsPerson || settled.claude !== "approves") {
         maxAdditions = Math.min(maxAdditions ?? Infinity, ruleCondition.lines);
         handoffs.add("too-large");
-        note("lossy", `a change over ${ruleCondition.lines} lines needs a person (max_additions + the too-large handoff). Ship counts every changed line across the PR; gp-foundry counts hand-written additions only, and for the whole PR rather than this rule's paths.`);
+        note("looser", `a change over ${ruleCondition.lines} lines needs a person (max_additions + the too-large handoff). Ship counts every changed line across the PR; gp-foundry counts hand-written additions only, and for the whole PR rather than this rule's paths.`);
       }
       continue;
     }
@@ -280,12 +298,10 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
     const ruleExcludes = rule.paths.filter((p) => p.startsWith("!")).map((p) => p.slice(1));
 
     if (settled.claude === "blocks") {
-      if (isCatchAll(rule)) {
-        note("unsupported", "claude: blocks on every path would fail every PR: left out.");
-        continue;
-      }
-      patterns.forEach((p) => immutable.add(p));
-      note("lossy", "claude: blocks → scope.yaml immutable_paths. That stops the pipeline's own agents changing these paths and fails their PRs; a person's PR touching them is not failed by the gate.");
+      if (!isCatchAll(rule)) patterns.forEach((p) => immutable.add(p));
+      patterns.forEach((p) => protectedPaths.add(p));
+      handoffs.add("protected-path");
+      note("looser", `claude: blocks fails the check whatever anyone approves. gp-foundry has no clause that a sign-off cannot clear, so ${isCatchAll(rule) ? "every change goes" : "these paths go"} to a person (protected_paths)${isCatchAll(rule) ? "" : ", and scope.yaml immutable_paths stops the pipeline's own agents changing them"}. A person's approval passes what Ship would block.`);
       continue;
     }
 
@@ -294,20 +310,20 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
       ruleExcludes.forEach((p) => excludes.add(p));
       handoffs.add("protected-path");
       note("mapped", `${isCatchAll(rule) ? "every change" : `a change under ${patterns.join(", ")}`} needs a person: protected_paths + the protected-path handoff. The check reads "A person decides" until a trusted person formally approves that exact head.`);
-      if (ruleExcludes.length) note("lossy", `the exclusions (${ruleExcludes.join(", ")}) become protected_path_exclude_globs, which apply to every protected path, not this rule only.`);
+      if (ruleExcludes.length) note("looser", `the exclusions (${ruleExcludes.join(", ")}) become protected_path_exclude_globs, which apply to every protected path, not this rule only.`);
       const n = people(settled);
-      if (n > 1) note("lossy", `${n} people: gp-foundry's sign-off is one person. Require ${n} approvals in the branch's GitHub rules — the sign-off only stands once GitHub's own review decision is met.`);
+      if (n > 1) note("looser", `${n} people: gp-foundry's sign-off is one person. Require ${n} approvals in the branch's GitHub rules — the sign-off only stands once GitHub's own review decision is met.`);
       const named = settled.seats.flatMap((s) => s.from).filter((f) => !["humans", "!pr/authors", "everyone"].includes(f));
-      if (named.length) note("lossy", `seats from ${[...new Set(named)].join(", ")}: gp-foundry trusts a sign-off by repository association (signoff_author_associations), not by team or login. Use CODEOWNERS with required code-owner review for this.`);
-      if (settled.seats.some((s) => !s.from.includes("!pr/authors"))) note("lossy", "this rule lets the PR's author fill a seat; a gp-foundry sign-off never comes from the PR's author.");
+      if (named.length) note("looser", `seats from ${[...new Set(named)].join(", ")}: gp-foundry trusts a sign-off by repository association (signoff_author_associations), not by team or login. Use CODEOWNERS with required code-owner review for this.`);
+      if (settled.seats.some((s) => !s.from.includes("!pr/authors"))) note("stricter", "this rule lets the PR's author fill a seat; a gp-foundry sign-off never comes from the PR's author.");
     } else if (settled.claude === "approves") {
       note("mapped", `${isCatchAll(rule) ? "every change" : patterns.join(", ")}: Claude's approval is enough — the approver's APPROVE verdict already satisfies the gate.`);
     } else {
-      note("lossy", "claude: comments with no seats passes with no approval at all in Ship; gp-foundry's gate still needs the approver's APPROVE (or a trusted person's approval).");
+      note("stricter", "claude: comments with no seats passes with no approval at all in Ship; gp-foundry's gate still needs the approver's APPROVE (or a trusted person's approval).");
     }
 
     if (onPass && (people(rule.verdict) > people(onPass) || rule.verdict.claude !== onPass.claude)) {
-      note("lossy", `without a passing review Ship falls back to ${people(rule.verdict)} people and "${rule.verdict.claude ?? "no"}" from Claude. gp-foundry has one path: a head the approver has not approved is not-approved, unless a trusted person's formal approval stands in (trusted_author_associations).`);
+      note(people(rule.verdict) > 1 ? "looser" : "stricter", `without a passing review Ship falls back to ${people(rule.verdict)} people and "${rule.verdict.claude ?? "no"}" from Claude. gp-foundry has one path: a head the approver has not approved is not-approved, unless a trusted person's formal approval stands in (trusted_author_associations).`);
     }
     for (const o of rule.override) {
       const c = classifyCondition(o.if);
@@ -315,12 +331,14 @@ export function translateApprovals(ship: ShipPolicy): ShipTranslation {
       if (c.kind === "larger-than" && o.verdict && people(o.verdict) > 0) {
         maxAdditions = Math.min(maxAdditions ?? Infinity, c.lines);
         handoffs.add("too-large");
-        note("lossy", `override over ${c.lines} lines → max_additions + the too-large handoff (hand-written additions, whole PR).`);
+        note("looser", `override over ${c.lines} lines → max_additions + the too-large handoff (hand-written additions, whole PR).`);
       } else if (c.kind === "bot-authored") {
         bots.add(c.bot);
-        note("lossy", `override for ${c.bot} → rollout.bot_authors brings its PRs into scope; a different seat count for one author is not expressible.`);
+        note("stricter", `override for ${c.bot} → rollout.bot_authors brings its PRs into scope; a different seat count for one author is not expressible, so the rule's own verdict applies to them too.`);
+      } else if (o.verdict && (o.verdict.claude === "blocks" || people(o.verdict) > people(settled)) && !needsPerson) {
+        toAPerson(`override if "${o.if}" raises the bar.`);
       } else {
-        note("unsupported", `override if "${o.if}": not readable by gp-foundry's policy; the rule's own verdict is what was translated.`);
+        note(needsPerson ? "stricter" : "unsupported", `override if "${o.if}": gp-foundry cannot read this condition; the rule's own verdict was translated${needsPerson ? ", which already sends these paths to a person" : ", and the override does not ask for more"}.`);
       }
     }
   }

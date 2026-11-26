@@ -6,6 +6,27 @@ A repo that already describes its review and approval rules for Claude Ship shou
 to describe them again for gp-foundry. This plan says which of Ship's files gp-foundry can
 read, what each one maps to, what does not map, and the order to build it in.
 
+## Premise and guiding principle
+
+**Premise.** A repo runs one or the other. Where gp-foundry is in use, Ship is off. So this
+is not about the two cooperating on one PR; it is about a repo moving between them, or a
+team using both across repos, without rewriting its rules.
+
+**Principle: the same files mean the same thing.** A repo's `REVIEW.md` and
+`.claude/approvals.yml` are its statement of how changes get reviewed and who must approve.
+gp-foundry reads them as written and gives the answer Ship would, as far as it can. Three
+commitments follow:
+
+1. **Ship's files are the format.** gp-foundry reads them in place and does not ask for a
+   second copy in its own dialect. Its own policy file stays for what Ship has no word for
+   (merging, CI, the pipeline's rollout).
+2. **Where gp-foundry cannot give Ship's answer, it gives a stricter one.** A rule it cannot
+   read sends its paths to a person; it is never dropped. Compatibility that is quietly
+   weaker is worse than none.
+3. **Every difference is stated, with its direction.** The tool marks each rule `mapped`,
+   `stricter`, `looser` or not carried, so a team can see exactly where the two disagree.
+   `looser` is the list of compatibility bugs: the build order below exists to empty it.
+
 ---
 
 ## What Claude Ship is, and which files it reads
@@ -45,37 +66,34 @@ gp-foundry decides **per PR**, with a fixed set of clauses: the approver's verdi
 (APPROVE / REQUEST_CHANGES / ESCALATE), CI, size (`max_additions`), protected paths, open
 threads, and a person's sign-off on a handoff clause or an escalation.
 
-So a Ship policy is strictly more expressive. Reading one is a translation with losses.
+So a Ship policy is strictly more expressive. Reading one is a translation, and where the
+translation cannot be exact it has to err on the strict side.
 
 ### The mapping (what the POC implements)
 
-| Ship | gp-foundry | Fidelity |
+| Ship | gp-foundry | Compared with Ship |
 | --- | --- | --- |
-| `claude: approves`, `seats: 0` | nothing to set: the approver's APPROVE satisfies the gate | exact |
-| `seats ≥ 1` on `paths` | `protected_paths` + `handoff_clauses: [protected-path]`; a trusted person's formal approval of the head signs it off | exact for one person |
-| `seats ≥ 1` on `**` | `protected_paths: ["**"]` — every PR needs a person | exact for one person |
-| `"!pattern"` in `paths` | `protected_path_exclude_globs` | lossy: global, not per rule |
-| `seats: N`, N > 1 | one sign-off; require N approvals in GitHub's branch rules (the sign-off waits for GitHub's review decision) | lossy |
-| seats `from` a team or login | `signoff_author_associations` is by association only; point at CODEOWNERS | lossy |
-| seats without `"!pr/authors"` | a sign-off never comes from the PR's author | lossy (stricter) |
-| `if`/override `claude/code_review = pass` | the approver's APPROVE verdict | exact |
-| the rule's stricter fallback when the review does not pass | `not-approved`, or a trusted person's approval standing in | lossy |
-| `if`/override `pr/diff_lines > N` raising the bar | `max_additions: N` + `handoff_clauses: [too-large]` | lossy: hand-written additions, whole PR |
-| `if: "ALL pr/authors = bot:x"` | `rollout.bot_authors: ["x[bot]"]` | exact when the rule asks for no person |
-| `claude: blocks` on paths | `scope.yaml` `immutable_paths` | lossy: stops agents, not people's PRs |
-| `mode: observe` | run the gate with `merge="off"` and do not require its check | lossy: no per-file switch |
-| `advisory: [claude/code_review]` | the reviewer lane | exact |
-| `locals`, `use`, `"@name"` | resolved before translating | exact |
+| `claude: approves`, `seats: 0` | nothing to set: the approver's APPROVE satisfies the gate | same |
+| `seats ≥ 1` on `paths` (or on `**`) | `protected_paths` + `handoff_clauses: [protected-path]`; a trusted person's formal approval of the head signs it off | same, for one person |
+| `if`/override `claude/code_review = pass` | the approver's APPROVE verdict | same |
+| `if: "ALL pr/authors = bot:x"`, no person asked | `rollout.bot_authors: ["x[bot]"]` | same |
+| `advisory: [claude/code_review]` | the reviewer lane | same |
+| `locals`, `use`, `"@name"` | resolved before translating | same |
+| seats without `"!pr/authors"` | a sign-off never comes from the PR's author | stricter |
+| `reuse` | a verdict and a sign-off are for the exact head | stricter |
+| `mode: observe` | no switch; run the gate with `merge="off"`, check not required | stricter |
+| a rule or a bar-raising override conditioned on something unreadable (a classifier, `AND`/`OR`, `pr/base`, …) | its paths go to a person, always | stricter (fail closed) |
+| `seats: N`, N > 1 | one sign-off | **looser**, unless GitHub's branch rules require N approvals |
+| seats `from` a team or login | any person with a sign-off association | **looser**, unless CODEOWNERS review is required |
+| `"!pattern"` in `paths` | `protected_path_exclude_globs`, which apply to every protected path | **looser** |
+| `pr/diff_lines > N` raising the bar | `max_additions: N` + `handoff_clauses: [too-large]` (hand-written additions only) | **looser** |
+| `claude: blocks` | paths go to a person + `scope.yaml` `immutable_paths` | **looser**: an approval passes what Ship would fail |
 
-### What has no equivalent today
+### Not carried over
 
-- **Custom classifiers** (`repo/<name>`, `.claude/classifiers/`). A rule conditioned on one is
-  dropped, and the translated policy then asks for *less* than the Ship policy. The tool says
-  so on each such rule. The nearest gp-foundry thing is an analyst lane, which cannot feed the gate.
-- **Compound conditions** (`AND`, `OR`, parentheses), `pr/base`, `pr/files_changed`, `pr/opened_by`,
-  `pr/approved_by`.
-- **`reuse`** (keeping an approval across a push that does not change intent). gp-foundry is
-  stricter: a verdict and a sign-off are for the exact head.
+- **Custom classifiers** (`repo/<name>`, `.claude/classifiers/`) are not run. Rules that read
+  one fail closed, as above; a rule that only relaxes on one is left out, which asks for
+  nothing less. The nearest gp-foundry thing is an analyst lane, which cannot feed the gate.
 - **`findings`** (who may close a finding). Nearest: `require_no_open_threads`.
 - **`max_age`**, **`nested`** and subdirectory policy files, **`run`**.
 - **Fork rules** and the `@claude approve` / `approvals rerun` / `approvals resolve` comment commands.
@@ -101,11 +119,14 @@ only) are left for later.
 
 ## Build order
 
+The order follows the principle: read the files in place first, then remove the `looser`
+rows one at a time.
+
 **Phase 1 — a read-only translator (this POC).** `gp-foundry ship [--dir] [--json]` reads
 `.claude/approvals.yml` and `REVIEW.md` and prints the merge-policy keys, the config and
-scope settings, and a note for every rule marked mapped, lossy or unsupported. It writes
-nothing. Code: `src/ship/approvals.ts`, `src/ship/review-md.ts`, `src/cli/ship.ts`; tests in
-`src/ship/ship.test.ts` use the policy examples from Ship's docs.
+scope settings, and a note for every rule: mapped, stricter, looser or not carried. It
+writes nothing. Code: `src/ship/approvals.ts`, `src/ship/review-md.ts`, `src/cli/ship.ts`;
+tests in `src/ship/ship.test.ts` use the policy examples from Ship's docs.
 
 **Phase 2 — `REVIEW.md` at run time.** A `pr-review` node attribute (say `review_md=true`,
 default off) makes the lane's context step resolve `REVIEW.md` from the **base branch** and
@@ -113,33 +134,41 @@ append it to the role's prompt, under a short preamble that maps severity to the
 Base branch only, as Ship does: a PR must not be able to rewrite the instructions it is
 reviewed under. Without the attribute generated workflows stay byte-identical.
 
-**Phase 3 — `gp-foundry ship --write`.** Apply the proposal: merge the keys into
-`policy/merge.yaml`, `foundry.config.yaml` and `scope.yaml`, preserving comments, refusing
-when any rule is unsupported unless `--allow-lossy`. Add a `doctor` check that warns when
-`.claude/approvals.yml` has changed since it was last translated (a hash in the policy file).
+**Phase 3 — the gate reads `.claude/approvals.yml` in place.** A gate attribute (say
+`ship_policy=true`) has `build` translate the file and `merge-gate` apply the result on top
+of `policy/merge.yaml` at run time, from the base branch. No second copy to drift, and
+`build --check` fails when a rule is `looser` unless the graph acknowledges it. This is the
+point at which a Ship repo can adopt gp-foundry without writing a policy.
 
-**Phase 4 — read the Ship policy natively (only if someone needs it).** A gate node with
-`policy=".claude/approvals.yml"` and a per-file evaluator inside `merge-gate`: per-rule
-seats counted from formal reviews, people lists resolved through the teams API, facts
-computed from the PR. This removes most "lossy" rows above. It is a second policy engine
-beside `evaluateMergeGate`, so it should wait for a real consumer. Custom classifiers would
-still be out: they need a model run per rule, which is a lane, not a gate clause.
+**Phase 4 — close the `looser` rows in the gate.** Each is a bounded change to the existing
+clauses, not a second engine:
+
+| Row | Change |
+| --- | --- |
+| N people | the sign-off counts distinct people (`signoffCandidates` already lists them) |
+| per-rule exclusions and seats | protected paths become a list of rules, each with its own patterns, exclusions and people count |
+| teams and logins | resolve a rule's people list through the teams API when gathering the sign-off |
+| `claude: blocks` | a protected-path rule a sign-off cannot clear |
+| `pr/diff_lines`, `pr/files_changed`, `pr/base` | computed from facts the gate already has |
+
+**Phase 5 — classifiers (only if someone needs it).** A custom classifier is a model run
+that answers a question about the change. In gp-foundry that is a lane, publishing its
+answer as a check the gate reads. Until then rules that read one stay failed-closed.
 
 ---
 
 ## Decisions to make
 
-1. **Translate or evaluate?** Phases 1–3 keep one policy engine and accept the losses.
-   Phase 4 is faithful and roughly doubles the gate's surface. Recommendation: stop at 3
-   until a consumer's policy cannot be expressed.
-2. **Which file is the source of truth** once both exist? Recommendation: the gp-foundry
-   policy, with the Ship file as an input the `doctor` check keeps in step — the gate
-   reads its policy from the base branch on every run and should not parse a second format there.
-3. **A dropped rule makes the result weaker than the source.** Should `--write` refuse by
-   default? Recommendation: yes.
-4. **N-person seats.** Leave to GitHub's required approvals (today's answer), or teach the
-   sign-off to count people? The second is a small change in `signoffCandidates` and would
-   turn two "lossy" rows into exact ones.
+1. **How far to go.** Phases 1–3 make a Ship repo work under gp-foundry, safely but more
+   strictly than Ship. Phase 4 makes the answers agree. Recommendation: build through 3,
+   then take phase 4 rows in the order real policies need them.
+2. **Should `looser` block a build?** Recommendation: yes, with a per-rule acknowledgement in
+   the graph. Otherwise the principle's second commitment is advisory.
+3. **The other direction.** Should gp-foundry write Ship's files (`gp-foundry ship --export`)
+   for a repo moving to Ship? Cheap for `REVIEW.md` (the reviewer role's guidance section),
+   and for the policy keys in the mapping above. Recommendation: after phase 3, if asked for.
+4. **Verdict words.** Ship's review has findings by severity; gp-foundry's ends in a verdict
+   line. Is "an open Important finding = REQUEST_CHANGES" the mapping to commit to?
 
 ## Not verified
 

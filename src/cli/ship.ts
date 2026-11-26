@@ -12,7 +12,12 @@ import { parseApprovals, translateApprovals, type ShipNote } from "../ship/appro
 import { resolveReviewMd } from "../ship/review-md.js";
 import { emitJson } from "./common.js";
 
-const MARK: Record<ShipNote["level"], string> = { mapped: pc.green("✓ mapped     "), lossy: pc.yellow("~ lossy      "), unsupported: pc.red("✗ unsupported") };
+const MARK: Record<ShipNote["level"], string> = {
+  mapped: pc.green("✓ mapped     "),
+  stricter: pc.cyan("↑ stricter   "),
+  looser: pc.red("↓ looser     "),
+  unsupported: pc.dim("· not carried"),
+};
 
 export function registerShipCommand(program: Command): void {
   program
@@ -62,8 +67,13 @@ export function registerShipCommand(program: Command): void {
           out(yaml.dump(translation.immutablePaths).trimEnd());
           out();
         }
-        const lost = translation.notes.filter((n) => n.level !== "mapped").length;
-        out(lost ? pc.yellow(`${lost} of ${translation.notes.length} items do not carry over exactly — read the notes above before relying on this.`) : pc.green("Everything in this policy carries over."));
+        const looser = translation.notes.filter((n) => n.level === "looser").length;
+        const stricter = translation.notes.filter((n) => n.level === "stricter").length;
+        out(
+          looser
+            ? pc.red(`${looser} item(s) where gp-foundry can ask for less than this policy — each needs the fix its note names before the two agree.`)
+            : pc.green(`gp-foundry asks for at least what this policy does${stricter ? ` (${stricter} item(s) stricter)` : ""}.`),
+        );
       }
       if (review.sources.length || review.warnings.length) {
         out();
