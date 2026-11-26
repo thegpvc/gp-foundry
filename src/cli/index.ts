@@ -15,6 +15,7 @@ import { modelCheck } from "../modelcheck/check.js";
 import { renderDiagram } from "../diagram/render.js";
 import { specFileReader, staleGeneratedWorkflows, emitJson, pkgFile, printDiagnostics, resolvePaths } from "./common.js";
 import { registerOpsCommands } from "./ops.js";
+import { registerShipCommand } from "./ship.js";
 
 const program = new Command();
 // Version comes from the packaged manifest — a hardcoded string shipped 0.1.1 reporting 0.1.0.
@@ -262,5 +263,6 @@ program
   });
 
 registerOpsCommands(program);
+registerShipCommand(program);
 
 program.parseAsync(process.argv);
